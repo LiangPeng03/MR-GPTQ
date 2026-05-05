@@ -17,6 +17,20 @@ def get_wikitext2(tokenizer: AutoTokenizer,  sequence_length: int):
     return test_loader
 
 
+def get_c4_eval(tokenizer: AutoTokenizer,  sequence_length: int):
+    val_datasetraw = load_dataset(
+        'allenai/c4', 
+        data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, 
+        split='validation'
+    )
+    valenc = tokenizer(' '.join(val_datasetraw[:1100]['text']), return_tensors='pt').input_ids
+    num_seqs = min(valenc.numel() // sequence_length, 256)
+    valenc = valenc[:, :(num_seqs * sequence_length)]
+    test_loader = []
+    for i in range(num_seqs):
+        test_loader.append(valenc[:, i * sequence_length : (i + 1) * sequence_length])
+    return test_loader
+
 def get_c4(
     tokenizer: AutoTokenizer, 
     max_sequence_length: int,

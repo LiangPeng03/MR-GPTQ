@@ -5,7 +5,11 @@ from transformers import AutoConfig
 
 from .common_utils import to
 from .llama_utils import QuantizedLlamaMLP, QuantizedLlamaAttention
-from .qwen3_utils import QuantizedQwen3MLP, QuantizedQwen3Attention
+try:
+    from .qwen3_utils import QuantizedQwen3MLP, QuantizedQwen3Attention
+except (ImportError, ModuleNotFoundError):
+    QuantizedQwen3MLP = None
+    QuantizedQwen3Attention = None
 
 ### Calibration utils and modules
 
@@ -44,6 +48,8 @@ def get_mlp_layer(config: AutoConfig):
     if config.model_type == "llama":
         return QuantizedLlamaMLP
     elif config.model_type == "qwen3":
+        if QuantizedQwen3MLP is None:
+            raise ImportError("Qwen3 dependencies (transformers.models.qwen3) are missing in your environment.")
         return QuantizedQwen3MLP
     else:
         raise ValueError(f"Model type {config.model_type} not supported")
@@ -52,6 +58,8 @@ def get_attention_layer(config: AutoConfig):
     if config.model_type == "llama":
         return QuantizedLlamaAttention
     elif config.model_type == "qwen3":
+        if QuantizedQwen3Attention is None:
+            raise ImportError("Qwen3 dependencies (transformers.models.qwen3) are missing in your environment.")
         return QuantizedQwen3Attention
     else:
         raise ValueError(f"Model type {config.model_type} not supported")

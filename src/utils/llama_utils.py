@@ -4,10 +4,90 @@ import torch
 import torch.nn as nn
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.cache_utils import Cache
-from transformers.processing_utils import Unpack
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, eager_attention_forward
+try:
+    from typing import Unpack
+except ImportError:
+    try:
+        from typing_extensions import Unpack
+    except ImportError:
+        # Fallback if neither is available, though Unpack is only for type hinting here
+        Unpack = Any
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+try:
+    from transformers.models.llama.modeling_llama import repeat_kv
+except ImportError:
+    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+def eager_attention_forward(
+    module,
+    query_states,
+    key_states,
+    value_states,
+    attention_mask,
+    dropout=0.0,
+    scaling=None,
+    **kwargs,
+):
+    key_states = repeat_kv(key_states, module.num_key_value_groups)
+    value_states = repeat_kv(value_states, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+
+    return attn_output, attn_weights
+
+def sdpa_attention_forward(
+    module,
+    query_states,
+    key_states,
+    value_states,
+    attention_mask,
+    dropout=0.0,
+    scaling=None,
+    **kwargs,
+):
+    key_states = repeat_kv(key_states, module.num_key_value_groups)
+    value_states = repeat_kv(value_states, module.num_key_value_groups)
+
+    causal_mask = attention_mask
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query_states,
+        key_states,
+        value_states,
+        attn_mask=causal_mask,
+        dropout_p=dropout if module.training else 0.0,
+        is_causal=causal_mask is None and query_states.shape[-2] > 1,
+    )
+
+    return attn_output, None
+
+try:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+except ImportError:
+    ALL_ATTENTION_FUNCTIONS = {
+        "eager": eager_attention_forward,
+        "sdpa": sdpa_attention_forward,
+    }
+
+try:
+    from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+except ImportError:
+    from typing import TypedDict
+    class FlashAttentionKwargs(TypedDict, total=False):
+        pass
 from transformers.activations import ACT2FN
 
 from ..quantization.qlinear import QLinear
@@ -182,7 +262,7 @@ class QuantizedLlamaAttention(nn.Module):
         # Rotate attn output
         attn_output = self.o_in_transform(attn_output)
         attn_output = self.o_proj(attn_output, self.o_in_transform)
-        return attn_output, attn_weights
+        return attn_output, attn_weights, past_key_value
 
     def fix_parametrization(self):
         # Fix layer parametrizations

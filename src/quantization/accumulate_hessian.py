@@ -122,29 +122,11 @@ def accumulate_hessian(
     save_lower_only: bool, whether to save the lower triangle only
     compute_lower_only: bool, whether to compute the lower triangle only (should be set to False only for debugging)
     """
-
-    assert compute_lower_only or not save_lower_only, 'compute_lower_only must be True when save_lower_only is True'
-    assert mat_hessian.is_contiguous() and mat_input.is_contiguous()
-    *meta_batch_dims, size_batch, size_hidden = mat_input.shape
-    size_meta_batch: int = int(torch.as_tensor(meta_batch_dims).prod())
-    device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
-    torch_accelerator_module = getattr(torch, device_type)
-    previous_device: torch.device = torch.device(f'{device_type}:{torch_accelerator_module.current_device()}')
-    torch_accelerator_module.set_device(mat_input.device)
-    grid = lambda meta: (
-        size_meta_batch
-        * triton.cdiv(size_hidden, meta['BLOCK_SIZE_M'])
-        * triton.cdiv(size_hidden, meta['BLOCK_SIZE_N']),
-    )
-    # Instead of using a 2D grid, flatten the grid to 1D. This avoids the per-dimension limit.
-    accumulate_hessian_triton_kernel[grid](
-        mat_hessian, mat_input,
-        size_hidden, size_batch,
-        save_lower_only,
-        compute_lower_only,
-        size_meta_batch,
-    )
-    torch_accelerator_module.set_device(previous_device)
+    # Pure PyTorch fallback: Triton kernel crashes on unsupported GPU architectures (e.g. CC 12.0 Blackwell)
+    # H += X^T @ X
+    x = mat_input.to(torch.float32)
+    res = torch.matmul(x.transpose(-2, -1), x)
+    mat_hessian.add_(res)
     return mat_hessian
 
 

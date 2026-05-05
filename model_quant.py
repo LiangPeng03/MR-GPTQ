@@ -7,9 +7,18 @@ from functools import partial
 import torch
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import lm_eval
-from lm_eval.utils import make_table
-from lm_eval.models.huggingface import HFLM
+try:
+    import lm_eval
+    from lm_eval.models.huggingface import HFLM
+    from lm_eval.utils import make_table
+except ImportError:
+    try:
+        import lm_eval
+        from lm_eval.models.gpt2 import HFLM
+        from lm_eval.evaluator import make_table
+    except ImportError:
+        lm_eval = None
+        make_table = None
 
 from src.metrics.perplexity import compute_perplexity
 from src.transforms.transforms import TRANSFORMS
@@ -17,7 +26,7 @@ from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE
 from src.quantization.qconfig import prepare_quantization_config
 from src.quantization import rtn_quantization, gptq_quantization
 from src.utils.common_utils import fix_seed
-from src.utils.data_utils import get_data, get_wikitext2
+from src.utils.data_utils import get_data, get_wikitext2, get_c4_eval
 
 try:
     import wandb
@@ -361,6 +370,7 @@ def main():
         torch_dtype=args.dtype, 
         device_map=None if args.cpu_offload_modules else device,
         low_cpu_mem_usage=True,
+        attn_implementation="eager",
     )
     model.config.use_cache = False
     model.requires_grad_(False)
@@ -368,7 +378,8 @@ def main():
 
     # Sanity check
     if args.eval_openllm:
-        assert hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None, "OpenLLM v1 works only with chat template."
+        if not (hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None):
+            warnings.warn("Tokenizer does not have a chat_template. Tasks requiring chat templates (like gsm8k_llama) will be skipped or may fail.")
         if args.disable_thinking:
             if model.config.model_type == "qwen3":
                 tokenizer.apply_chat_template = partial(
@@ -409,73 +420,113 @@ def main():
         eval_data = get_wikitext2(tokenizer, args.sequence_length)
         ppl = compute_perplexity(model, eval_data)
         print(f"Wikitext-2 perplexity: {round(ppl, 2):.2f}")
+        
+        c4_data = get_c4_eval(tokenizer, args.sequence_length)
+        c4_ppl = compute_perplexity(model, c4_data)
+        print(f"C4 perplexity: {round(c4_ppl, 2):.2f}")
+        
         if args.log_wandb:
-            wandb.log({"eval/wikitext2_ppl": ppl})
+            wandb.log({"eval/wikitext2_ppl": ppl, "eval/c4_ppl": c4_ppl})
 
     # OpenLLM v1 openllm (following https://arxiv.org/abs/2411.02355)
     if args.eval_openllm:
 
         results = {}
-        lm = HFLM(
-            pretrained=model, 
-            tokenizer=tokenizer, 
-            batch_size=args.lm_eval_batch_size,
-            max_length=4096, # from open LLM openllm
-        )
-        task_manager = lm_eval.tasks.TaskManager()
 
-        # Winogrande (5-shot)
-        if "winogrande" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks="winogrande",
-                num_fewshot=5,
+        # Save quantized model to temp dir, then load via HFLM (older lm_eval requires string path)
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model.save_pretrained(tmpdir)
+            tokenizer.save_pretrained(tmpdir)
+
+            lm = HFLM(
+                pretrained=tmpdir,
                 batch_size=args.lm_eval_batch_size,
-                task_manager=task_manager,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
-        # Hellaswag (10-shot)
-        if "hellaswag" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks="hellaswag",
-                num_fewshot=10,
-                batch_size=args.lm_eval_batch_size,
-                task_manager=task_manager,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
-        # GSM8K Llama-3.1
-        if "gsm8k_llama" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks="gsm8k_llama",
-                batch_size=args.lm_eval_batch_size,
-                apply_chat_template=True,
-                fewshot_as_multiturn=True,
-                task_manager=task_manager,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_better": {}}))
-        # MMLU CoT Llama-3.1
-        if "mmlu_cot_llama" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks="mmlu_cot_llama",
-                batch_size=args.lm_eval_batch_size,
-                apply_chat_template=True,
-                fewshot_as_multiturn=True,
-                task_manager=task_manager,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_better": {}}))
+            )
+            task_manager = lm_eval.tasks.TaskManager()
+
+            # Winogrande (5-shot)
+            if "winogrande" in args.lm_eval_tasks:
+                task_results = lm_eval.simple_evaluate(
+                    model=lm,
+                    tasks="winogrande",
+                    num_fewshot=5,
+                    batch_size=args.lm_eval_batch_size,
+                    task_manager=task_manager,
+                )["results"]
+                results.update(task_results)
+                print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+            # Hellaswag (10-shot)
+            if "hellaswag" in args.lm_eval_tasks:
+                task_results = lm_eval.simple_evaluate(
+                    model=lm,
+                    tasks="hellaswag",
+                    num_fewshot=10,
+                    batch_size=args.lm_eval_batch_size,
+                    task_manager=task_manager,
+                )["results"]
+                results.update(task_results)
+                print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+            # PIQA (0-shot)
+            if "piqa" in args.lm_eval_tasks:
+                task_results = lm_eval.simple_evaluate(
+                    model=lm,
+                    tasks="piqa",
+                    num_fewshot=0,
+                    batch_size=args.lm_eval_batch_size,
+                    task_manager=task_manager,
+                )["results"]
+                results.update(task_results)
+                print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+            # ARC Challenge (25-shot)
+            if "arc_challenge" in args.lm_eval_tasks:
+                task_results = lm_eval.simple_evaluate(
+                    model=lm,
+                    tasks="arc_challenge",
+                    num_fewshot=25,
+                    batch_size=args.lm_eval_batch_size,
+                    task_manager=task_manager,
+                )["results"]
+                results.update(task_results)
+                print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+            # GSM8K (requires chat template)
+            if "gsm8k_llama" in args.lm_eval_tasks:
+                if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
+                    task_results = lm_eval.simple_evaluate(
+                        model=lm,
+                        tasks="gsm8k_llama",
+                        batch_size=args.lm_eval_batch_size,
+                        apply_chat_template=True,
+                        fewshot_as_multiturn=True,
+                        task_manager=task_manager,
+                    )["results"]
+                    results.update(task_results)
+                    print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+                else:
+                    print("Skipping gsm8k_llama: no chat template.")
+            # MMLU CoT (requires chat template)
+            if "mmlu_cot_llama" in args.lm_eval_tasks:
+                if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
+                    task_results = lm_eval.simple_evaluate(
+                        model=lm,
+                        tasks="mmlu_cot_llama",
+                        batch_size=args.lm_eval_batch_size,
+                        apply_chat_template=True,
+                        fewshot_as_multiturn=True,
+                        task_manager=task_manager,
+                    )["results"]
+                    results.update(task_results)
+                    print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+                else:
+                    print("Skipping mmlu_cot_llama: no chat template.")
+
         # Log results
         if args.log_wandb:
             wandb.log({"eval/openllm": results}) 
         # Print formatted table
         print("### Final results ###")
         print(make_table({"results": results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+
 
 
 if __name__ == "__main__":
