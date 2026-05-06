@@ -1,6 +1,6 @@
 #!/bin/bash
 
-gpu_id=1
+gpu_id=0
 export CUDA_VISIBLE_DEVICES=$gpu_id
 
 export OMP_NUM_THREADS=8
@@ -14,10 +14,10 @@ MODEL5="Qwen/Qwen3-8B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL5} \
+    --model_name_or_path=${MODEL1} \
     --format=nvfp \
-    --w_bits=16 \
-    --a_bits=16 \
+    --w_bits=4 \
+    --a_bits=4 \
     --w_group_size=16 \
     --a_group_size=16 \
     --transform_class=hadamard \

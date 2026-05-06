@@ -441,21 +441,25 @@ def main():
         # Enable KV cache for faster autoregressive evaluation
         model.config.use_cache = True
 
+    wikitext2_ppl = None
+    c4_ppl = None
+
     if args.eval_perplexity:
         eval_data = get_wikitext2(tokenizer, args.sequence_length)
-        ppl = compute_perplexity(model, eval_data)
-        print(f"Wikitext-2 perplexity: {round(ppl, 2):.2f}")
+        wikitext2_ppl = compute_perplexity(model, eval_data)
+        print(f"Wikitext-2 perplexity: {wikitext2_ppl:.4f}")
         del eval_data
         
         c4_data = get_c4_eval(tokenizer, args.sequence_length)
         c4_ppl = compute_perplexity(model, c4_data)
-        print(f"C4 perplexity: {round(c4_ppl, 2):.2f}")
+        print(f"C4 perplexity: {c4_ppl:.4f}")
         del c4_data
         
         if args.log_wandb:
-            wandb.log({"eval/wikitext2_ppl": ppl, "eval/c4_ppl": c4_ppl})
+            wandb.log({"eval/wikitext2_ppl": wikitext2_ppl, "eval/c4_ppl": c4_ppl})
 
         # Free memory before OpenLLM eval
+        import gc
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -469,6 +473,7 @@ def main():
 
         def _run_task(task_name, num_fewshot=0, batch_size=1, **extra_kwargs):
             """Run a single lm_eval task with fresh HFLM to avoid accumulated state."""
+            import gc
             gc.collect()
             torch.cuda.empty_cache()
             # Create fresh HFLM per task to prevent KV cache / logits accumulation
@@ -523,6 +528,24 @@ def main():
         print("### Final results ###")
         print(make_table({"results": results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
 
+        # [NEW] Robust summary for scripts
+        def get_best_metric(res_dict):
+            # Try to find any key containing 'acc' (e.g., 'acc,none', 'acc_norm,none')
+            acc_keys = [k for k in res_dict.keys() if 'acc' in k]
+            if not acc_keys: return None
+            # Prioritize 'acc_norm' over 'acc'
+            norm_keys = [k for k in acc_keys if 'norm' in k]
+            target_key = norm_keys[0] if norm_keys else acc_keys[0]
+            return res_dict.get(target_key)
+
+        summary = {
+            "model": args.model_name_or_path,
+            "wikitext2_ppl": wikitext2_ppl,
+            "c4_ppl": c4_ppl,
+            "results": {task: get_best_metric(res) for task, res in results.items()}
+        }
+        import json
+        print(f"\n[RESULT_SUMMARY] {json.dumps(summary)}")
 
 
 if __name__ == "__main__":
