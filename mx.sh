@@ -1,6 +1,6 @@
 #!/bin/bash
 
-gpu_id=0
+gpu_id=1
 export CUDA_VISIBLE_DEVICES=$gpu_id
 
 export OMP_NUM_THREADS=8
@@ -32,4 +32,5 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --dtype=bfloat16 \
     --fuse_global_scale \
     --eval_perplexity \
-
+    --eval_openllm \
+    --lm_eval_tasks piqa arc_challenge hellaswag winogrande \

@@ -370,11 +370,12 @@ def main():
     # Model
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path, 
-        torch_dtype=args.dtype, 
-        device_map=None if args.cpu_offload_modules else device,
+        dtype=args.dtype, 
         low_cpu_mem_usage=True,
         attn_implementation="eager",
     )
+    if not args.cpu_offload_modules:
+        model = model.to(device)
     model.config.use_cache = False
     model.requires_grad_(False)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -417,6 +418,12 @@ def main():
         model = torch.compile(model)
 
     if args.eval_perplexity or args.eval_openllm:
+        # Clear quantization data to free memory
+        if 'calibration_data' in locals():
+            del calibration_data
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
         model = model.to(device)
 
     if args.eval_perplexity:
@@ -435,98 +442,81 @@ def main():
     if args.eval_openllm:
 
         results = {}
+        lm = HFLM(
+            pretrained=model, 
+            tokenizer=tokenizer, 
+            batch_size=args.lm_eval_batch_size,
+            max_length=4096,
+        )
 
-        # Save quantized model to temp dir, then load via HFLM (older lm_eval requires string path)
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model.save_pretrained(tmpdir)
-            tokenizer.save_pretrained(tmpdir)
-
-            # Fix for older lm_eval where batch_size must be int
-            eval_bs = args.lm_eval_batch_size
-            if isinstance(eval_bs, str):
-                eval_bs = 1 if eval_bs == "auto" else int(eval_bs)
-                
-            lm = HFLM(
-                pretrained=tmpdir,
-                batch_size=eval_bs,
-            )
-            task_manager = lm_eval.tasks.TaskManager()
-
-            # Winogrande (5-shot)
-            if "winogrande" in args.lm_eval_tasks:
+        # Winogrande (5-shot)
+        if "winogrande" in args.lm_eval_tasks:
+            task_results = lm_eval.simple_evaluate(
+                model=lm,
+                tasks=["winogrande"],
+                num_fewshot=5,
+                batch_size=args.lm_eval_batch_size,
+            )["results"]
+            results.update(task_results)
+            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+        # Hellaswag (10-shot)
+        if "hellaswag" in args.lm_eval_tasks:
+            task_results = lm_eval.simple_evaluate(
+                model=lm,
+                tasks=["hellaswag"],
+                num_fewshot=10,
+                batch_size=args.lm_eval_batch_size,
+            )["results"]
+            results.update(task_results)
+            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+        # PIQA (0-shot)
+        if "piqa" in args.lm_eval_tasks:
+            task_results = lm_eval.simple_evaluate(
+                model=lm,
+                tasks=["piqa"],
+                num_fewshot=0,
+                batch_size=args.lm_eval_batch_size,
+            )["results"]
+            results.update(task_results)
+            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+        # ARC Challenge (25-shot)
+        if "arc_challenge" in args.lm_eval_tasks:
+            task_results = lm_eval.simple_evaluate(
+                model=lm,
+                tasks=["arc_challenge"],
+                num_fewshot=25,
+                batch_size=args.lm_eval_batch_size,
+            )["results"]
+            results.update(task_results)
+            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+        # GSM8K (requires chat template)
+        if "gsm8k_llama" in args.lm_eval_tasks:
+            if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
                 task_results = lm_eval.simple_evaluate(
                     model=lm,
-                    tasks="winogrande",
-                    num_fewshot=5,
+                    tasks=["gsm8k_llama"],
                     batch_size=args.lm_eval_batch_size,
-                    task_manager=task_manager,
+                    apply_chat_template=True,
+                    fewshot_as_multiturn=True,
                 )["results"]
                 results.update(task_results)
                 print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
-            # Hellaswag (10-shot)
-            if "hellaswag" in args.lm_eval_tasks:
+            else:
+                print("Skipping gsm8k_llama: no chat template.")
+        # MMLU CoT (requires chat template)
+        if "mmlu_cot_llama" in args.lm_eval_tasks:
+            if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
                 task_results = lm_eval.simple_evaluate(
                     model=lm,
-                    tasks="hellaswag",
-                    num_fewshot=10,
+                    tasks=["mmlu_cot_llama"],
                     batch_size=args.lm_eval_batch_size,
-                    task_manager=task_manager,
+                    apply_chat_template=True,
+                    fewshot_as_multiturn=True,
                 )["results"]
                 results.update(task_results)
                 print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
-            # PIQA (0-shot)
-            if "piqa" in args.lm_eval_tasks:
-                task_results = lm_eval.simple_evaluate(
-                    model=lm,
-                    tasks="piqa",
-                    num_fewshot=0,
-                    batch_size=args.lm_eval_batch_size,
-                    task_manager=task_manager,
-                )["results"]
-                results.update(task_results)
-                print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
-            # ARC Challenge (25-shot)
-            if "arc_challenge" in args.lm_eval_tasks:
-                task_results = lm_eval.simple_evaluate(
-                    model=lm,
-                    tasks="arc_challenge",
-                    num_fewshot=25,
-                    batch_size=args.lm_eval_batch_size,
-                    task_manager=task_manager,
-                )["results"]
-                results.update(task_results)
-                print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
-            # GSM8K (requires chat template)
-            if "gsm8k_llama" in args.lm_eval_tasks:
-                if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
-                    task_results = lm_eval.simple_evaluate(
-                        model=lm,
-                        tasks="gsm8k_llama",
-                        batch_size=args.lm_eval_batch_size,
-                        apply_chat_template=True,
-                        fewshot_as_multiturn=True,
-                        task_manager=task_manager,
-                    )["results"]
-                    results.update(task_results)
-                    print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
-                else:
-                    print("Skipping gsm8k_llama: no chat template.")
-            # MMLU CoT (requires chat template)
-            if "mmlu_cot_llama" in args.lm_eval_tasks:
-                if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
-                    task_results = lm_eval.simple_evaluate(
-                        model=lm,
-                        tasks="mmlu_cot_llama",
-                        batch_size=args.lm_eval_batch_size,
-                        apply_chat_template=True,
-                        fewshot_as_multiturn=True,
-                        task_manager=task_manager,
-                    )["results"]
-                    results.update(task_results)
-                    print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
-                else:
-                    print("Skipping mmlu_cot_llama: no chat template.")
+            else:
+                print("Skipping mmlu_cot_llama: no chat template.")
 
         # Log results
         if args.log_wandb:
