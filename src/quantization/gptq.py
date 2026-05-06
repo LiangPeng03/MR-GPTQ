@@ -399,6 +399,12 @@ def gptq_quantization(
         block.mlp.gate_proj.weight.data = gate_up_in_transform(block.mlp.gate_proj.weight, inv_t=True)
         block.mlp.up_proj.weight.data = gate_up_in_transform(block.mlp.up_proj.weight, inv_t=True)
         block.mlp.down_proj.weight.data = down_in_transform(block.mlp.down_proj.weight, inv_t=True)
+
+        # IMPORTANT: GPTQ handles were initialized with un-rotated weights. 
+        # We must update them with the rotated weights now.
+        for layer_name, gptq_handle in gptq_handles.items():
+            gptq_handle.W = gptq_handle.layer.weight.data.clone()
+
         # Set train_mode to False
         for layer_name, layer in block.named_modules():
             if isinstance(layer, QLinear):

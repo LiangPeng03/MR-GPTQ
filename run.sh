@@ -16,7 +16,7 @@ MODEL_ID="SmolLM2-135M"
 NUM_SEQUENCES=128
 W_BITS=4
 A_BITS=4
-W_OBSERVER="minmax"
+W_OBSERVER="mse"
 QUANTIZATION_ORDER="default"
 TRANSFORM_CLASS="hadamard"
 HADAMARD_GROUP_SIZE=64   # SmolLM2-135M hidden_size=576, must divide evenly (576/64=9)
@@ -45,10 +45,11 @@ python model_quant.py \
     --sequence_length=2048 \
     --dtype=bfloat16 \
     --eval_perplexity \
+    --fuse_global_scale \
+    --amp \
     --eval_openllm \
     --lm_eval_tasks piqa arc_challenge hellaswag winogrande \
-    --fuse_global_scale \
-    --amp
+    --lm_eval_batch_size 1
 
 echo "========================================="
 echo "Starting MXFP4 Quantization for $MODEL"
@@ -67,12 +68,13 @@ python model_quant.py \
     --dataset_name_or_path=${DATASET} \
     --num_sequences=${NUM_SEQUENCES} \
     --sequence_length=2048 \
-    --dtype=auto \
+    --dtype=bfloat16 \
     --eval_perplexity \
+    --fuse_global_scale \
+    --amp \
     --eval_openllm \
     --lm_eval_tasks piqa arc_challenge hellaswag winogrande \
-    --fuse_global_scale \
-    --amp
+    --lm_eval_batch_size 1
 
 echo "========================================="
 echo "Quantization finished!"

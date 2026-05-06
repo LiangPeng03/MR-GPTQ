@@ -15,6 +15,9 @@ except ImportError:
     try:
         import lm_eval
         from lm_eval.models.gpt2 import HFLM
+        # Monkeypatch to skip strict tokenizer check for non-GPT2 models
+        if hasattr(HFLM, "tokenizer_check"):
+            HFLM.tokenizer_check = lambda self: None
         from lm_eval.evaluator import make_table
     except ImportError:
         lm_eval = None
@@ -439,9 +442,14 @@ def main():
             model.save_pretrained(tmpdir)
             tokenizer.save_pretrained(tmpdir)
 
+            # Fix for older lm_eval where batch_size must be int
+            eval_bs = args.lm_eval_batch_size
+            if isinstance(eval_bs, str):
+                eval_bs = 1 if eval_bs == "auto" else int(eval_bs)
+                
             lm = HFLM(
                 pretrained=tmpdir,
-                batch_size=args.lm_eval_batch_size,
+                batch_size=eval_bs,
             )
             task_manager = lm_eval.tasks.TaskManager()
 
