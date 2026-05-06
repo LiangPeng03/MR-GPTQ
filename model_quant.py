@@ -356,6 +356,9 @@ def parse_args():
 
 
 def main():
+    # Use expandable segments to handle the memory pressure of 25-shot ARC
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    
     args = parse_args()
     # Fix seed
     fix_seed(args.seed)
@@ -372,7 +375,7 @@ def main():
         args.model_name_or_path, 
         dtype=args.dtype, 
         low_cpu_mem_usage=True,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     )
     if not args.cpu_offload_modules:
         model = model.to(device)
@@ -413,108 +416,96 @@ def main():
         if args.export_quantized_model:
             export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args) 
             tokenizer.save_pretrained(args.save_path)
+        
+        # CRITICAL: Reclaim 16-32GB of VRAM
+        del quantized_state_dict
+        del non_quantized_state_dict
+        import gc
+        for _ in range(3): gc.collect()
+        torch.cuda.empty_cache()
 
     if args.compile:
         model = torch.compile(model)
 
     if args.eval_perplexity or args.eval_openllm:
-        # Clear quantization data to free memory
+        # Move model to CPU briefly to ensure NO hidden quantization tensors are kept on GPU
+        model = model.to('cpu')
         if 'calibration_data' in locals():
             del calibration_data
         import gc
-        gc.collect()
+        for _ in range(3): gc.collect()
         torch.cuda.empty_cache()
+        
+        # Now move model back to GPU - it should be the ONLY major thing on VRAM now
         model = model.to(device)
+        # Enable KV cache for faster autoregressive evaluation
+        model.config.use_cache = True
 
     if args.eval_perplexity:
         eval_data = get_wikitext2(tokenizer, args.sequence_length)
         ppl = compute_perplexity(model, eval_data)
         print(f"Wikitext-2 perplexity: {round(ppl, 2):.2f}")
+        del eval_data
         
         c4_data = get_c4_eval(tokenizer, args.sequence_length)
         c4_ppl = compute_perplexity(model, c4_data)
         print(f"C4 perplexity: {round(c4_ppl, 2):.2f}")
+        del c4_data
         
         if args.log_wandb:
             wandb.log({"eval/wikitext2_ppl": ppl, "eval/c4_ppl": c4_ppl})
+
+        # Free memory before OpenLLM eval
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # OpenLLM v1 openllm (following https://arxiv.org/abs/2411.02355)
     if args.eval_openllm:
 
         results = {}
+        # batch_size="auto:4" lets lm_eval find optimal batch up to 4
         lm = HFLM(
             pretrained=model, 
             tokenizer=tokenizer, 
-            batch_size=args.lm_eval_batch_size,
-            max_length=4096,
+            batch_size="auto:1",
+            max_length=2048,
         )
+
+        def _run_task(task_name, num_fewshot=0, **extra_kwargs):
+            """Run a single lm_eval task with memory cleanup."""
+            gc.collect()
+            torch.cuda.empty_cache()
+            task_results = lm_eval.simple_evaluate(
+                model=lm,
+                tasks=[task_name],
+                num_fewshot=num_fewshot,
+                **extra_kwargs,
+            )["results"]
+            results.update(task_results)
+            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
 
         # Winogrande (5-shot)
         if "winogrande" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks=["winogrande"],
-                num_fewshot=5,
-                batch_size=args.lm_eval_batch_size,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+            _run_task("winogrande", num_fewshot=5)
         # Hellaswag (10-shot)
         if "hellaswag" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks=["hellaswag"],
-                num_fewshot=10,
-                batch_size=args.lm_eval_batch_size,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+            _run_task("hellaswag", num_fewshot=10)
         # PIQA (0-shot)
         if "piqa" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks=["piqa"],
-                num_fewshot=0,
-                batch_size=args.lm_eval_batch_size,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+            _run_task("piqa", num_fewshot=0)
         # ARC Challenge (25-shot)
         if "arc_challenge" in args.lm_eval_tasks:
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks=["arc_challenge"],
-                num_fewshot=25,
-                batch_size=args.lm_eval_batch_size,
-            )["results"]
-            results.update(task_results)
-            print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+            _run_task("arc_challenge", num_fewshot=25)
         # GSM8K (requires chat template)
         if "gsm8k_llama" in args.lm_eval_tasks:
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
-                task_results = lm_eval.simple_evaluate(
-                    model=lm,
-                    tasks=["gsm8k_llama"],
-                    batch_size=args.lm_eval_batch_size,
-                    apply_chat_template=True,
-                    fewshot_as_multiturn=True,
-                )["results"]
-                results.update(task_results)
-                print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+                _run_task("gsm8k_llama", apply_chat_template=True, fewshot_as_multiturn=True)
             else:
                 print("Skipping gsm8k_llama: no chat template.")
         # MMLU CoT (requires chat template)
         if "mmlu_cot_llama" in args.lm_eval_tasks:
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
-                task_results = lm_eval.simple_evaluate(
-                    model=lm,
-                    tasks=["mmlu_cot_llama"],
-                    batch_size=args.lm_eval_batch_size,
-                    apply_chat_template=True,
-                    fewshot_as_multiturn=True,
-                )["results"]
-                results.update(task_results)
-                print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+                _run_task("mmlu_cot_llama", apply_chat_template=True, fewshot_as_multiturn=True)
             else:
                 print("Skipping mmlu_cot_llama: no chat template.")
 

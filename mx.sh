@@ -4,7 +4,7 @@ gpu_id=1
 export CUDA_VISIBLE_DEVICES=$gpu_id
 
 export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
 
 MODEL1="HuggingFaceTB/SmolLM2-135M"
 MODEL2="meta-llama/Llama-2-7b-hf"

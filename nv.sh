@@ -3,9 +3,8 @@
 gpu_id=1
 export CUDA_VISIBLE_DEVICES=$gpu_id
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
 
 MODEL1="HuggingFaceTB/SmolLM2-135M"
 MODEL2="meta-llama/Llama-2-7b-hf"
@@ -15,7 +14,7 @@ MODEL5="Qwen/Qwen3-8B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL4} \
+    --model_name_or_path=${MODEL5} \
     --format=nvfp \
     --w_bits=16 \
     --a_bits=16 \
@@ -33,5 +32,5 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --dtype=bfloat16 \
     --fuse_global_scale \
     --eval_openllm \
-    --lm_eval_tasks piqa arc_challenge hellaswag winogrande \
+    --lm_eval_tasks piqa arc_challenge winogrande \
 
