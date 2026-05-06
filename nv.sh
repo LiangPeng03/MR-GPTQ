@@ -31,6 +31,8 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --sequence_length=2048 \
     --dtype=bfloat16 \
     --fuse_global_scale \
+    --eval_perplexity \
     --eval_openllm \
-    --lm_eval_tasks piqa arc_challenge winogrande \
+    --lm_eval_tasks piqa winogrande \
+    # --lm_eval_tasks piqa arc_challenge winogrande \
 

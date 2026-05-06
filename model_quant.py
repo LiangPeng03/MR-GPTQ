@@ -463,18 +463,21 @@ def main():
     if args.eval_openllm:
 
         results = {}
-        # batch_size="auto:4" lets lm_eval find optimal batch up to 4
-        lm = HFLM(
-            pretrained=model, 
-            tokenizer=tokenizer, 
-            batch_size="auto:1",
-            max_length=2048,
-        )
+        # Cap max_position_embeddings to prevent lm_eval from using excessively long sequences
+        _orig_max_pos = model.config.max_position_embeddings
+        model.config.max_position_embeddings = min(model.config.max_position_embeddings, 2048)
 
-        def _run_task(task_name, num_fewshot=0, **extra_kwargs):
-            """Run a single lm_eval task with memory cleanup."""
+        def _run_task(task_name, num_fewshot=0, batch_size=1, **extra_kwargs):
+            """Run a single lm_eval task with fresh HFLM to avoid accumulated state."""
             gc.collect()
             torch.cuda.empty_cache()
+            # Create fresh HFLM per task to prevent KV cache / logits accumulation
+            lm = HFLM(
+                pretrained=model,
+                tokenizer=tokenizer,
+                batch_size=batch_size,
+                max_length=2048,
+            )
             task_results = lm_eval.simple_evaluate(
                 model=lm,
                 tasks=[task_name],
@@ -483,29 +486,33 @@ def main():
             )["results"]
             results.update(task_results)
             print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
+            # Immediately free HFLM and all its internal state
+            del lm
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        # Winogrande (5-shot)
+        # Winogrande (5-shot) - Can handle larger batch
         if "winogrande" in args.lm_eval_tasks:
-            _run_task("winogrande", num_fewshot=5)
-        # Hellaswag (10-shot)
+            _run_task("winogrande", num_fewshot=5, batch_size=64)
+        # Hellaswag (10-shot) - Medium batch
         if "hellaswag" in args.lm_eval_tasks:
-            _run_task("hellaswag", num_fewshot=10)
-        # PIQA (0-shot)
+            _run_task("hellaswag", num_fewshot=10, batch_size=8)
+        # PIQA (0-shot) - Can handle very large batch
         if "piqa" in args.lm_eval_tasks:
-            _run_task("piqa", num_fewshot=0)
-        # ARC Challenge (25-shot)
+            _run_task("piqa", num_fewshot=0, batch_size=64)
+        # ARC Challenge (25-shot) - Must keep batch_size=1
         if "arc_challenge" in args.lm_eval_tasks:
-            _run_task("arc_challenge", num_fewshot=25)
+            _run_task("arc_challenge", num_fewshot=25, batch_size=8)
         # GSM8K (requires chat template)
         if "gsm8k_llama" in args.lm_eval_tasks:
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
-                _run_task("gsm8k_llama", apply_chat_template=True, fewshot_as_multiturn=True)
+                _run_task("gsm8k_llama", apply_chat_template=True, fewshot_as_multiturn=True, batch_size=8)
             else:
                 print("Skipping gsm8k_llama: no chat template.")
         # MMLU CoT (requires chat template)
         if "mmlu_cot_llama" in args.lm_eval_tasks:
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
-                _run_task("mmlu_cot_llama", apply_chat_template=True, fewshot_as_multiturn=True)
+                _run_task("mmlu_cot_llama", apply_chat_template=True, fewshot_as_multiturn=True, batch_size=8)
             else:
                 print("Skipping mmlu_cot_llama: no chat template.")
 

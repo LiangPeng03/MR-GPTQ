@@ -33,4 +33,4 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --fuse_global_scale \
     --eval_perplexity \
     --eval_openllm \
-    --lm_eval_tasks piqa arc_challenge hellaswag winogrande \
+    --lm_eval_tasks piqa winogrande \
