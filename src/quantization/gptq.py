@@ -385,6 +385,14 @@ def gptq_quantization(
         # 5. Process calibration data
         device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
         for inp_args, inp_kwargs in zip(input_args, input_kwargs):
+            # Ensure block doesn't return past_key_value during calibration replay
+            # which can cause "too many values to unpack" in some transformers versions
+            inp_kwargs["use_cache"] = False
+            if "past_key_value" in inp_kwargs:
+                inp_kwargs["past_key_value"] = None
+            if "output_attentions" in inp_kwargs:
+                inp_kwargs["output_attentions"] = False
+                
             with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
                 block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
         # Remove hooks

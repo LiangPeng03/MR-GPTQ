@@ -266,7 +266,7 @@ class QuantizedLlamaAttention(nn.Module):
         # Rotate attn output
         attn_output = self.o_in_transform(attn_output)
         attn_output = self.o_proj(attn_output, self.o_in_transform)
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
     def fix_parametrization(self):
         # Fix layer parametrizations

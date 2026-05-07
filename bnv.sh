@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # --- 配置区 ---
-GPU_ID=0
+GPU_ID=1
 LOG_FILE="eval_summary.log"
 PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
 # 待测试模型列表
 MODELS=(
-    "HuggingFaceTB/SmolLM2-135M"
-    "Qwen/Qwen3-0.6B"
+    # "HuggingFaceTB/SmolLM2-135M"
+    # "Qwen/Qwen3-0.6B"
     "Qwen/Qwen3-8B"
     "meta-llama/Meta-Llama-3-8B"
     "meta-llama/Llama-2-7b-hf"
@@ -23,6 +23,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONWARNINGS="ignore"
 
 # 初始化日志文件
+echo "" >> $LOG_FILE
 echo "==========================================================" >> $LOG_FILE
 echo "Batch Run Started at: $(date)" >> $LOG_FILE
 printf "%-30s | %-8s | %-8s | %-8s | %-8s | %-8s\n" "Model" "W-PPL" "C4-PPL" "PIQA" "ARC-C" "WINO" >> $LOG_FILE
@@ -30,6 +31,7 @@ echo "----------------------------------------------------------" >> $LOG_FILE
 
 # --- 循环运行 ---
 for MODEL in "${MODELS[@]}"; do
+    echo ""
     echo "----------------------------------------------------------"
     echo "Processing: $MODEL"
     
@@ -89,4 +91,5 @@ for MODEL in "${MODELS[@]}"; do
 done
 
 echo "==========================================================" >> $LOG_FILE
+echo "" >> $LOG_FILE
 echo "All Tasks Finished."

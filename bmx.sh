@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # --- 配置区 ---
-GPU_ID=0
-LOG_FILE="eval_summary.log"
+GPU_ID=1
+LOG_FILE="eval_summary_mx.log"
 PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
 # 待测试模型列表
@@ -23,6 +23,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONWARNINGS="ignore"
 
 # 初始化日志文件
+echo "" >> $LOG_FILE
 echo "==========================================================" >> $LOG_FILE
 echo "Batch Run Started at: $(date)" >> $LOG_FILE
 printf "%-30s | %-8s | %-8s | %-8s | %-8s | %-8s\n" "Model" "W-PPL" "C4-PPL" "PIQA" "ARC-C" "WINO" >> $LOG_FILE
@@ -30,6 +31,7 @@ echo "----------------------------------------------------------" >> $LOG_FILE
 
 # --- 循环运行 ---
 for MODEL in "${MODELS[@]}"; do
+    echo ""
     echo "----------------------------------------------------------"
     echo "Processing: $MODEL"
     
@@ -39,10 +41,10 @@ for MODEL in "${MODELS[@]}"; do
         --format=mxfp \
         --w_bits=4 \
         --a_bits=4 \
-        --w_group_size=16 \
-        --a_group_size=16 \
-        --transform_class=hadamard \
-        --w_observer=mse \
+        --w_group_size=32 \
+        --a_group_size=32 \
+        --transform_class=identity \
+        --w_observer=minmax \
         --quantization_order=activation \
         --hadamard_group_size=128 \
         --dataset_name_or_path=fineweb-edu \
@@ -57,13 +59,13 @@ for MODEL in "${MODELS[@]}"; do
         --lm_eval_tasks piqa winogrande"
 
     # 运行并静默非核心输出
-    tmp_out="tmp_eval.out"
+    tmp_out="tmp_mx_eval.out"
     echo "Launch Command: $CMD" >> $LOG_FILE
     $CMD > $tmp_out 2>&1
 
     # 如果运行失败，记录错误
     if [ $? -ne 0 ]; then
-        echo "$MODEL | FAILED (Check tmp_eval.out)" >> $LOG_FILE
+        echo "$MODEL | FAILED (Check tmp_mx_eval.out)" >> $LOG_FILE
         cat $tmp_out # 在屏幕显示错误信息
         continue
     fi
@@ -89,4 +91,5 @@ for MODEL in "${MODELS[@]}"; do
 done
 
 echo "==========================================================" >> $LOG_FILE
+echo "" >> $LOG_FILE
 echo "All Tasks Finished."
