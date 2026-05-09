@@ -267,6 +267,11 @@ def parse_args():
         action="store_true",
         help="Whether to log to wandb."
     )
+    parser.add_argument(
+        "--show_act_mse",
+        action="store_true",
+        help="Whether to compute and show activation quantization MSE."
+    )
     # Misc params
     parser.add_argument(
         "--verbose",

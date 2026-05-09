@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # --- 配置区 ---
-GPU_ID=1
+GPU_ID=0
 LOG_FILE="eval_summary.log"
 PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
 # 待测试模型列表
 MODELS=(
-    # "HuggingFaceTB/SmolLM2-135M"
-    # "Qwen/Qwen3-0.6B"
+    "HuggingFaceTB/SmolLM2-135M"
+    "Qwen/Qwen3-0.6B"
     "Qwen/Qwen3-8B"
     "meta-llama/Meta-Llama-3-8B"
     "meta-llama/Llama-2-7b-hf"
@@ -40,7 +40,7 @@ for MODEL in "${MODELS[@]}"; do
         --model_name_or_path=$MODEL \
         --format=nvfp \
         --w_bits=4 \
-        --a_bits=4 \
+        --a_bits=16 \
         --w_group_size=16 \
         --a_group_size=16 \
         --transform_class=hadamard \

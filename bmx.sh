@@ -40,7 +40,7 @@ for MODEL in "${MODELS[@]}"; do
         --model_name_or_path=$MODEL \
         --format=mxfp \
         --w_bits=4 \
-        --a_bits=4 \
+        --a_bits=16 \
         --w_group_size=32 \
         --a_group_size=32 \
         --transform_class=identity \

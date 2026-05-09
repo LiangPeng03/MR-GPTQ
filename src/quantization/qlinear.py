@@ -46,7 +46,19 @@ class QLinear(nn.Linear):
 
         if self.act_quantizer is not None:
             a_scales, a_zeros = self.act_quantizer.get_quantization_params(x)
-            x = self.act_quantizer(x, a_scales, a_zeros)
+            x_q = self.act_quantizer(x, a_scales, a_zeros)
+            
+            if hasattr(self, 'track_act_mse') and self.track_act_mse:
+                if getattr(self, 'act_mse_sum', None) is None:
+                    self.act_mse_sum = 0.0
+                    self.act_mse_count = 0
+                
+                # Calculate relative MSE of the activation tensor
+                rel_mse = (x_q - x).pow(2).mean().item() / (x.pow(2).mean().item() + 1e-6)
+                self.act_mse_sum += rel_mse
+                self.act_mse_count += 1
+            
+            x = x_q
 
         return F.linear(x, weight, bias)
 

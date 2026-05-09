@@ -457,6 +457,12 @@ def gptq_quantization(
                         "act_global_scale": act_global_scale.clone()
                     }
 
+        # Enable activation MSE tracking
+        if args.show_act_mse:
+            for layer_name, layer in block.named_modules():
+                if isinstance(layer, QLinear):
+                    layer.track_act_mse = True
+
         # 8. Update activations
         device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
         for inp_args, inp_kwargs in zip(input_args, input_kwargs):
@@ -470,6 +476,17 @@ def gptq_quantization(
                 inp_kwargs["hidden_states"] = out
             else:
                 raise ValueError("Unsupported block input format.")
+
+        # Print activation MSE
+        if args.show_act_mse:
+            for layer_name, layer in block.named_modules():
+                if isinstance(layer, QLinear) and hasattr(layer, 'act_mse_sum') and layer.act_mse_count > 0:
+                    act_rel_mse = layer.act_mse_sum / layer.act_mse_count
+                    print(f"[{layer_name:16}]: Activation Rel MSE: {act_rel_mse:.2e}")
+                    if args.log_wandb:
+                        wandb.log({f"gptq/{layer_name}_act_relative_mse": act_rel_mse})
+                    layer.track_act_mse = False
+
 
         if args.cpu_offload_modules:
             block = block.cpu()

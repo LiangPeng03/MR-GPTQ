@@ -14,9 +14,9 @@ MODEL5="Qwen/Qwen3-8B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL1} \
+    --model_name_or_path=${MODEL3} \
     --format=nvfp \
-    --w_bits=4 \
+    --w_bits=16 \
     --a_bits=4 \
     --w_group_size=16 \
     --a_group_size=16 \
@@ -26,13 +26,13 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --hadamard_group_size=16 \
     --dataset_name_or_path=fineweb-edu \
     --num_sequences=128 \
-    --gptq \
     --rel_damp=0.01 \
     --sequence_length=2048 \
     --dtype=bfloat16 \
     --fuse_global_scale \
+    --show_act_mse \
     --eval_perplexity \
-    --eval_openllm \
-    --lm_eval_tasks piqa winogrande \
+    # --eval_openllm \
+    # --lm_eval_tasks piqa winogrande \
     # --lm_eval_tasks piqa arc_challenge winogrande \
 

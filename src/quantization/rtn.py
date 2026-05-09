@@ -23,7 +23,8 @@ def rtn_quantization(
     print("RTN quantization...")
     orig_dtype = model.config.torch_dtype if args.dtype == "auto" else args.dtype
     act_offload_device = "cpu" if args.cpu_offload_activations else device
-    need_calibration = args.scale_precision == ScalePrecision.E4M3
+    # We need calibration to track global scales for E4M3 OR to track activation MSE
+    need_calibration = (args.scale_precision == ScalePrecision.E4M3) or (args.show_act_mse and args.a_bits < 16)
     # State dict with quantized weights, scales and hadamards
     quantized_state_dict = {}
     non_quantized_state_dict = {}
@@ -214,6 +215,12 @@ def rtn_quantization(
         down_in_transform.remove_parametrizations() 
 
         if need_calibration:
+            # Enable activation MSE tracking
+            if args.show_act_mse:
+                for layer_name, layer in block.named_modules():
+                    if isinstance(layer, QLinear):
+                        layer.track_act_mse = True
+
             device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
             for inp_args, inp_kwargs in zip(input_args, input_kwargs):
                 with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
@@ -226,6 +233,14 @@ def rtn_quantization(
                     inp_kwargs["hidden_states"] = out
                 else:
                     raise ValueError("Unsupported block input format.")
+
+            # Print activation MSE
+            if args.show_act_mse:
+                for layer_name, layer in block.named_modules():
+                    if isinstance(layer, QLinear) and hasattr(layer, 'act_mse_sum') and layer.act_mse_count > 0:
+                        act_rel_mse = layer.act_mse_sum / layer.act_mse_count
+                        print(f"[{layer_name:16}]: Activation Rel MSE: {act_rel_mse:.2e}")
+                        layer.track_act_mse = False
 
         if args.cpu_offload_modules:
             block.cpu()
