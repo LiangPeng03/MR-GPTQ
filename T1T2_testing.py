@@ -5,6 +5,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib
+from matplotlib.colors import LogNorm
 from scipy.stats import pearsonr, spearmanr
 from tqdm import tqdm
 
@@ -50,6 +51,7 @@ def analyze_layer_shape(layer_name, X, quantizer, transform):
         "layer_name": layer_name,
         "E_total": E_total.cpu().numpy(),
         "E_max": E_max.cpu().numpy(),
+        "E_top12": (Top1**2 + Top2**2).cpu().numpy(),
         "Ratio_top2_energy": Top2_energy_ratio.cpu().numpy(),
         "Ratio_top3_energy": Top3_energy_ratio.cpu().numpy(),
         "R": R.cpu().numpy(),
@@ -161,6 +163,32 @@ def plot_consolidated_results(results_list):
     fig2.tight_layout(rect=[0, 0.03, 1, 0.95])
     fig2.savefig("consolidated_resonance_profile.png")
 
+    # --- 图表 3: 散点热图 (Scatter Heatmap) ---
+    fig3, axes3 = plt.subplots(1, n_layers, figsize=(18, 5))
+    if n_layers == 1: axes3 = [axes3]
+    for i, res in enumerate(results_list):
+        ax = axes3[i]
+        
+        sample_size = min(50000, len(res["mse_rot"]))
+        idx = np.random.choice(len(res["mse_rot"]), sample_size, replace=False)
+        
+        x = res["R"][idx]
+        y = res["E_top12"][idx]
+        c = res["mse_rot"][idx]
+        
+        # 使用 LogNorm 使低损失和高损失的颜色区分更明显
+        sc = ax.scatter(x, y, c=c, cmap='jet', s=3, alpha=0.8, norm=LogNorm(vmin=np.percentile(c, 5), vmax=np.percentile(c, 99)))
+        
+        ax.set_title(f"{res['layer_name']}")
+        ax.set_xlabel("Ratio $R = |Top2|/|Top1|$ (0~1)")
+        if i == 0: ax.set_ylabel("Sum of Top1 & Top2 Energy")
+        ax.set_yscale('log')
+        fig3.colorbar(sc, ax=ax, label="Post-Rot MSE")
+        
+    fig3.suptitle("Heatmap: Joint Impact of Energy Scale and R-Ratio on Quantization Loss", fontsize=16)
+    fig3.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig3.savefig("consolidated_heatmap.png")
+
 
 
 def main():
@@ -200,7 +228,7 @@ def main():
     
     print("\nGenerating consolidated plots...")
     plot_consolidated_results(results_cache)
-    print("Done. Check consolidated_convergence.png and consolidated_resonance_profile.png")
+    print("Done. Check consolidated_convergence.png, consolidated_resonance_profile.png, and consolidated_heatmap.png")
 
 if __name__ == "__main__":
     main()

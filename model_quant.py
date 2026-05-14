@@ -247,6 +247,12 @@ def parse_args():
         help="Weigth quantization order in GPTQ.",
     )
     parser.add_argument("--rel_damp", type=float, default=1e-2)
+    parser.add_argument(
+        "--awq_for_act",
+        type=float,
+        default=0.0,
+        help="Apply AWQ-style channel scaling preprocessing to activations with the given threshold (e.g., 10.0).",
+    )
     # Transform params
     parser.add_argument(
         "--transform_class",
