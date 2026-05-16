@@ -253,6 +253,13 @@ def parse_args():
         default=0.0,
         help="Apply AWQ-style channel scaling preprocessing to activations with the given threshold (e.g., 10.0).",
     )
+    parser.add_argument(
+        "--channel_resort",
+        type=str,
+        default="none",
+        choices=["none", "mean", "P95"],
+        help="Apply grid-aware channel reordering (GridSort) based on channel 'mean' or 'P95', or use 'none' to skip.",
+    )
     # Transform params
     parser.add_argument(
         "--transform_class",

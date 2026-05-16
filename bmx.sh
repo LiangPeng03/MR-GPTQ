@@ -40,7 +40,7 @@ for MODEL in "${MODELS[@]}"; do
         --model_name_or_path=$MODEL \
         --format=mxfp \
         --w_bits=4 \
-        --a_bits=16 \
+        --a_bits=4 \
         --w_group_size=32 \
         --a_group_size=32 \
         --transform_class=identity \
@@ -54,6 +54,7 @@ for MODEL in "${MODELS[@]}"; do
         --sequence_length=2048 \
         --dtype=bfloat16 \
         --fuse_global_scale \
+        --channel_resort P95\
         --eval_perplexity \
         --eval_openllm \
         --lm_eval_tasks piqa winogrande"

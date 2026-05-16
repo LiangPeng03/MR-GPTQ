@@ -50,6 +50,21 @@ class IdentityTransform(BaseTransform):
         pass
 
 
+class PermutationTransform(BaseTransform):
+    def __init__(self, perm_idx: torch.Tensor):
+        super().__init__()
+        self.register_buffer("perm_idx", perm_idx)
+
+    def forward(self, x: torch.Tensor, inv_t: bool = False, dim: int = -1):
+        if dim == -1:
+            dim = x.ndim - 1
+        # Permutation matrix is orthogonal: M^{-T} = M
+        return torch.index_select(x, dim, self.perm_idx)
+    
+    def remove_parametrizations(self) -> None:
+        pass
+
+
 class FullTransform(BaseTransform):
 
     def __init__(
@@ -291,6 +306,22 @@ class GSRTransform(BaseTransform):
     def remove_parametrizations(self) -> None:
         pass
         
+
+class CompositeTransform(BaseTransform):
+    
+    def __init__(self, transforms: list):
+        super().__init__()
+        self.transforms = nn.ModuleList(transforms)
+
+    def forward(self, x: torch.Tensor, inv_t: bool = False, dim: int = -1):
+        for transform in self.transforms:
+            x = transform(x, inv_t, dim)
+        return x
+    
+    def remove_parametrizations(self) -> None:
+        for transform in self.transforms:
+            transform.remove_parametrizations()
+
 
 TRANSFORMS = {
     "identity": IdentityTransform,

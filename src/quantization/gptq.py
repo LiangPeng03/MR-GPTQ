@@ -288,11 +288,189 @@ def gptq_quantization(
         if args.cpu_offload_modules:
             block.to(device)
 
+        # === 0. Resonance-Aware Channel Reordering ===
+        resort_perms = {}
+        if getattr(args, "channel_resort", False):
+            import numpy as np
+            print(f"  Computing resonance-aware channel permutations (Strategy: {args.channel_resort})...")
+            act_caches = {}
+            def hook_factory(name):
+                def _hook(_, inp, out):
+                    if name not in act_caches:
+                        act_caches[name] = []
+                    # Collect up to 16 sequences to estimate P95 without OOM
+                    if len(act_caches[name]) < 16:
+                        act_caches[name].append(inp[0].detach().cpu().float().abs().view(-1, inp[0].shape[-1]))
+                return _hook
+
+            resort_hooks = []
+            resort_hooks.append(block.self_attn.q_proj.register_forward_hook(hook_factory("qkv")))
+            resort_hooks.append(block.self_attn.o_proj.register_forward_hook(hook_factory("o")))
+            resort_hooks.append(block.mlp.gate_proj.register_forward_hook(hook_factory("gate_up")))
+            resort_hooks.append(block.mlp.down_proj.register_forward_hook(hook_factory("down")))
+
+            device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+            for inp_args, inp_kwargs in zip(input_args, input_kwargs):
+                ikw = inp_kwargs.copy()
+                ikw["use_cache"] = False
+                if "past_key_value" in ikw: ikw["past_key_value"] = None
+                if "output_attentions" in ikw: ikw["output_attentions"] = False
+                with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
+                    block(*to(inp_args, device=device), **to(ikw, device=device))
+            for h in resort_hooks: h.remove()
+            
+            act_means = {}
+            for name, caches in list(act_caches.items()):
+                X = torch.cat(caches, dim=0) # (N_tokens, Dim)
+                if args.channel_resort == "P95":
+                    act_means[name] = torch.quantile(X, 0.95, dim=0).to(device)
+                else: # "mean" or "R_val"
+                    act_means[name] = X.mean(dim=0).to(device)
+                del X
+                del act_caches[name]
+
+            def compute_resonance_perm(act_mean_abs, group_size=16, target_R=0.2):
+                N = act_mean_abs.shape[0]
+                vals = act_mean_abs.cpu().numpy()
+                sorted_pos = np.argsort(-vals)
+                available = np.ones(N, dtype=bool)
+                perm = []
+                for _ in range(N // group_size):
+                    avail_sorted = sorted_pos[available[sorted_pos]]
+                    if len(avail_sorted) < group_size:
+                        break
+                    top1 = avail_sorted[0]
+                    available[top1] = False
+                    avail_sorted = sorted_pos[available[sorted_pos]]
+                    target_val = target_R * vals[top1]
+                    candidates = avail_sorted[vals[avail_sorted] >= target_val]
+                    if len(candidates) > 0:
+                        top2 = candidates[-1]
+                        available[top2] = False
+                        avail_sorted = sorted_pos[available[sorted_pos]]
+                        fill = avail_sorted[-(group_size - 2):]
+                        available[fill] = False
+                        perm.extend([top1, top2] + fill.tolist())
+                    else:
+                        fill = avail_sorted[-(group_size - 1):]
+                        available[fill] = False
+                        perm.extend([top1] + fill.tolist())
+                return torch.tensor(perm, device=act_mean_abs.device, dtype=torch.long)
+                
+            def compute_gridsort_perm(act_stat, group_size=16):
+                FP4_GRID = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=act_stat.device)
+                N = act_stat.shape[0]
+                vals = act_stat.float()
+                available = torch.ones(N, dtype=torch.bool, device=act_stat.device)
+                perm = []
+                
+                for _ in range(N // group_size):
+                    avail_mask = available.clone()
+                    avail_vals = vals.clone()
+                    avail_vals[~avail_mask] = -1
+                    anchor = avail_vals.argmax().item()
+                    
+                    scale = (vals[anchor] / 6.0) + 1e-12
+                    available[anchor] = False
+                    group = [anchor]
+                    
+                    remaining_indices = available.nonzero(as_tuple=True)[0]
+                    if len(remaining_indices) < group_size - 1:
+                        if len(remaining_indices) > 0:
+                            group.extend(remaining_indices.tolist())
+                            available[remaining_indices] = False
+                        perm.extend(group)
+                        break
+                        
+                    remaining_vals = vals[remaining_indices]
+                    
+                    normalized = remaining_vals / scale
+                    distances = (normalized.unsqueeze(1) - FP4_GRID.unsqueeze(0)).abs()
+                    min_grid_errors = distances.min(dim=1).values
+                    
+                    gas_scores = -min_grid_errors + remaining_vals * 1e-6
+                    
+                    n_needed = group_size - 1
+                    _, top_indices = gas_scores.topk(n_needed)
+                    selected = remaining_indices[top_indices].tolist()
+                    
+                    for s in selected:
+                        available[s] = False
+                    group.extend(selected)
+                    perm.extend(group)
+                
+                return torch.tensor(perm, device=act_stat.device, dtype=torch.long)
+
+            for name, mean_val in act_means.items():
+                abs_vals = mean_val.abs()
+                N = abs_vals.shape[0]
+                quant_group_size = args.a_group_size if args.a_group_size else 16
+                
+                if args.channel_resort in ["mean", "P95"]:
+                    # GridSort Strategy
+                    if "o" in name:
+                        head_dim = model.config.hidden_size // model.config.num_attention_heads
+                        h_group_size = head_dim
+                    else:
+                        h_group_size = -1 # Global matrix for other projections
+                        
+                    if h_group_size <= 0:
+                        p = compute_gridsort_perm(abs_vals, group_size=quant_group_size)
+                    else:
+                        p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
+                        for i in range(0, N, h_group_size):
+                            block_vals = abs_vals[i : i + h_group_size]
+                            block_perm = compute_gridsort_perm(block_vals, group_size=quant_group_size)
+                            p[i : i + h_group_size] = block_perm + i
+                            
+                    resort_perms[name] = p
+                    print(f"    [{name:8}] GridSort completed.")
+                else:
+                    # Old Resonance R_val Strategy
+                    h_group_size = args.hadamard_group_size
+                    if "o" in name:
+                        head_dim = model.config.hidden_size // model.config.num_attention_heads
+                        if h_group_size <= 0 or h_group_size > head_dim:
+                            h_group_size = head_dim
+                            
+                    if h_group_size <= 0:
+                        p = compute_resonance_perm(abs_vals, group_size=16)
+                    else:
+                        p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
+                        for i in range(0, N, h_group_size):
+                            block_vals = abs_vals[i : i + h_group_size]
+                            block_perm = compute_resonance_perm(block_vals, group_size=16)
+                            p[i : i + h_group_size] = block_perm + i
+                    resort_perms[name] = p
+                    
+                    grouped = abs_vals[p].view(-1, 16)
+                    top2_vals = torch.topk(grouped, k=2, dim=-1).values
+                    R_vals = top2_vals[:, 1] / (top2_vals[:, 0] + 1e-9)
+                    print(f"    [{name:8}] Mean R after resort: {R_vals.mean():.4f}")
+
         # 1. Init transforms
         qkv_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
         o_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
         gate_up_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
         down_in_transform = build_transform(args.transform_class, size=model.config.intermediate_size, **transform_kwargs)     
+
+        if resort_perms:
+            from ..transforms.transforms import CompositeTransform, PermutationTransform
+            if "qkv" in resort_perms:
+                qkv_in_transform = CompositeTransform([PermutationTransform(resort_perms["qkv"]), qkv_in_transform])
+            if "gate_up" in resort_perms:
+                gate_up_in_transform = CompositeTransform([PermutationTransform(resort_perms["gate_up"]), gate_up_in_transform])
+            # O: in-place permutation only for MHA (skip GQA to avoid cross-head corruption)
+            if "o" in resort_perms:
+                o_perm = resort_perms["o"]
+                if block.self_attn.v_proj.weight.shape[0] == block.self_attn.o_proj.weight.shape[1]:
+                    block.self_attn.o_proj.weight.data = block.self_attn.o_proj.weight.data[:, o_perm]
+                    block.self_attn.v_proj.weight.data = block.self_attn.v_proj.weight.data[o_perm, :]
+            if "down" in resort_perms:
+                down_perm = resort_perms["down"]
+                block.mlp.down_proj.weight.data = block.mlp.down_proj.weight.data[:, down_perm]
+                block.mlp.gate_proj.weight.data = block.mlp.gate_proj.weight.data[down_perm, :]
+                block.mlp.up_proj.weight.data = block.mlp.up_proj.weight.data[down_perm, :]
 
         # 2. Replace blocks with quantized versions
         quantized_attn = get_attention_layer(model.config)(
@@ -326,6 +504,17 @@ def gptq_quantization(
         gate_up_in_transform.remove_parametrizations()
         down_in_transform.remove_parametrizations() 
 
+        # --- NEW: Transform all weights BEFORE calibration ---
+        # This ensures the model forward pass (if any) uses pre-transformed weights, 
+        # and more importantly, that GPTQ handles are initialized with rotated weights.
+        block.self_attn.q_proj.weight.data = qkv_in_transform(block.self_attn.q_proj.weight, inv_t=True)
+        block.self_attn.k_proj.weight.data = qkv_in_transform(block.self_attn.k_proj.weight, inv_t=True)
+        block.self_attn.v_proj.weight.data = qkv_in_transform(block.self_attn.v_proj.weight, inv_t=True)
+        block.self_attn.o_proj.weight.data = o_in_transform(block.self_attn.o_proj.weight, inv_t=True)
+        block.mlp.gate_proj.weight.data = gate_up_in_transform(block.mlp.gate_proj.weight, inv_t=True)
+        block.mlp.up_proj.weight.data = gate_up_in_transform(block.mlp.up_proj.weight, inv_t=True)
+        block.mlp.down_proj.weight.data = down_in_transform(block.mlp.down_proj.weight, inv_t=True)
+
         # 4. Create GPTQ handles and hooks
         gptq_handles = {}
         hooks = {}
@@ -339,28 +528,23 @@ def gptq_quantization(
                     rel_damp=args.rel_damp,
                     export_quantized_model=args.export_quantized_model
                 )
+                
+                # Update weight reference in handle (since it was just rotated)
+                gptq_handles[layer_name].W = layer.weight.data.clone()
+
                 # Get weight global scale
                 if args.scale_precision == ScalePrecision.E4M3:
-                    # Rotate weight
-                    with torch.no_grad():
-                        if re.search("(q|k|v)_proj", layer_name):
-                            layer_transform = qkv_in_transform
-                        elif re.search("o_proj", layer_name):
-                            layer_transform = o_in_transform
-                        elif re.search("(gate|up)_proj", layer_name):
-                            layer_transform = gate_up_in_transform
-                        else:
-                            layer_transform = down_in_transform
-                        weight = layer_transform(layer.weight, inv_t=True)
-                    
-                    gptq_handles[layer_name].quantizer.get_quantization_params(weight)
-                    # Turn off global scale tracking
+                    # Weights are already rotated, just compute scales
+                    gptq_handles[layer_name].quantizer.get_quantization_params(layer.weight)
                     gptq_handles[layer_name].quantizer._track_global_scale = False
-                # Attach hook
+
+                # Attach hook. The activation inp[0] is ALREADY transformed by LlamaAttention/LlamaMLP.
                 def update_handle_hook(name):
                     def _hook(_, inp, out):
-                        gptq_handles[name].update(inp[0])
+                        x = inp[0]
+                        gptq_handles[name].update(x)
                     return _hook
+                
                 hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
 
         # Fuse global scales
@@ -382,45 +566,31 @@ def gptq_quantization(
             gptq_handles["mlp.gate_proj"].quantizer.global_scale = gate_up_global_scale
             gptq_handles["mlp.up_proj"].quantizer.global_scale = gate_up_global_scale
 
-        # 5. Process calibration data
-        device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
-        for inp_args, inp_kwargs in zip(input_args, input_kwargs):
-            # Ensure block doesn't return past_key_value during calibration replay
-            # which can cause "too many values to unpack" in some transformers versions
-            inp_kwargs["use_cache"] = False
-            if "past_key_value" in inp_kwargs:
-                inp_kwargs["past_key_value"] = None
-            if "output_attentions" in inp_kwargs:
-                inp_kwargs["output_attentions"] = False
-                
-            with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
-                block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
-        # Remove hooks
-        for hook in hooks.values():
-            hook.remove()
-
-        # 6. Transform all weights before quantization
-        block.self_attn.q_proj.weight.data = qkv_in_transform(block.self_attn.q_proj.weight, inv_t=True)
-        block.self_attn.k_proj.weight.data = qkv_in_transform(block.self_attn.k_proj.weight, inv_t=True)
-        block.self_attn.v_proj.weight.data = qkv_in_transform(block.self_attn.v_proj.weight, inv_t=True)
-        block.self_attn.o_proj.weight.data = o_in_transform(block.self_attn.o_proj.weight, inv_t=True)
-        block.mlp.gate_proj.weight.data = gate_up_in_transform(block.mlp.gate_proj.weight, inv_t=True)
-        block.mlp.up_proj.weight.data = gate_up_in_transform(block.mlp.up_proj.weight, inv_t=True)
-        block.mlp.down_proj.weight.data = down_in_transform(block.mlp.down_proj.weight, inv_t=True)
-
-        # IMPORTANT: GPTQ handles were initialized with un-rotated weights. 
-        # We must update them with the rotated weights now.
-        for layer_name, gptq_handle in gptq_handles.items():
-            gptq_handle.W = gptq_handle.layer.weight.data.clone()
-
-        # Set train_mode to False
+        # Set train_mode to False BEFORE calibration
+        # so QLinear doesn't dynamically transform weights we already pre-rotated
         for layer_name, layer in block.named_modules():
             if isinstance(layer, QLinear):
                 layer._train_mode = False
+
+        # 5. Process calibration data (Collects Hessian aligned with rotated weights)
+        device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+        for inp_args, inp_kwargs in zip(input_args, input_kwargs):
+            inp_kwargs["use_cache"] = False
+            if "past_key_value" in inp_kwargs: inp_kwargs["past_key_value"] = None
+            if "output_attentions" in inp_kwargs: inp_kwargs["output_attentions"] = False
+            with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
+                block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
+        
+        # Remove hooks
+        for hook in hooks.values(): hook.remove()
+
+        # Freeze act scales AFTER calibration
+        for layer_name, layer in block.named_modules():
+            if isinstance(layer, QLinear):
                 if layer.act_quantizer:
                     layer.act_quantizer._track_global_scale = False
 
-        # 7. Run GPTQ quantization
+        # 7. Run GPTQ quantization (Already aligned)
         for layer_name, gptq_handle in gptq_handles.items():
             dequantized_qweight, qweight, scales = gptq_handle.quantize()
             orig_weight = gptq_handle.layer.weight

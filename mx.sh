@@ -31,6 +31,7 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --dtype=bfloat16 \
     --fuse_global_scale \
     --show_act_mse \
-    # --eval_perplexity \
-    # --eval_openllm \
-    # --lm_eval_tasks piqa winogrande \
+    --channel_resort P95 \
+    --eval_perplexity \
+    --eval_openllm \
+    --lm_eval_tasks piqa winogrande \
