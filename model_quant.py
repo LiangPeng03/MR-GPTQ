@@ -257,8 +257,8 @@ def parse_args():
         "--channel_resort",
         type=str,
         default="none",
-        choices=["none", "mean", "P95"],
-        help="Apply grid-aware channel reordering (GridSort) based on channel 'mean' or 'P95', or use 'none' to skip.",
+        choices=["none", "mean", "P95", "minmax"],
+        help="Apply grid-aware channel reordering (GridSort) based on channel 'mean' or 'P95', 'minmax', or use 'none' to skip.",
     )
     # Transform params
     parser.add_argument(
@@ -370,6 +370,12 @@ def parse_args():
         assert args.format in ["nvfp", "mxfp"], "`export_quantization` is only supported for nvfp and mxfp formats."
         assert args.w_bits == 4, "`export_quantization` is only supported for 4 bit weights."
         assert args.a_bits == 4, "`export_quantization` is only supported for 4 bit activations."
+        
+    if args.format == "nvfp" and args.channel_resort == "minmax":
+        if args.transform_class != "identity":
+            print("Forcing transform_class to 'identity' since format is nvfp and channel_resort is 'minmax'.")
+            args.transform_class = "identity"
+            
     return args
 
 

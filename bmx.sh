@@ -40,21 +40,21 @@ for MODEL in "${MODELS[@]}"; do
         --model_name_or_path=$MODEL \
         --format=mxfp \
         --w_bits=4 \
-        --a_bits=4 \
+        --a_bits=16 \
         --w_group_size=32 \
         --a_group_size=32 \
-        --transform_class=identity \
+        --transform_class=hadamard \
         --w_observer=minmax \
         --quantization_order=activation \
         --hadamard_group_size=128 \
         --dataset_name_or_path=fineweb-edu \
         --num_sequences=128 \
-        --gptq \
         --rel_damp=0.01 \
+        --gptq \
         --sequence_length=2048 \
         --dtype=bfloat16 \
         --fuse_global_scale \
-        --channel_resort P95\
+        --channel_resort minmax\
         --eval_perplexity \
         --eval_openllm \
         --lm_eval_tasks piqa winogrande"

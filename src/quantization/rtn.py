@@ -117,7 +117,7 @@ def rtn_quantization(
             act_means = {}
             for name, caches in list(act_caches.items()):
                 X = torch.cat(caches, dim=0) # (N_tokens, Dim)
-                if args.channel_resort == "P95":
+                if args.channel_resort in ["P95", "minmax"]:
                     act_means[name] = torch.quantile(X, 0.95, dim=0).to(device)
                 else: # "mean" or "R_val"
                     act_means[name] = X.mean(dim=0).to(device)
@@ -195,6 +195,22 @@ def rtn_quantization(
                     perm.extend(group)
                 
                 return torch.tensor(perm, device=act_stat.device, dtype=torch.long)
+                
+            def compute_minmax_perm(act_stat, group_size):
+                N = act_stat.shape[0]
+                sorted_idx = torch.argsort(act_stat, descending=True)
+                head, tail = 0, N - 1
+                perm = []
+                while head < tail and len(perm) + group_size <= N:
+                    group = [sorted_idx[head].item()]
+                    head += 1
+                    for _ in range(group_size - 1):
+                        group.append(sorted_idx[tail].item())
+                        tail -= 1
+                    perm.extend(group)
+                for i in range(head, tail + 1):
+                    perm.append(sorted_idx[i].item())
+                return torch.tensor(perm, device=act_stat.device, dtype=torch.long)
 
             for name, mean_val in act_means.items():
                 abs_vals = mean_val.abs()
@@ -220,6 +236,30 @@ def rtn_quantization(
                             
                     resort_perms[name] = p
                     print(f"    [{name:8}] GridSort completed.")
+                elif args.channel_resort == "minmax":
+                    # Min-Max Pairing for both NVFP4 and MXFP4
+                    if args.format == "mxfp":
+                        gs = args.hadamard_group_size if args.hadamard_group_size > 0 else 128
+                    else:
+                        gs = quant_group_size
+                        
+                    if "o" in name:
+                        head_dim = model.config.hidden_size // model.config.num_attention_heads
+                        h_group_size = head_dim
+                    else:
+                        h_group_size = -1
+                        
+                    if h_group_size <= 0:
+                        p = compute_minmax_perm(abs_vals, group_size=gs)
+                    else:
+                        p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
+                        for i in range(0, N, h_group_size):
+                            block_vals = abs_vals[i : i + h_group_size]
+                            block_gs = min(gs, h_group_size)
+                            block_perm = compute_minmax_perm(block_vals, group_size=block_gs)
+                            p[i : i + h_group_size] = block_perm + i
+                    resort_perms[name] = p
+                    print(f"    [{name:8}] MinMax Pairing (gs={gs}) completed.")
                 else:
                     # Old Resonance R_val Strategy
                     h_group_size = args.hadamard_group_size
