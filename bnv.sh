@@ -40,7 +40,7 @@ for MODEL in "${MODELS[@]}"; do
         --model_name_or_path=$MODEL \
         --format=nvfp \
         --w_bits=4 \
-        --a_bits=16 \
+        --a_bits=4 \
         --w_group_size=16 \
         --a_group_size=16 \
         --transform_class=identity \
@@ -55,6 +55,7 @@ for MODEL in "${MODELS[@]}"; do
         --dtype=bfloat16 \
         --fuse_global_scale \
         --channel_resort minmax \
+        --outlier_ratio 0.005 \
         --eval_perplexity \
         --eval_openllm \
         --lm_eval_tasks piqa winogrande"

@@ -14,9 +14,9 @@ MODEL5="Qwen/Qwen3-8B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL3} \
+    --model_name_or_path=${MODEL4} \
     --format=mxfp \
-    --w_bits=16 \
+    --w_bits=4 \
     --a_bits=4 \
     --w_group_size=32 \
     --a_group_size=32 \
@@ -31,7 +31,8 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --dtype=bfloat16 \
     --fuse_global_scale \
     --show_act_mse \
-    --channel_resort P95 \
+    --gptq \
+    --channel_resort minmax \
     --eval_perplexity \
     --eval_openllm \
     --lm_eval_tasks piqa winogrande \

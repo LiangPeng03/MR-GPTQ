@@ -23,22 +23,30 @@ from fast_hadamard_transform import hadamard_transform
 
 # ======================== 核心算法 ========================
 
-def compute_minmax_perm(act_stat, group_size=128):
-    """首尾配对: 每个 group_size (128) 包含 1 个最大 + (group_size-1) 个最小"""
+def compute_truncated_minmax_perm(act_stat, group_size=128, outlier_ratio=0.005):
+    """Truncated MinMax Strategy"""
     N = act_stat.shape[0]
     sorted_idx = torch.argsort(act_stat, descending=True)
+    
+    n_outliers = int(N * outlier_ratio)
     head, tail = 0, N - 1
     perm = []
-    while head < tail and len(perm) + group_size <= N:
+    
+    for _ in range(n_outliers):
+        if head >= tail: break
         group = [sorted_idx[head].item()]
         head += 1
         for _ in range(group_size - 1):
+            if head > tail: break
             group.append(sorted_idx[tail].item())
             tail -= 1
         perm.extend(group)
-    for i in range(head, tail + 1):
-        perm.append(sorted_idx[i].item())
-    return torch.tensor(perm, dtype=torch.long)
+        
+    remaining = [sorted_idx[i].item() for i in range(head, tail + 1)]
+    remaining = sorted(remaining)
+    
+    perm.extend(remaining)
+    return torch.tensor(perm, device=act_stat.device, dtype=torch.long)
 
 
 def apply_hadamard_128(x, dim=-1):
@@ -133,13 +141,13 @@ def analyze_layer(layer_idx, act, weight, quantizer, device):
     dim = act.shape[-1]
     n_tokens = min(50, act.shape[0])
     
-    # 1. 计算 P95 统计量并获得 MinMax 排列
-    p95 = torch.quantile(act.abs(), 0.95, dim=0)
-    perm = compute_minmax_perm(p95, group_size=128)
-    inv_perm = torch.argsort(perm)
-    
     # 近似 Hessian 对角线
     hessian_diag = (act[:n_tokens] ** 2).mean(dim=0)
+    
+    # 1. 计算 P95 统计量并获得 Truncated MinMax 排列 (outlier_ratio=0.005)
+    p95 = torch.quantile(act.abs(), 0.95, dim=0)
+    perm = compute_truncated_minmax_perm(p95, group_size=128, outlier_ratio=0.001)
+    inv_perm = torch.argsort(perm)
     
     # 权重子矩阵，用于快速评估输出空间误差
     n_out = min(128, weight.shape[0])

@@ -21,20 +21,25 @@ from src.transforms.transforms import build_transform
 # ======================== 核心算法 ========================
 
 def compute_minmax_perm(act_stat, group_size):
-    """首尾配对: 1个最大 + (group_size-1)个最小"""
+    """Truncated MinMax (outlier_ratio=0.01)"""
+    outlier_ratio = 0.01
     N = act_stat.shape[0]
     sorted_idx = torch.argsort(act_stat, descending=True)
+    n_outliers = int(N * outlier_ratio)
     head, tail = 0, N - 1
     perm = []
-    while head < tail and len(perm) + group_size <= N:
+    for _ in range(n_outliers):
+        if head >= tail: break
         group = [sorted_idx[head].item()]
         head += 1
         for _ in range(group_size - 1):
+            if head > tail: break
             group.append(sorted_idx[tail].item())
             tail -= 1
         perm.extend(group)
-    for i in range(head, tail + 1):
-        perm.append(sorted_idx[i].item())
+    remaining = [sorted_idx[i].item() for i in range(head, tail + 1)]
+    remaining = sorted(remaining)
+    perm.extend(remaining)
     return torch.tensor(perm, dtype=torch.long)
 
 

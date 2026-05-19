@@ -260,6 +260,12 @@ def parse_args():
         choices=["none", "mean", "P95", "minmax"],
         help="Apply grid-aware channel reordering (GridSort) based on channel 'mean' or 'P95', 'minmax', or use 'none' to skip.",
     )
+    parser.add_argument(
+        "--outlier_ratio",
+        type=float,
+        default=0.01,
+        help="Outlier ratio for Truncated MinMax channel reordering.",
+    )
     # Transform params
     parser.add_argument(
         "--transform_class",
