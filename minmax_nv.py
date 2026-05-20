@@ -20,27 +20,43 @@ from src.transforms.transforms import build_transform
 
 # ======================== 核心算法 ========================
 
-def compute_minmax_perm(act_stat, group_size):
-    """Truncated MinMax (outlier_ratio=0.01)"""
-    outlier_ratio = 0.01
+def compute_nvfp4_scale_first_perm(act_stat, w_norm, group_size=16):
+    w_norm = w_norm.to(act_stat.device)
     N = act_stat.shape[0]
-    sorted_idx = torch.argsort(act_stat, descending=True)
-    n_outliers = int(N * outlier_ratio)
-    head, tail = 0, N - 1
+    n_groups = max(1, N // group_size)
+    score = act_stat * w_norm
+    score_sorted_idx = torch.argsort(score, descending=True)
+    anchors = score_sorted_idx[:n_groups].tolist()
+    groups = [[a] for a in anchors]
+    group_lens = torch.ones(n_groups, dtype=torch.long, device=act_stat.device)
+    FP4_GRID = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=act_stat.device)
+    remaining_mask = torch.ones(N, dtype=torch.bool, device=act_stat.device)
+    remaining_mask[anchors] = False
+    remaining_idx = remaining_mask.nonzero(as_tuple=True)[0]
+    remaining_p95 = act_stat[remaining_idx]
+    rem_sorted_idx = remaining_idx[torch.argsort(remaining_p95, descending=True)]
+    group_scales = torch.tensor([act_stat[a] / 6.0 + 1e-12 for a in anchors], device=act_stat.device)
+    group_w_sums = torch.tensor([w_norm[a] for a in anchors], device=act_stat.device)
+    for ch_idx in rem_sorted_idx.tolist():
+        val = act_stat[ch_idx]
+        w = w_norm[ch_idx]
+        new_scales = torch.maximum(group_scales, torch.tensor(val / 6.0 + 1e-12, device=act_stat.device))
+        normalized = val / new_scales
+        distances = (normalized.unsqueeze(1) - FP4_GRID.unsqueeze(0)).abs()
+        min_errs = distances.min(dim=1).values * new_scales
+        damage = min_errs * w
+        scale_diff = new_scales - group_scales
+        damage += scale_diff * group_w_sums
+        damage[group_lens >= group_size] = float('inf')
+        best_g_idx = damage.argmin().item()
+        groups[best_g_idx].append(ch_idx)
+        group_lens[best_g_idx] += 1
+        group_scales[best_g_idx] = new_scales[best_g_idx]
+        group_w_sums[best_g_idx] += w
     perm = []
-    for _ in range(n_outliers):
-        if head >= tail: break
-        group = [sorted_idx[head].item()]
-        head += 1
-        for _ in range(group_size - 1):
-            if head > tail: break
-            group.append(sorted_idx[tail].item())
-            tail -= 1
-        perm.extend(group)
-    remaining = [sorted_idx[i].item() for i in range(head, tail + 1)]
-    remaining = sorted(remaining)
-    perm.extend(remaining)
-    return torch.tensor(perm, dtype=torch.long)
+    for g in groups:
+        perm.extend(g)
+    return torch.tensor(perm, device=act_stat.device, dtype=torch.long)
 
 
 def quantize_and_mse(x, quantizer, device):
@@ -115,9 +131,10 @@ def analyze_layer(layer_idx, act, weight, quantizer, device, group_size=16):
     
     # --- 1. 计算 P95 统计量 ---
     p95 = torch.quantile(act.abs(), 0.95, dim=0)
+    w_norm = weight.float().norm(p=2, dim=0).to(p95.device)
     
     # --- 2. 计算 MinMax 排列 ---
-    perm = compute_minmax_perm(p95, group_size)
+    perm = compute_nvfp4_scale_first_perm(p95, w_norm, group_size)
     
     # --- 3. 激活值量化对比 ---
     # 取多行token做平均MSE（取前100行避免太慢）

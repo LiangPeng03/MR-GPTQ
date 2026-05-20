@@ -20,10 +20,10 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --a_bits=4 \
     --w_group_size=32 \
     --a_group_size=32 \
-    --transform_class=identity \
+    --transform_class=hadamard \
     --w_observer=minmax \
     --quantization_order=activation \
-    --hadamard_group_size=128 \
+    --hadamard_group_size=32 \
     --dataset_name_or_path=fineweb-edu \
     --num_sequences=128 \
     --rel_damp=0.01 \

@@ -23,50 +23,52 @@ from fast_hadamard_transform import hadamard_transform
 
 # ======================== 核心算法 ========================
 
-def compute_truncated_minmax_perm(act_stat, group_size=128, outlier_ratio=0.005):
-    """Truncated MinMax Strategy"""
+def compute_mxfp4_vip_l1_perm(act_stat, w_norm, block_size=32):
+    """VIP+L1 平滑策略 (VIP Anchored L1 Balancing)"""
+    w_norm = w_norm.to(act_stat.device)
     N = act_stat.shape[0]
-    sorted_idx = torch.argsort(act_stat, descending=True)
-    
-    n_outliers = int(N * outlier_ratio)
-    head, tail = 0, N - 1
+    n_blocks = max(1, N // block_size)
+    score = act_stat * w_norm
+    score_sorted_idx = torch.argsort(score, descending=True)
+    vips = score_sorted_idx[:n_blocks].tolist()
+    blocks = [[vip] for vip in vips]
+    block_lens = torch.ones(n_blocks, dtype=torch.long, device=act_stat.device)
+    block_l1 = torch.tensor([act_stat[vip] for vip in vips], device=act_stat.device)
+    remaining_mask = torch.ones(N, dtype=torch.bool, device=act_stat.device)
+    remaining_mask[vips] = False
+    remaining_idx = remaining_mask.nonzero(as_tuple=True)[0]
+    remaining_p95 = act_stat[remaining_idx]
+    rem_sorted_idx = remaining_idx[torch.argsort(remaining_p95, descending=True)]
+    for ch_idx in rem_sorted_idx.tolist():
+        val = act_stat[ch_idx]
+        valid_l1 = block_l1.clone()
+        valid_l1[block_lens >= block_size] = float('inf')
+        min_block_idx = valid_l1.argmin().item()
+        blocks[min_block_idx].append(ch_idx)
+        block_lens[min_block_idx] += 1
+        block_l1[min_block_idx] += val
     perm = []
-    
-    for _ in range(n_outliers):
-        if head >= tail: break
-        group = [sorted_idx[head].item()]
-        head += 1
-        for _ in range(group_size - 1):
-            if head > tail: break
-            group.append(sorted_idx[tail].item())
-            tail -= 1
-        perm.extend(group)
-        
-    remaining = [sorted_idx[i].item() for i in range(head, tail + 1)]
-    remaining = sorted(remaining)
-    
-    perm.extend(remaining)
+    for b in blocks:
+        perm.extend(b)
     return torch.tensor(perm, device=act_stat.device, dtype=torch.long)
 
 
-def apply_hadamard_128(x, dim=-1):
-    """在 128 大小的 Block 上应用 Fast Hadamard Transform"""
+def apply_hadamard(x, dim=-1, hadamard_size=32):
+    """应用 Fast Hadamard Transform"""
     orig_shape = x.shape
     device = x.device
     dtype = x.dtype
     
-    # 确保在指定的维度上大小可以被 128 整除
     size = x.shape[dim]
-    assert size % 128 == 0, f"Dimension size {size} is not divisible by 128."
+    assert size % hadamard_size == 0, f"Dimension size {size} is not divisible by {hadamard_size}."
     
-    # 将指定维度移到最后
     if dim != -1 and dim != x.ndim - 1:
         x = x.transpose(dim, -1)
     
-    flat_shape = list(x.shape[:-1]) + [-1, 128]
-    x_reshaped = x.reshape(-1, 128)
+    flat_shape = list(x.shape[:-1]) + [-1, hadamard_size]
+    x_reshaped = x.reshape(-1, hadamard_size)
     
-    scale = 1.0 / math.sqrt(128)
+    scale = 1.0 / math.sqrt(hadamard_size)
     x_rot = hadamard_transform(x_reshaped, scale=scale)
     
     x_out = x_rot.view(x.shape)
@@ -134,27 +136,25 @@ def collect_all_layer_data(model, tokenizer, device, n_layers):
 
 # ======================== 逐层分析 ========================
 
-def analyze_layer(layer_idx, act, weight, quantizer, device):
+def analyze_layer(layer_idx, act, weight, quantizer, device, hadamard_size=32):
     """
-    针对 MXFP4 对一层进行完整的 MinMax & Hadamard 诊断
+    针对 MXFP4 对一层进行完整的 VIP+L1 & Hadamard 诊断
     """
     dim = act.shape[-1]
     n_tokens = min(50, act.shape[0])
     
-    # 近似 Hessian 对角线
-    hessian_diag = (act[:n_tokens] ** 2).mean(dim=0)
-    
-    # 1. 计算 P95 统计量并获得 Truncated MinMax 排列 (outlier_ratio=0.005)
+    w_norm = weight.float().norm(p=2, dim=0).to(device)
     p95 = torch.quantile(act.abs(), 0.95, dim=0)
-    perm = compute_truncated_minmax_perm(p95, group_size=128, outlier_ratio=0.001)
+    
+    perm = compute_mxfp4_vip_l1_perm(p95, w_norm, block_size=hadamard_size)
     inv_perm = torch.argsort(perm)
     
     # 权重子矩阵，用于快速评估输出空间误差
     n_out = min(128, weight.shape[0])
     W = weight[:n_out, :].float().to(device)  # (n_out, dim)
     
-    # 区分通道重要性
-    importance = hessian_diag * p95 ** 2
+    hessian_diag = (act[:n_tokens].cpu().float() ** 2).mean(dim=0)
+    importance = hessian_diag * p95.cpu() ** 2
     imp_sorted = torch.argsort(importance, descending=True)
     top10_mask = torch.zeros(dim, dtype=torch.bool)
     top10_mask[imp_sorted[:dim // 10]] = True
@@ -181,17 +181,17 @@ def analyze_layer(layer_idx, act, weight, quantizer, device):
     for t in range(n_tokens):
         x = act[t:t+1, :].to(device)  # (1, dim)
         
-        # A. Baseline: Hadamard 128 Only
-        x_rot = apply_hadamard_128(x)
+        # A. Baseline: Hadamard Only
+        x_rot = apply_hadamard(x, hadamard_size=hadamard_size)
         _, pg_mse_o, pg_scale_o, x_rot_q = quantize_and_mse_mxfp4(x_rot, quantizer, device)
-        x_q_orig = apply_hadamard_128(x_rot_q.to(device))
+        x_q_orig = apply_hadamard(x_rot_q.to(device), hadamard_size=hadamard_size)
         delta_orig = (x_q_orig - x).squeeze(0).cpu().float()
         
-        # B. MinMax: Reordering + Hadamard 128
+        # B. MinMax: Reordering + Hadamard
         x_perm = x[:, perm]
-        x_perm_rot = apply_hadamard_128(x_perm)
+        x_perm_rot = apply_hadamard(x_perm, hadamard_size=hadamard_size)
         _, pg_mse_m, pg_scale_m, x_perm_rot_q = quantize_and_mse_mxfp4(x_perm_rot, quantizer, device)
-        x_perm_q = apply_hadamard_128(x_perm_rot_q.to(device))
+        x_perm_q = apply_hadamard(x_perm_rot_q.to(device), hadamard_size=hadamard_size)
         x_q_mm = x_perm_q[:, inv_perm]
         delta_mm = (x_q_mm - x).squeeze(0).cpu().float()
         
@@ -239,30 +239,30 @@ def analyze_layer(layer_idx, act, weight, quantizer, device):
     for r in range(n_rows):
         w = weight[r:r+1, :].to(device)  # (1, dim)
         
-        # Baseline: Hadamard 128 Only
-        w_rot = apply_hadamard_128(w)
+        # Baseline: Hadamard Only
+        w_rot = apply_hadamard(w, hadamard_size=hadamard_size)
         _, _, _, w_rot_q = quantize_and_mse_mxfp4(w_rot, quantizer, device)
-        w_q_orig = apply_hadamard_128(w_rot_q.to(device))
+        w_q_orig = apply_hadamard(w_rot_q.to(device), hadamard_size=hadamard_size)
         wt_mse_orig_list.append((w_q_orig - w).pow(2).mean().item())
         
-        # MinMax: Reordering + Hadamard 128
+        # MinMax: Reordering + Hadamard
         w_perm = w[:, perm]
-        w_perm_rot = apply_hadamard_128(w_perm)
+        w_perm_rot = apply_hadamard(w_perm, hadamard_size=hadamard_size)
         _, _, _, w_perm_rot_q = quantize_and_mse_mxfp4(w_perm_rot, quantizer, device)
-        w_perm_q = apply_hadamard_128(w_perm_rot_q.to(device))
+        w_perm_q = apply_hadamard(w_perm_rot_q.to(device), hadamard_size=hadamard_size)
         w_q_mm = w_perm_q[:, inv_perm]
         wt_mse_minmax_list.append((w_q_mm - w).pow(2).mean().item())
         
-    # ---- 128-size Hadamard 块内 Outlier 数量统计 ----
-    # 统计 P95 统计量在 128-block 里的分布情况，证明 Outlier 分散度
+    # ---- Hadamard 块内 Outlier 数量统计 ----
+    # 统计 P95 统计量在 block 里的分布情况，证明 Outlier 分散度
     median_p95 = p95.median().item()
     is_outlier = (p95 > 2 * median_p95)
     
-    # 原始排列下每个 block (128) 内 Outlier 的数量
-    outliers_per_block_orig = is_outlier.view(-1, 128).sum(dim=-1).cpu().numpy()
+    # 原始排列下每个 block 内 Outlier 的数量
+    outliers_per_block_orig = is_outlier.view(-1, hadamard_size).sum(dim=-1).cpu().numpy()
     
-    # MinMax 排列下每个 block (128) 内 Outlier 的数量
-    outliers_per_block_mm = is_outlier[perm].view(-1, 128).sum(dim=-1).cpu().numpy()
+    # MinMax 排列下每个 block 内 Outlier 的数量
+    outliers_per_block_mm = is_outlier[perm].view(-1, hadamard_size).sum(dim=-1).cpu().numpy()
     
     result = {
         'wt_mse_orig': np.mean(wt_mse_orig_list),
@@ -274,7 +274,7 @@ def analyze_layer(layer_idx, act, weight, quantizer, device):
         'outliers_per_block_orig': outliers_per_block_orig,
         'outliers_per_block_mm': outliers_per_block_mm,
         'n_total_groups': dim // 32,
-        'n_total_blocks': dim // 128,
+        'n_total_blocks': dim // hadamard_size,
         'perm': perm,
     }
     
@@ -497,7 +497,7 @@ def main():
     all_results = {}
     for l in range(n_layers):
         print(f"  Layer {l}/{n_layers-1}...", end=" ", flush=True)
-        result = analyze_layer(l, activations[l], weights[l], quantizer, device)
+        result = analyze_layer(l, activations[l], weights[l], quantizer, device, hadamard_size=32)
         all_results[l] = result
         
         act_chg = (result['mse_mm'] - result['mse_orig']) / (result['mse_orig'] + 1e-15) * 100

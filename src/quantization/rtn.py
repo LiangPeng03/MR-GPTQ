@@ -220,11 +220,90 @@ def rtn_quantization(
                 perm.extend(remaining)
                 return torch.tensor(perm, device=act_stat.device, dtype=torch.long)
 
-            def compute_hessian_quarantine_perm(h_diag, block_size=128):
-                return torch.argsort(h_diag, descending=True).to(device=h_diag.device, dtype=torch.long)
+            def get_combined_weight_norm(block, name):
+                if name == "qkv":
+                    w = torch.cat([block.self_attn.q_proj.weight, block.self_attn.k_proj.weight, block.self_attn.v_proj.weight], dim=0)
+                elif name == "o":
+                    w = block.self_attn.o_proj.weight
+                elif name == "gate_up":
+                    w = torch.cat([block.mlp.gate_proj.weight, block.mlp.up_proj.weight], dim=0)
+                elif name == "down":
+                    w = block.mlp.down_proj.weight
+                else:
+                    return None
+                return w.float().norm(p=2, dim=0).to(device)
+
+            def compute_nvfp4_scale_first_perm(act_stat, w_norm, group_size=16):
+                w_norm = w_norm.to(act_stat.device)
+                N = act_stat.shape[0]
+                n_groups = max(1, N // group_size)
+                score = act_stat * w_norm
+                score_sorted_idx = torch.argsort(score, descending=True)
+                anchors = score_sorted_idx[:n_groups].tolist()
+                groups = [[a] for a in anchors]
+                group_lens = torch.ones(n_groups, dtype=torch.long, device=act_stat.device)
+                FP4_GRID = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=act_stat.device)
+                remaining_mask = torch.ones(N, dtype=torch.bool, device=act_stat.device)
+                remaining_mask[anchors] = False
+                remaining_idx = remaining_mask.nonzero(as_tuple=True)[0]
+                remaining_p95 = act_stat[remaining_idx]
+                rem_sorted_idx = remaining_idx[torch.argsort(remaining_p95, descending=True)]
+                group_scales = torch.tensor([act_stat[a] / 6.0 + 1e-12 for a in anchors], device=act_stat.device)
+                group_w_sums = torch.tensor([w_norm[a] for a in anchors], device=act_stat.device)
+                for ch_idx in rem_sorted_idx.tolist():
+                    val = act_stat[ch_idx]
+                    w = w_norm[ch_idx]
+                    new_scales = torch.maximum(group_scales, torch.tensor(val / 6.0 + 1e-12, device=act_stat.device))
+                    normalized = val / new_scales
+                    distances = (normalized.unsqueeze(1) - FP4_GRID.unsqueeze(0)).abs()
+                    min_errs = distances.min(dim=1).values * new_scales
+                    damage = min_errs * w
+                    scale_diff = new_scales - group_scales
+                    damage += scale_diff * group_w_sums
+                    damage[group_lens >= group_size] = float('inf')
+                    best_g_idx = damage.argmin().item()
+                    groups[best_g_idx].append(ch_idx)
+                    group_lens[best_g_idx] += 1
+                    group_scales[best_g_idx] = new_scales[best_g_idx]
+                    group_w_sums[best_g_idx] += w
+                perm = []
+                for g in groups:
+                    perm.extend(g)
+                return torch.tensor(perm, device=act_stat.device, dtype=torch.long)
+
+            def compute_mxfp4_vip_l1_perm(act_stat, w_norm, block_size=128):
+                w_norm = w_norm.to(act_stat.device)
+                N = act_stat.shape[0]
+                n_blocks = max(1, N // block_size)
+                score = act_stat * w_norm
+                score_sorted_idx = torch.argsort(score, descending=True)
+                vips = score_sorted_idx[:n_blocks].tolist()
+                blocks = [[vip] for vip in vips]
+                block_lens = torch.ones(n_blocks, dtype=torch.long, device=act_stat.device)
+                block_l1 = torch.tensor([act_stat[vip] for vip in vips], device=act_stat.device)
+                remaining_mask = torch.ones(N, dtype=torch.bool, device=act_stat.device)
+                remaining_mask[vips] = False
+                remaining_idx = remaining_mask.nonzero(as_tuple=True)[0]
+                remaining_p95 = act_stat[remaining_idx]
+                rem_sorted_idx = remaining_idx[torch.argsort(remaining_p95, descending=True)]
+                for ch_idx in rem_sorted_idx.tolist():
+                    val = act_stat[ch_idx]
+                    valid_l1 = block_l1.clone()
+                    valid_l1[block_lens >= block_size] = float('inf')
+                    min_block_idx = valid_l1.argmin().item()
+                    blocks[min_block_idx].append(ch_idx)
+                    block_lens[min_block_idx] += 1
+                    block_l1[min_block_idx] += val
+                perm = []
+                for b in blocks:
+                    perm.extend(b)
+                return torch.tensor(perm, device=act_stat.device, dtype=torch.long)
 
             for name, mean_val in act_means.items():
                 abs_vals = mean_val.abs()
+                w_norm = get_combined_weight_norm(block, name)
+                if w_norm is None:
+                    w_norm = torch.ones_like(abs_vals)
                 N = abs_vals.shape[0]
                 quant_group_size = args.a_group_size if args.a_group_size else 16
                 
@@ -258,15 +337,16 @@ def rtn_quantization(
                             h_group_size = -1
                             
                         if h_group_size <= 0:
-                            p = compute_truncated_minmax_perm(abs_vals, group_size=gs, outlier_ratio=args.outlier_ratio)
+                            p = compute_mxfp4_vip_l1_perm(abs_vals, w_norm, block_size=gs)
                         else:
                             p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
                             for i in range(0, N, h_group_size):
                                 block_vals = abs_vals[i : i + h_group_size]
+                                block_w_norm = w_norm[i : i + h_group_size]
                                 block_gs = min(gs, h_group_size)
-                                block_perm = compute_truncated_minmax_perm(block_vals, group_size=block_gs, outlier_ratio=args.outlier_ratio)
+                                block_perm = compute_mxfp4_vip_l1_perm(block_vals, block_w_norm, block_size=block_gs)
                                 p[i : i + h_group_size] = block_perm + i
-                        print(f"    [{name:8}] Truncated MinMax Pairing (gs={gs}, ratio={args.outlier_ratio}) completed.")
+                        print(f"    [{name:8}] VIP+L1 平滑 (gs={gs}) completed.")
                     else:
                         gs = quant_group_size
                         if "o" in name:
@@ -276,15 +356,16 @@ def rtn_quantization(
                             h_group_size = -1
                             
                         if h_group_size <= 0:
-                            p = compute_truncated_minmax_perm(abs_vals, group_size=gs, outlier_ratio=args.outlier_ratio)
+                            p = compute_nvfp4_scale_first_perm(abs_vals, w_norm, group_size=gs)
                         else:
                             p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
                             for i in range(0, N, h_group_size):
                                 block_vals = abs_vals[i : i + h_group_size]
+                                block_w_norm = w_norm[i : i + h_group_size]
                                 block_gs = min(gs, h_group_size)
-                                block_perm = compute_truncated_minmax_perm(block_vals, group_size=block_gs, outlier_ratio=args.outlier_ratio)
+                                block_perm = compute_nvfp4_scale_first_perm(block_vals, block_w_norm, group_size=block_gs)
                                 p[i : i + h_group_size] = block_perm + i
-                        print(f"    [{name:8}] Truncated MinMax Pairing (gs={gs}, ratio={args.outlier_ratio}) completed.")
+                        print(f"    [{name:8}] Scale-First Greedy Fill (gs={gs}) completed.")
                     resort_perms[name] = p
                 else:
                     # Old Resonance R_val Strategy
