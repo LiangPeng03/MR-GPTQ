@@ -451,8 +451,8 @@ def gptq_quantization(
                 remaining_mask = torch.ones(N, dtype=torch.bool, device=act_stat.device)
                 remaining_mask[anchors] = False
                 remaining_idx = remaining_mask.nonzero(as_tuple=True)[0]
-                remaining_p95 = act_stat[remaining_idx]
-                rem_sorted_idx = remaining_idx[torch.argsort(remaining_p95, descending=True)]
+                remaining_score = score[remaining_idx]
+                rem_sorted_idx = remaining_idx[torch.argsort(remaining_score, descending=True)]
                 group_scales = torch.tensor([act_stat[a] / 6.0 + 1e-12 for a in anchors], device=act_stat.device)
                 group_w_sums = torch.tensor([w_norm[a] for a in anchors], device=act_stat.device)
                 for ch_idx in rem_sorted_idx.tolist():

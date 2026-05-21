@@ -8,10 +8,10 @@ PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 # 待测试模型列表
 MODELS=(
     # "HuggingFaceTB/SmolLM2-135M"
-    # "Qwen/Qwen3-0.6B"
+    "Qwen/Qwen3-0.6B"
     "Qwen/Qwen3-8B"
     "meta-llama/Meta-Llama-3-8B"
-    # "meta-llama/Llama-2-7b-hf"
+    "meta-llama/Llama-2-7b-hf"
 )
 
 # 屏蔽冗余 Warning 和日志
@@ -39,7 +39,7 @@ for MODEL in "${MODELS[@]}"; do
     CMD="$PYTHON_BIN model_quant.py \
         --model_name_or_path=$MODEL \
         --format=nvfp \
-        --w_bits=16 \
+        --w_bits=4 \
         --a_bits=4 \
         --w_group_size=16 \
         --a_group_size=16 \
@@ -52,6 +52,7 @@ for MODEL in "${MODELS[@]}"; do
         --rel_damp=0.01 \
         --sequence_length=2048 \
         --dtype=bfloat16 \
+        --gptq \
         --fuse_global_scale \
         --channel_resort minmax \
         --eval_perplexity \
