@@ -255,6 +255,166 @@ def main():
     
     # 生成宏观图表（图表一和图表三）
     plot_macro_visualizations(activations, nv_q, device)
+    
+    # 针对 MxFP4 生成 1x2 对比诊断图 (Before vs After Hadamard-128)
+    plot_mx_macro_visualizations(activations, mx_q, transform, device)
+
+def plot_mx_macro_visualizations(activations, quantizer_mx, transform, device):
+    """
+    MxFP4 综合误差诊断分析方案 (MxFP4 Comprehensive Output Error Diagnostic)
+    生成 1x2 的高清对比图，对比旋转前 (Before Rotation) 和旋转后 (After Hadamard Rotation)。
+    """
+    print("\n" + "="*80)
+    print(" 🎨 GENERATING MXFP4 COMPREHENSIVE MACRO VISUALIZATIONS (1x2 Plot)")
+    print("="*80)
+    
+    gs = 32 # MxFP4 Group Size
+    bins = [1, 4, 8, 12, 16, 24, float('inf')]
+    short_bin_names = ["1-4", "4-8", "8-12", "12-16", "16-24", ">24"]
+    
+    for layer_idx, data in activations.items():
+        print(f"  Generating MxFP4 plots for Layer {layer_idx}...")
+        X = data['X']
+        W = data['W']
+        out_dim = W.shape[0]
+        n_tokens = X.shape[0]
+        n_groups_per_token = X.shape[1] // gs
+        
+        X_dev = X.to(device)
+        
+        # Calculate for BOTH Before and After Rotation
+        chart_data = {}
+        for rot_state, X_current in [("Before Rotation", X_dev), ("After Rotation (Hadamard-128)", transform(X_dev))]:
+            
+            # 1. 计算 Spikiness = max(|x|) / mean(|x|)
+            X_groups = X_current.view(-1, gs)
+            max_abs = X_groups.abs().max(dim=1).values
+            mean_abs = X_groups.abs().mean(dim=1)
+            spikiness = max_abs / (mean_abs + 1e-9)
+            
+            # 2. 计算量化 MSE
+            scales, zeros = quantizer_mx.get_quantization_params(X_current)
+            X_q = quantizer_mx(X_current, scales, zeros)
+            
+            # 如果是旋转后，需要转回原空间计算真实输出损失
+            if rot_state == "Before Rotation":
+                err_sq = (X_q - X_current).pow(2).view(-1, gs).cpu()
+            else:
+                X_q_orig_space = transform(X_q)
+                err_sq = (X_q_orig_space - X_dev).pow(2).view(-1, gs).cpu()
+                
+            W_g = W.view(out_dim, n_groups_per_token, gs).permute(1, 2, 0)
+            W_norm2 = W_g.pow(2).sum(dim=2) # (G, gs)
+            W_norm2_expanded = W_norm2.unsqueeze(0).expand(n_tokens, -1, -1).reshape(-1, gs)
+            
+            err_sq_out = err_sq * W_norm2_expanded / out_dim
+            total_output_mse = err_sq_out.sum().item()
+            
+            # Level binning
+            levels = X_q.abs().view(-1, gs).cpu() / (scales.view(-1, 1).cpu() + 1e-15)
+            
+            avg_mse_6x, avg_mse_4x, avg_mse_05x, avg_mse_0x, avg_mse_rest = [], [], [], [], []
+            counts_6x, counts_4x, counts_05x, counts_0x, counts_rest = [], [], [], [], []
+            freq_list = []
+            
+            for i in range(len(bins)-1):
+                low, high = bins[i], bins[i+1]
+                mask = (spikiness >= low) & (spikiness < high)
+                n_groups = mask.sum().item()
+                freq_list.append(n_groups / len(spikiness) * 100)
+                
+                if n_groups == 0:
+                    for l in [avg_mse_6x, avg_mse_4x, avg_mse_05x, avg_mse_0x, avg_mse_rest,
+                              counts_6x, counts_4x, counts_05x, counts_0x, counts_rest]:
+                        l.append(0.0)
+                else:
+                    bin_err = err_sq_out[mask.cpu()]
+                    bin_levels = levels[mask.cpu()]
+                    
+                    err_6x = (bin_err * (bin_levels >= 5.5)).sum().item() / total_output_mse * 100
+                    err_4x = (bin_err * ((bin_levels > 3.5) & (bin_levels < 4.5))).sum().item() / total_output_mse * 100
+                    err_05x = (bin_err * ((bin_levels > 0.25) & (bin_levels < 0.75))).sum().item() / total_output_mse * 100
+                    err_0x = (bin_err * (bin_levels < 0.25)).sum().item() / total_output_mse * 100
+                    
+                    mask_rest = ~( (bin_levels >= 5.5) | ((bin_levels > 3.5) & (bin_levels < 4.5)) | ((bin_levels > 0.25) & (bin_levels < 0.75)) | (bin_levels < 0.25) )
+                    err_rest = (bin_err * mask_rest).sum().item() / total_output_mse * 100
+                    
+                    c_6x = (bin_levels >= 5.5).sum().item() / n_groups
+                    c_4x = ((bin_levels > 3.5) & (bin_levels < 4.5)).sum().item() / n_groups
+                    c_05x = ((bin_levels > 0.25) & (bin_levels < 0.75)).sum().item() / n_groups
+                    c_0x = (bin_levels < 0.25).sum().item() / n_groups
+                    c_rest = mask_rest.sum().item() / n_groups
+                    
+                    avg_mse_6x.append(err_6x); avg_mse_4x.append(err_4x); avg_mse_05x.append(err_05x); avg_mse_0x.append(err_0x); avg_mse_rest.append(err_rest)
+                    counts_6x.append(c_6x); counts_4x.append(c_4x); counts_05x.append(c_05x); counts_0x.append(c_0x); counts_rest.append(c_rest)
+            
+            chart_data[rot_state] = {
+                'avg_mse_6x': avg_mse_6x, 'avg_mse_4x': avg_mse_4x, 'avg_mse_rest': avg_mse_rest,
+                'avg_mse_05x': avg_mse_05x, 'avg_mse_0x': avg_mse_0x,
+                'counts_6x': counts_6x, 'counts_4x': counts_4x, 'counts_rest': counts_rest,
+                'counts_05x': counts_05x, 'counts_0x': counts_0x, 'freq_list': freq_list
+            }
+            
+        # Plotting 1x2 Subplots
+        fig, axes = plt.subplots(1, 2, figsize=(24, 7))
+        x = np.arange(len(short_bin_names))
+        width = 0.6
+        
+        for ax_idx, title in enumerate(["Before Rotation", "After Rotation (Hadamard-128)"]):
+            ax1 = axes[ax_idx]
+            d = chart_data[title]
+            
+            b1 = ax1.bar(x, d['avg_mse_6x'], width, color='#2ca02c', label='Quantized to 6x (Outlier)' if ax_idx==0 else "")
+            b2 = ax1.bar(x, d['avg_mse_4x'], width, bottom=d['avg_mse_6x'], color='#bcbd22', label='Quantized to 4x' if ax_idx==0 else "")
+            
+            bottom_rest = np.array(d['avg_mse_6x'])+np.array(d['avg_mse_4x'])
+            b_rest = ax1.bar(x, d['avg_mse_rest'], width, bottom=bottom_rest, color='#ff7f0e', label='Quantized to Others (1x-3x)' if ax_idx==0 else "")
+            
+            bottom_05x = bottom_rest+np.array(d['avg_mse_rest'])
+            b05 = ax1.bar(x, d['avg_mse_05x'], width, bottom=bottom_05x, color='#9467bd', label='Quantized to 0.5x' if ax_idx==0 else "")
+            
+            bottom_0x = bottom_05x+np.array(d['avg_mse_05x'])
+            b0 = ax1.bar(x, d['avg_mse_0x'], width, bottom=bottom_0x, color='#d62728', label='Quantized to 0 (Underflow Massacre)' if ax_idx==0 else "")
+            
+            def add_labels(bars, counts, threshold=1.0):
+                for i, rect in enumerate(bars):
+                    height = rect.get_height()
+                    if height > threshold:
+                        count_val = counts[i]
+                        if count_val >= 0.1:
+                            ax1.text(rect.get_x() + rect.get_width()/2., rect.get_y() + height/2.,
+                                     f"n={count_val:.1f}", ha='center', va='center', color='white', fontsize=9, fontweight='bold')
+            
+            add_labels(b1, d['counts_6x'], threshold=2.0)
+            add_labels(b2, d['counts_4x'], threshold=2.0)
+            add_labels(b_rest, d['counts_rest'], threshold=2.0)
+            add_labels(b05, d['counts_05x'], threshold=2.0)
+            add_labels(b0, d['counts_0x'], threshold=2.0)
+            
+            ax1.set_xticks(x)
+            ax1.set_xticklabels(short_bin_names, rotation=45, fontsize=10)
+            ax1.set_ylabel('Total Output MSE Contribution (%)', fontweight='bold', fontsize=12)
+            ax1.set_xlabel('Spikiness Bin (Max / Mean)', fontweight='bold', fontsize=12)
+            ax1.set_title(title, fontsize=14, fontweight='bold')
+            ax1.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            # Secondary Y-axis
+            ax2 = ax1.twinx()
+            ax2.plot(x, d['freq_list'], color='black', marker='o', linewidth=2.5, markersize=8, linestyle='-', label='Frequency of Groups (%)' if ax_idx==0 else "")
+            ax2.set_ylabel('Frequency of Groups (%)', color='black', fontweight='bold', fontsize=12)
+            ax2.set_ylim(0, max(max(d['freq_list'])*1.2, 10))
+            
+            if ax_idx == 0:
+                lines_1, labels_1 = ax1.get_legend_handles_labels()
+                lines_2, labels_2 = ax2.get_legend_handles_labels()
+                fig.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper center', bbox_to_anchor=(0.5, 1.05), ncol=3, fontsize=12)
+
+        plt.suptitle(f'Layer {layer_idx}: MxFP4 Comprehensive Error Diagnostic', y=1.1, fontsize=18, fontweight='bold')
+        fig.tight_layout()
+        plt.savefig(f"macro_mxfp4_comprehensive_L{layer_idx}.png", dpi=200, bbox_inches='tight')
+        plt.close()
+        
+        torch.cuda.empty_cache()
 
 def plot_summary_comparison(all_results, output_path):
     """
