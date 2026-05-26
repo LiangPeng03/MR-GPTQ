@@ -65,6 +65,35 @@ class PermutationTransform(BaseTransform):
         pass
 
 
+class DiagonalScaleTransform(BaseTransform):
+    """
+    Applies a diagonal scaling vector `s`.
+    Forward: x * s
+    Inverse (inv_t=True): x * (1 / s)
+    """
+    def __init__(self, s: torch.Tensor):
+        super().__init__()
+        # shape should be (dim,)
+        self.register_buffer("scale", s)
+        self.register_buffer("inv_scale", 1.0 / s)
+
+    def forward(self, x: torch.Tensor, inv_t: bool = False, dim: int = -1):
+        s = self.scale if not inv_t else self.inv_scale
+        
+        if dim == -1:
+            dim = x.ndim - 1
+            
+        # Reshape s to broadcast with x
+        shape = [1] * x.ndim
+        shape[dim] = s.shape[0]
+        s_broadcast = s.view(shape)
+        
+        return (x * s_broadcast).to(x.dtype)
+    
+    def remove_parametrizations(self) -> None:
+        pass
+
+
 class FullTransform(BaseTransform):
 
     def __init__(

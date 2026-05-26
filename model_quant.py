@@ -233,6 +233,13 @@ def parse_args():
         choices=["", "realquant", "pseudoquant"],
         help="Whether export quantized model in realquant or pseudoquant format.",
     )
+    # AWQ params
+    parser.add_argument(
+        "--awq",
+        type=int,
+        default=0,
+        help="Run AWQ search before GPTQ with the specified number of grid search steps (e.g. 20). 0 disables AWQ.",
+    )
     # GPTQ params
     parser.add_argument(
         "--gptq",

@@ -7,7 +7,7 @@ PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
 # 待测试模型列表
 MODELS=(
-    # "HuggingFaceTB/SmolLM2-135M"
+    "HuggingFaceTB/SmolLM2-135M"
     "Qwen/Qwen3-0.6B"
     "Qwen/Qwen3-8B"
     "meta-llama/Meta-Llama-3-8B"
@@ -46,7 +46,7 @@ for MODEL in "${MODELS[@]}"; do
         --transform_class=identity \
         --w_observer=mse \
         --quantization_order=activation \
-        --hadamard_group_size=128 \
+        --hadamard_group_size=16 \
         --dataset_name_or_path=fineweb-edu \
         --num_sequences=128 \
         --rel_damp=0.01 \
@@ -54,7 +54,7 @@ for MODEL in "${MODELS[@]}"; do
         --dtype=bfloat16 \
         --gptq \
         --fuse_global_scale \
-        --channel_resort minmax \
+        --awq 20 \
         --eval_perplexity \
         --eval_openllm \
         --lm_eval_tasks piqa winogrande"

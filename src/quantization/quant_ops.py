@@ -57,15 +57,15 @@ def quantize_dequantize_int(x: torch.Tensor, scales: torch.Tensor, zeros: torch.
 def cast_to_fp4(x):
     sign = torch.sign(x)
     x = torch.abs(x)
-    x[(x >= 0.0) & (x <= 0.25)] = 0.0
-    x[(x > 0.25) & (x < 0.75)] = 0.5
-    x[(x >= 0.75) & (x <= 1.25)] = 1.0
-    x[(x > 1.25) & (x < 1.75)] = 1.5
-    x[(x >= 1.75) & (x <= 2.5)] = 2.0
-    x[(x > 2.5) & (x < 3.5)] = 3.0
-    x[(x >= 3.5) & (x <= 5.0)] = 4.0
-    x[x > 5.0] = 6.0
-    return x * sign
+    
+    # Mathematically exact equivalent to the original 8 boolean masks,
+    # utilizing PyTorch's native IEEE round-to-even for exact midpoint boundaries.
+    out = torch.where(x > 5.0, 6.0,
+          torch.where(x >= 3.5, 4.0,
+          torch.where(x >= 1.75, torch.round(x),
+                                 torch.round(x * 2.0) * 0.5)))
+    
+    return out * sign
 
 def quantize_fp4(x: torch.Tensor, scales: torch.Tensor, zeros: torch.Tensor, q_min: int, q_max: int):
     return cast_to_fp4(x / scales)

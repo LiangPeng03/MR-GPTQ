@@ -686,10 +686,18 @@ def gptq_quantization(
                     gptq_handles[layer_name].quantizer._track_global_scale = False
 
                 # Attach hook. The activation inp[0] is ALREADY transformed by LlamaAttention/LlamaMLP.
+                # AWQ Collections
+                if not hasattr(block, "_layer_inputs"):
+                    block._layer_inputs = {}
+                block._layer_inputs[layer_name] = []
+
                 def update_handle_hook(name):
                     def _hook(_, inp, out):
                         x = inp[0]
-                        gptq_handles[name].update(x)
+                        if getattr(args, "awq", 0) > 0:
+                            block._layer_inputs[name].append(x.cpu())
+                        else:
+                            gptq_handles[name].update(x)
                     return _hook
                 
                 hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
@@ -727,6 +735,102 @@ def gptq_quantization(
             if "output_attentions" in inp_kwargs: inp_kwargs["output_attentions"] = False
             with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
                 block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
+        
+        # --- NEW: AWQ SEARCH & FUSION ---
+        if getattr(args, "awq", 0) > 0:
+            from .awq import run_awq_search
+            from ..transforms.transforms import CompositeTransform, DiagonalScaleTransform
+            
+            # Helper to process a group of modules sharing the same input
+            def process_awq_group(mod_names, in_transform):
+                valid_names = [n for n in mod_names if n in block._layer_inputs]
+                if not valid_names: return in_transform
+                
+                # 1. Compute X_max by scanning CPU list to avoid loading everything to GPU at once
+                X_list = block._layer_inputs[valid_names[0]]
+                in_features = X_list[0].shape[-1]
+                X_max = torch.zeros(in_features, device=device, dtype=X_list[0].dtype)
+                for x_tensor in X_list:
+                    # Move to GPU temporarily one by one to get max values
+                    x_gpu = x_tensor.to(device)
+                    X_max = torch.max(X_max, x_gpu.abs().view(-1, in_features).max(dim=0).values)
+                    del x_gpu
+                X_max = X_max.clamp(min=1e-4)
+                
+                # 2. Sample 2048 tokens on CPU first, then move only the sample to GPU
+                all_flat = [x.view(-1, in_features) for x in X_list]
+                X_cpu = torch.cat(all_flat, dim=0)
+                n_samples = X_cpu.shape[0]
+                if n_samples > 2048:
+                    idx = torch.randperm(n_samples)[:2048]
+                    X_sub = X_cpu[idx].to(device)
+                else:
+                    X_sub = X_cpu.to(device)
+                
+                weights = [gptq_handles[n].layer.weight for n in valid_names]
+                w_qs = [gptq_handles[n].quantizer for n in valid_names]
+                a_q = getattr(gptq_handles[valid_names[0]].layer, 'act_quantizer', None)
+                
+                # 3. Run awq search using the small X_sub and precomputed X_max
+                s = run_awq_search(X_sub, weights, weight_quantizer=w_qs[0], act_quantizer=a_q, steps=args.awq, X_max=X_max)
+                
+                scale_t = DiagonalScaleTransform(s).to(device)
+                if isinstance(in_transform, CompositeTransform):
+                    in_transform.transforms.append(scale_t)
+                    new_transform = in_transform
+                else:
+                    new_transform = CompositeTransform([in_transform, scale_t])
+                
+                # 4. Scale weights and update GPTQ batch-by-batch (ensuring original dtypes are preserved)
+                for n in valid_names:
+                    layer = gptq_handles[n].layer
+                    layer.weight.data = (layer.weight.data / s.unsqueeze(0)).to(layer.weight.dtype)
+                    gptq_handles[n].W = layer.weight.data.clone()
+                    
+                    # Recompute weight global scale since the weight distribution changed
+                    if args.scale_precision == ScalePrecision.E4M3:
+                        gptq_handles[n].quantizer._track_global_scale = True
+                        gptq_handles[n].quantizer.get_quantization_params(layer.weight)
+                        gptq_handles[n].quantizer._track_global_scale = False
+                
+                # Re-fuse global scales for the group
+                if args.fuse_global_scale and args.scale_precision == ScalePrecision.E4M3:
+                    min_global_scale = min(gptq_handles[n].quantizer.global_scale for n in valid_names)
+                    for n in valid_names:
+                        gptq_handles[n].quantizer.global_scale = min_global_scale
+                
+                for x_cpu in X_list:
+                    x_scaled = (x_cpu.to(device) * s).to(x_cpu.dtype)
+                    for n in valid_names:
+                        gptq_handles[n].update(x_scaled)
+                    del x_scaled
+                
+                torch.cuda.empty_cache()
+                
+                # Free memory
+                for n in valid_names:
+                    block._layer_inputs[n] = []
+                    
+                return new_transform
+            
+            print(f"  [AWQ] Running grid search ({args.awq} steps) and fusing operators...")
+            qkv_in_transform = process_awq_group(["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], qkv_in_transform)
+            block.self_attn.qkv_in_transform = qkv_in_transform
+            
+            o_in_transform = process_awq_group(["self_attn.o_proj"], o_in_transform)
+            block.self_attn.o_in_transform = o_in_transform
+            
+            gate_up_in_transform = process_awq_group(["mlp.gate_proj", "mlp.up_proj"], gate_up_in_transform)
+            block.mlp.gate_up_in_transform = gate_up_in_transform
+            
+            down_in_transform = process_awq_group(["mlp.down_proj"], down_in_transform)
+            block.mlp.down_in_transform = down_in_transform
+
+            # Propagate updated transforms to QLinear modules
+            block.self_attn.fix_parametrization()
+            block.mlp.fix_parametrization()
+            
+            del block._layer_inputs
         
         # Remove hooks
         for hook in hooks.values(): hook.remove()

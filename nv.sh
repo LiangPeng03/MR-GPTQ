@@ -32,7 +32,6 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --fuse_global_scale \
     --gptq \
     --show_act_mse \
-    --channel_resort minmax \
     --eval_perplexity \
     --eval_openllm \
     --lm_eval_tasks piqa winogrande \
