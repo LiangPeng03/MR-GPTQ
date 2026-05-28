@@ -315,7 +315,7 @@ def gptq_quantization(
                     return _hook
                 
                 for layer_name, layer in block.named_modules():
-                    if isinstance(layer, QLinear):
+                    if isinstance(layer, torch.nn.Linear) or type(layer).__name__ == "QLinear":
                         lock_hooks.append(layer.register_forward_hook(lock_hook_factory(layer_name)))
             
             if do_channel_resort:
@@ -741,8 +741,7 @@ def gptq_quantization(
                                 act_global_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(act_max_val)
                                 layer.act_quantizer.global_scale = act_global_scale.to(layer.weight.device)
                                 layer.act_quantizer._track_global_scale = False
-                                if layer_name == "self_attn.q_proj":
-                                    print(f"  [DEBUG] Act {layer_name} Locked scale: {layer.act_quantizer.global_scale.item():.4f}")
+                                print(f"  [DEBUG] Locked {layer_name} act_scale to {layer.act_quantizer.global_scale.item():.4f} (max_val={fp16_act_global_max[layer_name]:.4f})")
                     else:
                         # Weights are already rotated, just compute scales
                         if gptq_handles[layer_name].quantizer is not None:

@@ -43,38 +43,74 @@ def quantize_group(values, quantizer, device):
 def analyze_block(block_values, quantizer_nv, quantizer_mx, transform, device):
     """
     block_values: (128,) 一个 token 的 128 个通道值
-    返回 NVFP4 和 MXFP4 在旋转前后的详细量化结果
+    返回 NVFP4 和 MXFP4 在旋转前后的详细量化结果，包括 NVFP4 锁定 global_scale 的情况。
     """
     block = block_values.clone()
     
     # --- 旋转 ---
     block_rot = transform(block.unsqueeze(0).to(device)).squeeze(0).cpu()
     
-    results = {}
-    for label, fmt_q, gs, name in [
-        ("nvfp4", quantizer_nv, 16, "NVFP4 (8 groups × 16)"),
-        ("mxfp4", quantizer_mx, 32, "MXFP4 (4 groups × 32)")
-    ]:
+    # 辅助函数：量化整个 block
+    def quantize_full_block(data, quantizer, gs, is_locked=False, lock_ref_data=None):
+        x = data.to(device).unsqueeze(0) # (1, 128)
+        
+        # 重置 quantizer 状态
+        quantizer._track_global_scale = (quantizer.scale_precision.value == "e4m3")
+        quantizer.global_scale = torch.tensor([float("inf")], dtype=torch.float32).to(device)
+        
+        if is_locked and quantizer.scale_precision.value == "e4m3":
+            # 锁定 global_scale 到 lock_ref_data 的最大值
+            from src.quantization.quant_ops import FP8_E4M3_MAX, FP4_E2M1_MAX
+            from src.quantization.quantizer import get_reciprocal
+            act_max_val = lock_ref_data.abs().max().to(torch.float32).view(1)
+            locked_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(act_max_val)
+            quantizer.global_scale = locked_scale.to(device)
+            quantizer._track_global_scale = False
+            
+        scales, zeros = quantizer.get_quantization_params(x)
+        x_q = quantizer(x, scales, zeros)
+        
+        x_q = x_q.squeeze(0).cpu() # (128,)
+        scales = scales.squeeze().cpu() # (n_groups,)
+        
         n_groups = 128 // gs
-        for rot_label, data in [("norot", block), ("rot", block_rot)]:
-            groups_info = []
-            for g in range(n_groups):
-                vals = data[g*gs : (g+1)*gs].float()
-                q_vals, scale = quantize_group(vals, fmt_q, device)
-                mse = (q_vals - vals).pow(2).mean().item()
-                groups_info.append({
-                    "values": vals.numpy(),
-                    "quantized": q_vals.numpy(),
-                    "scale": scale,
-                    "mse": mse,
-                    "max_abs": vals.abs().max().item()
-                })
-            total_mse = np.mean([g["mse"] for g in groups_info])
-            results[f"{label}_{rot_label}"] = {
-                "groups": groups_info,
-                "total_mse": total_mse,
-                "name": name
-            }
+        groups_info = []
+        for g in range(n_groups):
+            vals = data[g*gs : (g+1)*gs].float()
+            q_vals = x_q[g*gs : (g+1)*gs].float()
+            scale = scales[g].item() if scales.dim() > 0 else scales.item()
+            mse = (q_vals - vals).pow(2).mean().item()
+            groups_info.append({
+                "values": vals.numpy(),
+                "quantized": q_vals.numpy(),
+                "scale": scale,
+                "mse": mse,
+                "max_abs": vals.abs().max().item()
+            })
+        total_mse = np.mean([g["mse"] for g in groups_info])
+        return groups_info, total_mse
+    
+    results = {}
+    
+    # 1. NVFP4 No Rotation
+    g_info, mse = quantize_full_block(block, quantizer_nv, 16)
+    results["nvfp4_norot"] = {"groups": g_info, "total_mse": mse, "name": "NVFP4 No Rotation"}
+    
+    # 2. NVFP4 Rotated (Unlocked)
+    g_info, mse = quantize_full_block(block_rot, quantizer_nv, 16)
+    results["nvfp4_rot"] = {"groups": g_info, "total_mse": mse, "name": "NVFP4 Rotated (Unlocked)"}
+    
+    # 3. NVFP4 Rotated (Locked to original block)
+    g_info, mse = quantize_full_block(block_rot, quantizer_nv, 16, is_locked=True, lock_ref_data=block)
+    results["nvfp4_rot_locked"] = {"groups": g_info, "total_mse": mse, "name": "NVFP4 Rotated (Locked)"}
+    
+    # 4. MXFP4 No Rotation
+    g_info, mse = quantize_full_block(block, quantizer_mx, 32)
+    results["mxfp4_norot"] = {"groups": g_info, "total_mse": mse, "name": "MXFP4 No Rotation"}
+    
+    # 5. MXFP4 Rotated
+    g_info, mse = quantize_full_block(block_rot, quantizer_mx, 32)
+    results["mxfp4_rot"] = {"groups": g_info, "total_mse": mse, "name": "MXFP4 Rotated"}
     
     return results, block.numpy(), block_rot.numpy()
 
@@ -96,14 +132,15 @@ def print_report(layer_idx, block_idx, token_idx, orig, rotated, results):
     for fmt in ["nvfp4", "mxfp4"]:
         norot = results[f"{fmt}_norot"]
         rot = results[f"{fmt}_rot"]
+        rot_locked = results.get(f"{fmt}_rot_locked", None)
         n_groups = len(norot["groups"])
         gs = 128 // n_groups
         
-        print(f"\n{'─'*80}")
-        print(f"  {norot['name']}")
-        print(f"{'─'*80}")
-        print(f"  {'Group':>7} | {'Condition':>8} | {'Scale':>10} | {'Max|Val|':>10} | {'Group MSE':>12} | 前6个值")
-        print(f"  {'─'*7}─┼─{'─'*8}─┼─{'─'*10}─┼─{'─'*10}─┼─{'─'*12}─┼─{'─'*30}")
+        print(f"\n{'─'*90}")
+        print(f"  {norot['name'].split(' No Rotation')[0]}")
+        print(f"{'─'*90}")
+        print(f"  {'Group':>7} | {'Condition':>12} | {'Scale':>10} | {'Max|Val|':>10} | {'Group MSE':>12} | 前6个值")
+        print(f"  {'─'*7}─┼─{'─'*12}─┼─{'─'*10}─┼─{'─'*10}─┼─{'─'*12}─┼─{'─'*30}")
         
         for g in range(n_groups):
             g_norot = norot["groups"][g]
@@ -114,33 +151,44 @@ def print_report(layer_idx, block_idx, token_idx, orig, rotated, results):
             marker = " ★" if is_outlier else ""
             
             vals_str = np.array2string(g_norot["values"][:6], precision=2, separator=',')
-            print(f"  G{g:>5} | {'NoRot':>8} | {g_norot['scale']:>10.4f} | {g_norot['max_abs']:>10.4f} | {g_norot['mse']:>12.6f} | {vals_str}{marker}")
+            print(f"  G{g:>5} | {'NoRot':>12} | {g_norot['scale']:>10.4f} | {g_norot['max_abs']:>10.4f} | {g_norot['mse']:>12.6f} | {vals_str}{marker}")
             
             vals_str_r = np.array2string(g_rot["values"][:6], precision=2, separator=',')
-            print(f"  {'':>7} | {'Rot':>8} | {g_rot['scale']:>10.4f} | {g_rot['max_abs']:>10.4f} | {g_rot['mse']:>12.6f} | {vals_str_r}")
-            print(f"  {'─'*7}─┼─{'─'*8}─┼─{'─'*10}─┼─{'─'*10}─┼─{'─'*12}─┼─{'─'*30}")
+            print(f"  {'':>7} | {'Rot(Unlck)':>12} | {g_rot['scale']:>10.4f} | {g_rot['max_abs']:>10.4f} | {g_rot['mse']:>12.6f} | {vals_str_r}")
+            
+            if rot_locked:
+                g_rot_l = rot_locked["groups"][g]
+                vals_str_rl = np.array2string(g_rot_l["values"][:6], precision=2, separator=',')
+                print(f"  {'':>7} | {'Rot(Locked)':>12} | {g_rot_l['scale']:>10.4f} | {g_rot_l['max_abs']:>10.4f} | {g_rot_l['mse']:>12.6f} | {vals_str_rl}")
+            
+            print(f"  {'─'*7}─┼─{'─'*12}─┼─{'─'*10}─┼─{'─'*10}─┼─{'─'*12}─┼─{'─'*30}")
         
         ratio = rot["total_mse"] / (norot["total_mse"] + 1e-15)
         verdict = "↑ WORSE" if ratio > 1 else "↓ BETTER"
-        print(f"  Total MSE:  NoRot={norot['total_mse']:.6f}  Rot={rot['total_mse']:.6f}  Ratio={ratio:.2f}× ({verdict})")
+        locked_info = f"  Rot_Locked={rot_locked['total_mse']:.6f}" if rot_locked else ""
+        print(f"  Total MSE:  NoRot={norot['total_mse']:.6f}  Rot={rot['total_mse']:.6f}{locked_info}  Ratio={ratio:.2f}× ({verdict})")
 
 def plot_block(layer_idx, block_idx, token_idx, orig, rotated, results, output_path):
     """
-    2×2 图：
-    (0,0) NVFP4 NoRot  (0,1) NVFP4 Rot
-    (1,0) MXFP4 NoRot  (1,1) MXFP4 Rot
+    2×3 图：
+    (0,0) NVFP4 NoRot  (0,1) NVFP4 Rot Unlocked  (0,2) NVFP4 Rot Locked
+    (1,0) MXFP4 NoRot  (1,1) MXFP4 Rot           (1,2) Empty
     """
-    fig, axes = plt.subplots(2, 2, figsize=(20, 10), sharex=True)
+    fig, axes = plt.subplots(2, 3, figsize=(30, 10), sharex=True)
     
     group_colors_8 = plt.cm.Set2(np.linspace(0, 1, 8))
     group_colors_4 = plt.cm.Set1(np.linspace(0, 1, 4))
     
     configs = [
         (0, 0, "nvfp4_norot", "NVFP4 No Rotation", 16, group_colors_8, orig),
-        (0, 1, "nvfp4_rot",   "NVFP4 Rotated",     16, group_colors_8, rotated),
+        (0, 1, "nvfp4_rot",   "NVFP4 Rotated (Unlocked)", 16, group_colors_8, rotated),
+        (0, 2, "nvfp4_rot_locked", "NVFP4 Rotated (Locked)", 16, group_colors_8, rotated),
         (1, 0, "mxfp4_norot", "MXFP4 No Rotation", 32, group_colors_4, orig),
         (1, 1, "mxfp4_rot",   "MXFP4 Rotated",     32, group_colors_4, rotated),
     ]
+    
+    # Hide the empty subplot
+    axes[1, 2].axis('off')
     
     for row, col, key, title, gs, colors, data in configs:
         ax = axes[row, col]
@@ -175,6 +223,7 @@ def plot_block(layer_idx, block_idx, token_idx, orig, rotated, results, output_p
     
     axes[1, 0].set_xlabel("Channel Index (within 128-block)")
     axes[1, 1].set_xlabel("Channel Index (within 128-block)")
+    axes[0, 2].set_xlabel("Channel Index (within 128-block)")
     
     fig.suptitle(f"Layer {layer_idx}, Block {block_idx}, Token {token_idx}\n"
                  f"Dots = Quantized Values | Bars = Original Values | Dashed = FP4 Grid",
@@ -243,6 +292,7 @@ def main():
                 'group_id': group_idx,
                 'norot_mse': results['nvfp4_norot']['groups'][group_idx]['mse'],
                 'rot_mse': results['nvfp4_rot']['groups'][group_idx]['mse'],
+                'rot_locked_mse': results['nvfp4_rot_locked']['groups'][group_idx]['mse'],
                 'orig': group_orig,
                 'rotated': group_rotated
             })
@@ -251,10 +301,10 @@ def main():
     plot_summary_comparison(all_nv_results, "nvfp4_all_layers_summary.png")
     
     # 宏观全矩阵统计
-    run_macro_statistics(activations, nv_q, transform, device)
+    run_macro_statistics(activations, transform, device)
     
     # 生成宏观图表（图表一和图表三）
-    plot_macro_visualizations(activations, nv_q, device)
+    plot_macro_visualizations(activations, device)
     
     # 针对 MxFP4 生成 1x2 对比诊断图 (Before vs After Hadamard-128)
     plot_mx_macro_visualizations(activations, mx_q, transform, device)
@@ -418,10 +468,10 @@ def plot_mx_macro_visualizations(activations, quantizer_mx, transform, device):
 
 def plot_summary_comparison(all_results, output_path):
     """
-    汇总图片：对比所有层的 NVFP4 NoRot vs Rot 性能
+    汇总图片：对比所有层的 NVFP4 NoRot vs Rot (Unlocked) vs Rot (Locked)
     """
     n = len(all_results)
-    fig, axes = plt.subplots(n, 2, figsize=(15, 4*n))
+    fig, axes = plt.subplots(n, 3, figsize=(22, 4*n))
     
     for i, res in enumerate(all_results):
         layer = res['layer']
@@ -432,11 +482,15 @@ def plot_summary_comparison(all_results, output_path):
         axes[i, 0].bar(range(16), res['orig'], color='skyblue', alpha=0.7)
         axes[i, 0].set_title(f"L{layer} ({tag}) G{gid} - NoRot\nMSE: {res['norot_mse']:.6f}")
         
-        # Rot Plot
+        # Rot Plot (Unlocked)
         axes[i, 1].bar(range(16), res['rotated'], color='salmon', alpha=0.7)
-        axes[i, 1].set_title(f"L{layer} ({tag}) G{gid} - Rotated\nMSE: {res['rot_mse']:.6f}")
+        axes[i, 1].set_title(f"L{layer} ({tag}) G{gid} - Rotated (Unlocked)\nMSE: {res['rot_mse']:.6f}")
         
-        for j in range(2):
+        # Rot Plot (Locked)
+        axes[i, 2].bar(range(16), res['rotated'], color='mediumpurple', alpha=0.7)
+        axes[i, 2].set_title(f"L{layer} ({tag}) G{gid} - Rotated (Locked)\nMSE: {res['rot_locked_mse']:.6f}")
+        
+        for j in range(3):
             axes[i, j].axhline(0, color='black', linewidth=0.5)
             axes[i, j].set_xticks(range(16))
             axes[i, j].tick_params(axis='x', labelsize=8)
@@ -446,7 +500,7 @@ def plot_summary_comparison(all_results, output_path):
     print(f"  Summary figure saved to {output_path}")
 
 
-def run_macro_statistics(activations, quantizer_nv, transform, device):
+def run_macro_statistics(activations, transform, device):
     """
     全矩阵宏观诊断：定量分析各种 Outlier 组的出现频率和损失贡献。
     重点评估 NVFP4 (group=16) 及其在 Hadamard 旋转前后的表现。
@@ -454,6 +508,9 @@ def run_macro_statistics(activations, quantizer_nv, transform, device):
     print("\n" + "="*80)
     print(" 🚀 RUNNING MACRO-DIAGNOSTIC STATISTICS (NVFP4 Output MSE Analysis)")
     print("="*80)
+    
+    from src.quantization.quantizer import Quantizer
+    quantizer_nv = Quantizer(bits=4, format="nvfp", granularity="group", group_size=16, symmetric=True, scale_precision="e4m3")
     
     gs = 16 # NVFP4 group size
     
@@ -588,15 +645,18 @@ def run_macro_statistics(activations, quantizer_nv, transform, device):
             print(f"    Quantized to Others (1x-3x)     : {mean_err_pct[4]:>5.2f}% of Group OUTPUT MSE  (avg {mean_cnt[4]:.1f} elements)")
 
 
-def plot_macro_visualizations(activations, quantizer_nv, device):
+def plot_macro_visualizations(activations, device):
     """
-    生成大一统双轴图表（图表一）和图表三（Scale分布对比）
+    NVFP4 综合误差诊断分析方案 (Comprehensive Output Error Diagnostic)
     """
     print("\n" + "="*80)
-    print(" 🎨 GENERATING COMPREHENSIVE MACRO VISUALIZATIONS")
+    print(" 🎨 GENERATING MACRO VISUALIZATIONS (Output MSE Diagnostics)")
     print("="*80)
     
-    gs = 16
+    from src.quantization.quantizer import Quantizer
+    quantizer_nv = Quantizer(bits=4, format="nvfp", granularity="group", group_size=16, symmetric=True, scale_precision="e4m3")
+    
+    gs = 16 # NVFP4 Group Size
     bins = [1, 2, 4, 8, 10, 12, 14, 16, float('inf')]
     bin_names = ["1-2 (Smooth)", "2-4 (Mild)", "4-8 (Spiky)", "8-10 (High)", "10-12 (Extreme)", "12-14 (Severe)", "14-16 (Isolated)", "16+ (Catastrophic)"]
     short_bin_names = ["1-2", "2-4", "4-8", "8-10", "10-12", "12-14", "14-16", "16+"]

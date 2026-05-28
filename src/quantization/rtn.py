@@ -7,7 +7,8 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from .qlinear import QLinear
-from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision
+from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision, FP8_E4M3_MAX, FP4_E2M1_MAX
+from .quantizer import get_reciprocal
 
 from ..utils.common_utils import clear_device_cache, to, maybe_first_element
 from ..utils.model_utils import InputCollector, ForwardInterrupt, get_attention_layer, get_mlp_layer
@@ -83,26 +84,50 @@ def rtn_quantization(
         if args.cpu_offload_modules:
             block.to(device)
 
-        # === 0. Resonance-Aware Channel Reordering ===
+        # === 0. Resonance-Aware Channel Reordering & Global Scale Lock ===
         resort_perms = {}
-        if getattr(args, "channel_resort", "none") != "none" and need_calibration:
-            import numpy as np
-            print(f"  Computing resonance-aware channel permutations (Strategy: {args.channel_resort})...")
+        do_channel_resort = getattr(args, "channel_resort", "none") != "none"
+        do_lock_global_scale = args.scale_precision in ["e4m3", ScalePrecision.E4M3] and getattr(args, "lock_global_scale", False)
+        
+        if do_lock_global_scale:
+            print(f"  [DEBUG] lock_global_scale is ACTIVE for block {block_idx}!")
+            
+        fp16_act_global_max = {}
+        if (do_channel_resort or do_lock_global_scale) and need_calibration:
             act_caches = {}
-            def hook_factory(name):
-                def _hook(_, inp, out):
-                    if name not in act_caches:
-                        act_caches[name] = []
-                    # Collect up to 16 sequences to estimate P95 without OOM
-                    if len(act_caches[name]) < 16:
-                        act_caches[name].append(inp[0].detach().cpu().float().abs().view(-1, inp[0].shape[-1]))
-                return _hook
+            resort_hooks = []
+            lock_hooks = []
+            
+            if do_lock_global_scale:
+                def lock_hook_factory(layer_name):
+                    def _hook(_, inp, out):
+                        max_val = inp[0].detach().float().abs().max().item()
+                        if layer_name not in fp16_act_global_max:
+                            fp16_act_global_max[layer_name] = max_val
+                        else:
+                            fp16_act_global_max[layer_name] = max(fp16_act_global_max[layer_name], max_val)
+                    return _hook
+                
+                for layer_name, layer in block.named_modules():
+                    if isinstance(layer, torch.nn.Linear) or type(layer).__name__ == "QLinear":
+                        lock_hooks.append(layer.register_forward_hook(lock_hook_factory(layer_name)))
+            
+            if do_channel_resort:
+                import numpy as np
+                print(f"  Computing resonance-aware channel permutations (Strategy: {args.channel_resort})...")
+                def hook_factory(name):
+                    def _hook(_, inp, out):
+                        if name not in act_caches:
+                            act_caches[name] = []
+                        # Collect up to 16 sequences to estimate P95 without OOM
+                        if len(act_caches[name]) < 16:
+                            act_caches[name].append(inp[0].detach().cpu().float().abs().view(-1, inp[0].shape[-1]))
+                    return _hook
 
-            hooks = []
-            hooks.append(block.self_attn.q_proj.register_forward_hook(hook_factory("qkv")))
-            hooks.append(block.self_attn.o_proj.register_forward_hook(hook_factory("o")))
-            hooks.append(block.mlp.gate_proj.register_forward_hook(hook_factory("gate_up")))
-            hooks.append(block.mlp.down_proj.register_forward_hook(hook_factory("down")))
+                resort_hooks.append(block.self_attn.q_proj.register_forward_hook(hook_factory("qkv")))
+                resort_hooks.append(block.self_attn.o_proj.register_forward_hook(hook_factory("o")))
+                resort_hooks.append(block.mlp.gate_proj.register_forward_hook(hook_factory("gate_up")))
+                resort_hooks.append(block.mlp.down_proj.register_forward_hook(hook_factory("down")))
 
             device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
             for inp_args, inp_kwargs in zip(input_args, input_kwargs):
@@ -112,7 +137,10 @@ def rtn_quantization(
                 if "output_attentions" in ikw: ikw["output_attentions"] = False
                 with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
                     block(*to(inp_args, device=device), **to(ikw, device=device))
-            for h in hooks: h.remove()
+            
+            for h in resort_hooks: h.remove()
+            if do_lock_global_scale:
+                for h in lock_hooks: h.remove()
             
             act_means = {}
             for name, caches in list(act_caches.items()):
@@ -439,29 +467,41 @@ def rtn_quantization(
         block = block.to(device=device, dtype=orig_dtype)  
 
         # 3. Global scale collection for NVFP
-        if weight_quantizer_kwargs and args.scale_precision == ScalePrecision.E4M3:
+        if args.scale_precision in ["e4m3", ScalePrecision.E4M3]:
             for layer_name, layer in block.named_modules():
                 if isinstance(layer, QLinear):
-                    # Weights are already rotated above
-                    layer.weight_quantizer.get_quantization_params(layer.weight)
-                    layer.weight_quantizer._track_global_scale = False
+                    # Weights are unrotated at this point, so this naturally captures the unrotated weight global scale.
+                    if layer.weight_quantizer is not None:
+                        layer.weight_quantizer.get_quantization_params(layer.weight)
+                        layer.weight_quantizer._track_global_scale = False
+                    
+                    if layer.act_quantizer is not None:
+                        if do_lock_global_scale and layer_name in fp16_act_global_max:
+                            act_max_val = torch.tensor([fp16_act_global_max[layer_name]], dtype=torch.float32)
+                            act_global_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(act_max_val)
+                            layer.act_quantizer.global_scale = act_global_scale.to(layer.weight.device)
+                            layer.act_quantizer._track_global_scale = False
+                            print(f"  [DEBUG] Locked {layer_name} act_scale to {layer.act_quantizer.global_scale.item():.4f} (max_val={fp16_act_global_max[layer_name]:.4f})")
 
             if args.fuse_global_scale:
-                qkv_global_scale = min(
-                    quantized_attn.q_proj.weight_quantizer.global_scale,
-                    quantized_attn.k_proj.weight_quantizer.global_scale,
-                    quantized_attn.v_proj.weight_quantizer.global_scale,
-                )
-                quantized_attn.q_proj.weight_quantizer.global_scale = qkv_global_scale
-                quantized_attn.k_proj.weight_quantizer.global_scale = qkv_global_scale
-                quantized_attn.v_proj.weight_quantizer.global_scale = qkv_global_scale
-                # gate_up fusion
-                gate_up_global_scale = min(
-                    quantized_mlp.gate_proj.weight_quantizer.global_scale,
-                    quantized_mlp.up_proj.weight_quantizer.global_scale
-                )
-                quantized_mlp.gate_proj.weight_quantizer.global_scale = gate_up_global_scale
-                quantized_mlp.up_proj.weight_quantizer.global_scale = gate_up_global_scale
+                if getattr(quantized_attn.q_proj, "weight_quantizer", None) is not None:
+                    qkv_global_scale = min(
+                        quantized_attn.q_proj.weight_quantizer.global_scale,
+                        quantized_attn.k_proj.weight_quantizer.global_scale,
+                        quantized_attn.v_proj.weight_quantizer.global_scale,
+                    )
+                    quantized_attn.q_proj.weight_quantizer.global_scale = qkv_global_scale
+                    quantized_attn.k_proj.weight_quantizer.global_scale = qkv_global_scale
+                    quantized_attn.v_proj.weight_quantizer.global_scale = qkv_global_scale
+                
+                if getattr(quantized_mlp.gate_proj, "weight_quantizer", None) is not None:
+                    # gate_up fusion
+                    gate_up_global_scale = min(
+                        quantized_mlp.gate_proj.weight_quantizer.global_scale,
+                        quantized_mlp.up_proj.weight_quantizer.global_scale
+                    )
+                    quantized_mlp.gate_proj.weight_quantizer.global_scale = gate_up_global_scale
+                    quantized_mlp.up_proj.weight_quantizer.global_scale = gate_up_global_scale
 
         # Calibrate activations (if needed)
         if need_calibration:
