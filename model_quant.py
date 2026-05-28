@@ -240,6 +240,11 @@ def parse_args():
         default=0,
         help="Run AWQ search before GPTQ with the specified number of grid search steps (e.g. 20). 0 disables AWQ.",
     )
+    parser.add_argument(
+        "--gajs",
+        action="store_true",
+        help="Use Grid-Aligned Joint Scaling (Adam) instead of grid search for AWQ.",
+    )
     # GPTQ params
     parser.add_argument(
         "--gptq",
@@ -316,6 +321,7 @@ def parse_args():
     parser.add_argument("--amp", action="store_true", help="whether to enable fp16 autocasting.")
     parser.add_argument("--compile", action="store_true", help="whether to use torch.compile.")
     parser.add_argument("--fuse_global_scale", action="store_true", help="whether to fuse global scale in qkv and gate_up.")
+    parser.add_argument("--lock_global_scale", action="store_true", help="whether to lock the NVFP4 global scale to the original FP16 weights.")
     # Eval params
     parser.add_argument("--eval_perplexity", action="store_true", help="whether to eval perplexity after quantization.")
     parser.add_argument("--eval_openllm", action="store_true", help="whether to eval OpenLLM v1 openllm after quantization.")

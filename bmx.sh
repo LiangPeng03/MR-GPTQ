@@ -54,7 +54,7 @@ for MODEL in "${MODELS[@]}"; do
         --sequence_length=2048 \
         --dtype=bfloat16 \
         --fuse_global_scale \
-        --awq 20 \
+        --gajs \
         --eval_perplexity \
         --eval_openllm \
         --lm_eval_tasks piqa winogrande"

@@ -10,9 +10,9 @@ from torch.nn.modules.conv import _ConvNd
 from transformers import AutoModelForCausalLM
 
 from .qlinear import QLinear
-from .quantizer import Quantizer
+from .quantizer import Quantizer, get_reciprocal
 from .quant_args import QuantizationOrder
-from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision
+from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision, FP8_E4M3_MAX, FP4_E2M1_MAX
 from .accumulate_hessian import accumulate_hessian
 from ..transforms.transforms import build_transform, get_transform_matrix
 from ..utils.linalg_utils import inv_sym
@@ -288,37 +288,73 @@ def gptq_quantization(
         if args.cpu_offload_modules:
             block.to(device)
 
-        # === 0. Resonance-Aware Channel Reordering ===
+        # === 0. Evaluate FP16 Block Outputs & Channel Resort Stats ===
         resort_perms = {}
-        if getattr(args, "channel_resort", "none") != "none":
-            import numpy as np
-            print(f"  Computing resonance-aware channel permutations (Strategy: {args.channel_resort})...")
+        do_channel_resort = getattr(args, "channel_resort", "none") != "none"
+        do_show_act_mse = getattr(args, "show_act_mse", False)
+        
+        do_lock_global_scale = args.scale_precision in ["e4m3", ScalePrecision.E4M3] and getattr(args, "lock_global_scale", False)
+        if do_lock_global_scale:
+            print(f"  [DEBUG] lock_global_scale is ACTIVE for block {block_idx}!")
+        
+        orig_block_outputs = None
+        fp16_act_global_max = {}
+        if do_channel_resort or do_show_act_mse or do_lock_global_scale:
             act_caches = {}
-            def hook_factory(name):
-                def _hook(_, inp, out):
-                    if name not in act_caches:
-                        act_caches[name] = []
-                    # Collect up to 16 sequences to estimate P95 without OOM
-                    if len(act_caches[name]) < 16:
-                        act_caches[name].append(inp[0].detach().cpu().float().abs().view(-1, inp[0].shape[-1]))
-                return _hook
-
             resort_hooks = []
-            resort_hooks.append(block.self_attn.q_proj.register_forward_hook(hook_factory("qkv")))
-            resort_hooks.append(block.self_attn.o_proj.register_forward_hook(hook_factory("o")))
-            resort_hooks.append(block.mlp.gate_proj.register_forward_hook(hook_factory("gate_up")))
-            resort_hooks.append(block.mlp.down_proj.register_forward_hook(hook_factory("down")))
+            lock_hooks = []
+            
+            if do_lock_global_scale:
+                def lock_hook_factory(layer_name):
+                    def _hook(_, inp, out):
+                        max_val = inp[0].detach().float().abs().max().item()
+                        if layer_name not in fp16_act_global_max:
+                            fp16_act_global_max[layer_name] = max_val
+                        else:
+                            fp16_act_global_max[layer_name] = max(fp16_act_global_max[layer_name], max_val)
+                    return _hook
+                
+                for layer_name, layer in block.named_modules():
+                    if isinstance(layer, QLinear):
+                        lock_hooks.append(layer.register_forward_hook(lock_hook_factory(layer_name)))
+            
+            if do_channel_resort:
+                import numpy as np
+                print(f"  Computing resonance-aware channel permutations (Strategy: {args.channel_resort})...")
+                def hook_factory(name):
+                    def _hook(_, inp, out):
+                        if name not in act_caches:
+                            act_caches[name] = []
+                        # Collect up to 16 sequences to estimate P95 without OOM
+                        if len(act_caches[name]) < 16:
+                            act_caches[name].append(inp[0].detach().cpu().float().abs().view(-1, inp[0].shape[-1]))
+                    return _hook
+
+                resort_hooks.append(block.self_attn.q_proj.register_forward_hook(hook_factory("qkv")))
+                resort_hooks.append(block.self_attn.o_proj.register_forward_hook(hook_factory("o")))
+                resort_hooks.append(block.mlp.gate_proj.register_forward_hook(hook_factory("gate_up")))
+                resort_hooks.append(block.mlp.down_proj.register_forward_hook(hook_factory("down")))
 
             device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+            
+            if do_show_act_mse:
+                orig_block_outputs = []
+                
             for inp_args, inp_kwargs in zip(input_args, input_kwargs):
                 ikw = inp_kwargs.copy()
                 ikw["use_cache"] = False
                 if "past_key_value" in ikw: ikw["past_key_value"] = None
                 if "output_attentions" in ikw: ikw["output_attentions"] = False
                 with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
-                    block(*to(inp_args, device=device), **to(ikw, device=device))
+                    out = block(*to(inp_args, device=device), **to(ikw, device=device))
+                if do_show_act_mse:
+                    orig_block_outputs.append(maybe_first_element(out).detach().cpu())
+                    
             for h in resort_hooks: h.remove()
+            if do_lock_global_scale:
+                for h in lock_hooks: h.remove()
             
+        if do_channel_resort:
             act_means = {}
             for name, caches in list(act_caches.items()):
                 X = torch.cat(caches, dim=0) # (N_tokens, Dim)
@@ -651,6 +687,14 @@ def gptq_quantization(
         gate_up_in_transform.remove_parametrizations()
         down_in_transform.remove_parametrizations() 
 
+        # --- NEW: Capture FP16 Global Scales BEFORE any rotation ---
+        fp16_global_scales = {}
+        if args.scale_precision in ["e4m3", ScalePrecision.E4M3] and getattr(args, "lock_global_scale", False):
+            for layer_name, layer in block.named_modules():
+                if isinstance(layer, QLinear):
+                    max_val = layer.weight.abs().max().to(torch.float32).view(1)
+                    fp16_global_scales[layer_name] = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(max_val)
+
         # --- NEW: Transform all weights BEFORE calibration ---
         # This ensures the model forward pass (if any) uses pre-transformed weights, 
         # and more importantly, that GPTQ handles are initialized with rotated weights.
@@ -679,11 +723,31 @@ def gptq_quantization(
                 # Update weight reference in handle (since it was just rotated)
                 gptq_handles[layer_name].W = layer.weight.data.clone()
 
-                # Get weight global scale
-                if args.scale_precision == ScalePrecision.E4M3:
-                    # Weights are already rotated, just compute scales
-                    gptq_handles[layer_name].quantizer.get_quantization_params(layer.weight)
-                    gptq_handles[layer_name].quantizer._track_global_scale = False
+                # Get weight and activation global scales
+                if args.scale_precision in ["e4m3", ScalePrecision.E4M3]:
+                    if getattr(args, "lock_global_scale", False):
+                        if gptq_handles[layer_name].quantizer is not None:
+                            gptq_handles[layer_name].quantizer.global_scale = fp16_global_scales[layer_name].to(layer.weight.device)
+                            gptq_handles[layer_name].quantizer._track_global_scale = False
+                            
+                            # DEBUG: Compute dynamic scale to compare
+                            dynamic_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(layer.weight.abs().max().to(torch.float32).view(1)).to(layer.weight.device)
+                            if layer_name == "self_attn.q_proj":
+                                print(f"  [DEBUG] Weight {layer_name} Locked scale: {gptq_handles[layer_name].quantizer.global_scale.item():.4f}, Dynamic scale: {dynamic_scale.item():.4f}")
+                        
+                        if layer.act_quantizer is not None:
+                            if layer_name in fp16_act_global_max:
+                                act_max_val = torch.tensor([fp16_act_global_max[layer_name]], dtype=torch.float32)
+                                act_global_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(act_max_val)
+                                layer.act_quantizer.global_scale = act_global_scale.to(layer.weight.device)
+                                layer.act_quantizer._track_global_scale = False
+                                if layer_name == "self_attn.q_proj":
+                                    print(f"  [DEBUG] Act {layer_name} Locked scale: {layer.act_quantizer.global_scale.item():.4f}")
+                    else:
+                        # Weights are already rotated, just compute scales
+                        if gptq_handles[layer_name].quantizer is not None:
+                            gptq_handles[layer_name].quantizer.get_quantization_params(layer.weight)
+                            gptq_handles[layer_name].quantizer._track_global_scale = False
 
                 # Attach hook. The activation inp[0] is ALREADY transformed by LlamaAttention/LlamaMLP.
                 # AWQ Collections
@@ -694,7 +758,7 @@ def gptq_quantization(
                 def update_handle_hook(name):
                     def _hook(_, inp, out):
                         x = inp[0]
-                        if getattr(args, "awq", 0) > 0:
+                        if getattr(args, "awq", 0) > 0 or getattr(args, "gajs", False):
                             block._layer_inputs[name].append(x.cpu())
                         else:
                             gptq_handles[name].update(x)
@@ -703,23 +767,25 @@ def gptq_quantization(
                 hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
 
         # Fuse global scales
-        if args.fuse_global_scale and args.scale_precision == ScalePrecision.E4M3:
-            # qkv fusion
-            qkv_global_scale = min(
-                gptq_handles["self_attn.q_proj"].quantizer.global_scale,
-                gptq_handles["self_attn.k_proj"].quantizer.global_scale,
-                gptq_handles["self_attn.v_proj"].quantizer.global_scale,
-            )
-            gptq_handles["self_attn.q_proj"].quantizer.global_scale = qkv_global_scale
-            gptq_handles["self_attn.k_proj"].quantizer.global_scale = qkv_global_scale
-            gptq_handles["self_attn.v_proj"].quantizer.global_scale = qkv_global_scale
-            # gate_up fusion
-            gate_up_global_scale = min(
-                gptq_handles["mlp.gate_proj"].quantizer.global_scale,
-                gptq_handles["mlp.up_proj"].quantizer.global_scale
-            )
-            gptq_handles["mlp.gate_proj"].quantizer.global_scale = gate_up_global_scale
-            gptq_handles["mlp.up_proj"].quantizer.global_scale = gate_up_global_scale
+        if args.fuse_global_scale and args.scale_precision in ["e4m3", ScalePrecision.E4M3]:
+            if gptq_handles.get("self_attn.q_proj") and gptq_handles["self_attn.q_proj"].quantizer is not None:
+                # qkv fusion
+                qkv_global_scale = min(
+                    gptq_handles["self_attn.q_proj"].quantizer.global_scale,
+                    gptq_handles["self_attn.k_proj"].quantizer.global_scale,
+                    gptq_handles["self_attn.v_proj"].quantizer.global_scale,
+                )
+                gptq_handles["self_attn.q_proj"].quantizer.global_scale = qkv_global_scale
+                gptq_handles["self_attn.k_proj"].quantizer.global_scale = qkv_global_scale
+                gptq_handles["self_attn.v_proj"].quantizer.global_scale = qkv_global_scale
+            if gptq_handles.get("mlp.gate_proj") and gptq_handles["mlp.gate_proj"].quantizer is not None:
+                # gate_up fusion
+                gate_up_global_scale = min(
+                    gptq_handles["mlp.gate_proj"].quantizer.global_scale,
+                    gptq_handles["mlp.up_proj"].quantizer.global_scale
+                )
+                gptq_handles["mlp.gate_proj"].quantizer.global_scale = gate_up_global_scale
+                gptq_handles["mlp.up_proj"].quantizer.global_scale = gate_up_global_scale
 
         # Set train_mode to False BEFORE calibration
         # so QLinear doesn't dynamically transform weights we already pre-rotated
@@ -737,7 +803,7 @@ def gptq_quantization(
                 block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
         
         # --- NEW: AWQ SEARCH & FUSION ---
-        if getattr(args, "awq", 0) > 0:
+        if getattr(args, "awq", 0) > 0 or getattr(args, "gajs", False):
             from .awq import run_awq_search
             from ..transforms.transforms import CompositeTransform, DiagonalScaleTransform
             
@@ -772,7 +838,7 @@ def gptq_quantization(
                 a_q = getattr(gptq_handles[valid_names[0]].layer, 'act_quantizer', None)
                 
                 # 3. Run awq search using the small X_sub and precomputed X_max
-                s = run_awq_search(X_sub, weights, weight_quantizer=w_qs[0], act_quantizer=a_q, steps=args.awq, X_max=X_max)
+                s = run_awq_search(X_sub, weights, weight_quantizer=w_qs[0], act_quantizer=a_q, steps=args.awq, X_max=X_max, use_gajs=args.gajs)
                 
                 scale_t = DiagonalScaleTransform(s).to(device)
                 if isinstance(in_transform, CompositeTransform):
@@ -789,8 +855,9 @@ def gptq_quantization(
                     
                     # Recompute weight global scale since the weight distribution changed
                     if args.scale_precision == ScalePrecision.E4M3:
-                        gptq_handles[n].quantizer._track_global_scale = True
-                        gptq_handles[n].quantizer.get_quantization_params(layer.weight)
+                        if not getattr(args, "lock_global_scale", False):
+                            gptq_handles[n].quantizer._track_global_scale = True
+                            gptq_handles[n].quantizer.get_quantization_params(layer.weight)
                         gptq_handles[n].quantizer._track_global_scale = False
                 
                 # Re-fuse global scales for the group
@@ -813,18 +880,22 @@ def gptq_quantization(
                     
                 return new_transform
             
-            print(f"  [AWQ] Running grid search ({args.awq} steps) and fusing operators...")
-            qkv_in_transform = process_awq_group(["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], qkv_in_transform)
-            block.self_attn.qkv_in_transform = qkv_in_transform
-            
-            o_in_transform = process_awq_group(["self_attn.o_proj"], o_in_transform)
-            block.self_attn.o_in_transform = o_in_transform
-            
-            gate_up_in_transform = process_awq_group(["mlp.gate_proj", "mlp.up_proj"], gate_up_in_transform)
-            block.mlp.gate_up_in_transform = gate_up_in_transform
-            
-            down_in_transform = process_awq_group(["mlp.down_proj"], down_in_transform)
-            block.mlp.down_in_transform = down_in_transform
+            if args.awq or args.gajs:
+                if args.gajs:
+                    print(f"  [GAJS] Running Strict Bound Grid Search (20 steps) and fusing operators...")
+                else:
+                    print(f"  [AWQ] Running grid search ({args.awq} steps) and fusing operators...")
+                qkv_in_transform = process_awq_group(["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], qkv_in_transform)
+                block.self_attn.qkv_in_transform = qkv_in_transform
+                
+                o_in_transform = process_awq_group(["self_attn.o_proj"], o_in_transform)
+                block.self_attn.o_in_transform = o_in_transform
+                
+                gate_up_in_transform = process_awq_group(["mlp.gate_proj", "mlp.up_proj"], gate_up_in_transform)
+                block.mlp.gate_up_in_transform = gate_up_in_transform
+                
+                down_in_transform = process_awq_group(["mlp.down_proj"], down_in_transform)
+                block.mlp.down_in_transform = down_in_transform
 
             # Propagate updated transforms to QLinear modules
             block.self_attn.fix_parametrization()
@@ -886,10 +957,20 @@ def gptq_quantization(
 
         # 8. Update activations
         device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
-        for inp_args, inp_kwargs in zip(input_args, input_kwargs):
+        
+        block_mse_sum = 0.0
+        block_mse_count = 0
+        
+        for idx, (inp_args, inp_kwargs) in enumerate(zip(input_args, input_kwargs)):
             with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
                 out = block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
             out = maybe_first_element(out).to(act_offload_device)
+            
+            if getattr(args, "show_act_mse", False):
+                orig_out = orig_block_outputs[idx].to(out.device)
+                block_mse_sum += (orig_out.float() - out.float()).pow(2).mean().item()
+                block_mse_count += 1
+                
             # change only first input argument
             if len(inp_args) > 0:
                 inp_args[0].data = out
@@ -898,6 +979,12 @@ def gptq_quantization(
             else:
                 raise ValueError("Unsupported block input format.")
 
+        if getattr(args, "show_act_mse", False) and block_mse_count > 0:
+            block_mse = block_mse_sum / block_mse_count
+            print(f"[{'Block Final Out':16}]: Output MSE Error: {block_mse:.2e}")
+            if getattr(args, "log_wandb", False):
+                wandb.log({f"gptq/block_{block_idx}_output_mse": block_mse})
+                
         # Print activation MSE
         if args.show_act_mse:
             for layer_name, layer in block.named_modules():
