@@ -1,8 +1,3 @@
-"""
-微观 Block 级别量化分析：
-对同一个 128-channel Block，分别用 NVFP4(8组×16) 和 MXFP4(4组×32) 量化，
-对比旋转前后的具体数值、scale、量化值和误差。
-"""
 import os, sys, torch, numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
@@ -34,32 +29,29 @@ def collect_activations(model, layers_to_hook, calib_data, device):
     return activations
 
 def quantize_group(values, quantizer, device):
-    """对一个 group 的值进行量化，返回量化后的值和 scale"""
+    """对一?group 的值进行量化，返回量化后的值和 scale"""
     x = values.to(device).unsqueeze(0)  # (1, group_size)
     scales, zeros = quantizer.get_quantization_params(x)
     x_q = quantizer(x, scales, zeros)
     return x_q.squeeze(0).cpu(), scales.squeeze().cpu().item()
 
 def analyze_block(block_values, quantizer_nv, quantizer_mx, transform, device):
-    """
-    block_values: (128,) 一个 token 的 128 个通道值
-    返回 NVFP4 和 MXFP4 在旋转前后的详细量化结果，包括 NVFP4 锁定 global_scale 的情况。
-    """
+
     block = block_values.clone()
     
     # --- 旋转 ---
     block_rot = transform(block.unsqueeze(0).to(device)).squeeze(0).cpu()
     
-    # 辅助函数：量化整个 block
+    # 辅助函数：量化整?block
     def quantize_full_block(data, quantizer, gs, is_locked=False, lock_ref_data=None):
         x = data.to(device).unsqueeze(0) # (1, 128)
         
-        # 重置 quantizer 状态
+        # 重置 quantizer 状?
         quantizer._track_global_scale = (quantizer.scale_precision.value == "e4m3")
         quantizer.global_scale = torch.tensor([float("inf")], dtype=torch.float32).to(device)
         
         if is_locked and quantizer.scale_precision.value == "e4m3":
-            # 锁定 global_scale 到 lock_ref_data 的最大值
+            # 锁定 global_scale ?lock_ref_data 的最大?
             from src.quantization.quant_ops import FP8_E4M3_MAX, FP4_E2M1_MAX
             from src.quantization.quantizer import get_reciprocal
             act_max_val = lock_ref_data.abs().max().to(torch.float32).view(1)
@@ -90,44 +82,54 @@ def analyze_block(block_values, quantizer_nv, quantizer_mx, transform, device):
         total_mse = np.mean([g["mse"] for g in groups_info])
         return groups_info, total_mse
     
+    def compute_stats(g_info, is_rotated, raw_data):
+        q_vals = np.concatenate([g["quantized"] for g in g_info])
+        err2 = (q_vals - raw_data)**2
+        max_idx = np.argmax(np.abs(block.numpy()))
+        mse_max = err2[max_idx]
+        mse_other = (np.sum(err2) - mse_max) / 127.0
+        return mse_max, mse_other
+    
     results = {}
     
     # 1. NVFP4 No Rotation
     g_info, mse = quantize_full_block(block, quantizer_nv, 16)
-    results["nvfp4_norot"] = {"groups": g_info, "total_mse": mse, "name": "NVFP4 No Rotation"}
+    mse_max, mse_other = compute_stats(g_info, False, block.numpy())
+    results["nvfp4_norot"] = {"groups": g_info, "total_mse": mse, "name": "NVFP4 No Rotation", "mse_max": mse_max, "mse_other": mse_other}
     
     # 2. NVFP4 Rotated (Unlocked)
     g_info, mse = quantize_full_block(block_rot, quantizer_nv, 16)
-    results["nvfp4_rot"] = {"groups": g_info, "total_mse": mse, "name": "NVFP4 Rotated (Unlocked)"}
+    mse_max, mse_other = compute_stats(g_info, True, block_rot.numpy())
+    results["nvfp4_rot"] = {"groups": g_info, "total_mse": mse, "name": "NVFP4 Rotated (Unlocked)", "mse_max": mse_max, "mse_other": mse_other}
     
     # 3. NVFP4 Rotated (Locked to original block)
     g_info, mse = quantize_full_block(block_rot, quantizer_nv, 16, is_locked=True, lock_ref_data=block)
-    results["nvfp4_rot_locked"] = {"groups": g_info, "total_mse": mse, "name": "NVFP4 Rotated (Locked)"}
+    mse_max, mse_other = compute_stats(g_info, True, block_rot.numpy())
+    results["nvfp4_rot_locked"] = {"groups": g_info, "total_mse": mse, "name": "NVFP4 Rotated (Locked)", "mse_max": mse_max, "mse_other": mse_other}
     
     # 4. MXFP4 No Rotation
     g_info, mse = quantize_full_block(block, quantizer_mx, 32)
-    results["mxfp4_norot"] = {"groups": g_info, "total_mse": mse, "name": "MXFP4 No Rotation"}
+    mse_max, mse_other = compute_stats(g_info, False, block.numpy())
+    results["mxfp4_norot"] = {"groups": g_info, "total_mse": mse, "name": "MXFP4 No Rotation", "mse_max": mse_max, "mse_other": mse_other}
     
     # 5. MXFP4 Rotated
     g_info, mse = quantize_full_block(block_rot, quantizer_mx, 32)
-    results["mxfp4_rot"] = {"groups": g_info, "total_mse": mse, "name": "MXFP4 Rotated"}
+    mse_max, mse_other = compute_stats(g_info, True, block_rot.numpy())
+    results["mxfp4_rot"] = {"groups": g_info, "total_mse": mse, "name": "MXFP4 Rotated", "mse_max": mse_max, "mse_other": mse_other}
     
     return results, block.numpy(), block_rot.numpy()
 
 def print_report(layer_idx, block_idx, token_idx, orig, rotated, results):
-    """打印详细的数值报告"""
     print(f"\n{'='*80}")
     print(f"  Layer {layer_idx}, Block {block_idx} (channels {block_idx*128}-{(block_idx+1)*128-1}), Token {token_idx}")
     print(f"{'='*80}")
-    
-    # 原始值摘要
+
     max_pos = np.argmax(np.abs(orig))
-    print(f"\n  原始值 (128 channels), Max |值| = {orig[max_pos]:.4f} @ position {max_pos}")
-    print(f"  前16: {np.array2string(orig[:16], precision=3, separator=', ')}")
+    print(f"\n  原始�?(128 channels), Max |值| = {orig[max_pos]:.4f} @ position {max_pos}")
+    print(f"  �?6: {np.array2string(orig[:16], precision=3, separator=', ')}")
     
-    # 旋转后值摘要
-    print(f"\n  旋转后 (Hadamard-128), Max |值| = {np.max(np.abs(rotated)):.4f}")
-    print(f"  前16: {np.array2string(rotated[:16], precision=3, separator=', ')}")
+    print(f"\n  旋转�?(Hadamard-128), Max |值| = {np.max(np.abs(rotated)):.4f}")
+    print(f"  �?6: {np.array2string(rotated[:16], precision=3, separator=', ')}")
     
     for fmt in ["nvfp4", "mxfp4"]:
         norot = results[f"{fmt}_norot"]
@@ -139,16 +141,16 @@ def print_report(layer_idx, block_idx, token_idx, orig, rotated, results):
         print(f"\n{'─'*90}")
         print(f"  {norot['name'].split(' No Rotation')[0]}")
         print(f"{'─'*90}")
-        print(f"  {'Group':>7} | {'Condition':>12} | {'Scale':>10} | {'Max|Val|':>10} | {'Group MSE':>12} | 前6个值")
+        print(f"  {'Group':>7} | {'Condition':>12} | {'Scale':>10} | {'Max|Val|':>10} | {'Group MSE':>12} | �?个�?)")
         print(f"  {'─'*7}─┼─{'─'*12}─┼─{'─'*10}─┼─{'─'*10}─┼─{'─'*12}─┼─{'─'*30}")
         
         for g in range(n_groups):
             g_norot = norot["groups"][g]
             g_rot = rot["groups"][g]
             
-            # 标记含 Outlier 的组
+            # 标记�?Outlier 的组
             is_outlier = g_norot["max_abs"] > 2 * np.median([gi["max_abs"] for gi in norot["groups"]])
-            marker = " ★" if is_outlier else ""
+            marker = " �? if is_outlier else "
             
             vals_str = np.array2string(g_norot["values"][:6], precision=2, separator=',')
             print(f"  G{g:>5} | {'NoRot':>12} | {g_norot['scale']:>10.4f} | {g_norot['max_abs']:>10.4f} | {g_norot['mse']:>12.6f} | {vals_str}{marker}")
@@ -164,7 +166,7 @@ def print_report(layer_idx, block_idx, token_idx, orig, rotated, results):
             print(f"  {'─'*7}─┼─{'─'*12}─┼─{'─'*10}─┼─{'─'*10}─┼─{'─'*12}─┼─{'─'*30}")
         
         ratio = rot["total_mse"] / (norot["total_mse"] + 1e-15)
-        verdict = "↑ WORSE" if ratio > 1 else "↓ BETTER"
+        verdict = "�?WORSE" if ratio > 1 else "�?BETTER"
         locked_info = f"  Rot_Locked={rot_locked['total_mse']:.6f}" if rot_locked else ""
         print(f"  Total MSE:  NoRot={norot['total_mse']:.6f}  Rot={rot['total_mse']:.6f}{locked_info}  Ratio={ratio:.2f}× ({verdict})")
 
@@ -195,7 +197,7 @@ def plot_block(layer_idx, block_idx, token_idx, orig, rotated, results, output_p
         res = results[key]
         n_groups = 128 // gs
         
-        # 画每个 group 的 bar (原始值)
+        # 画每�?group �?bar (原始�?
         for g in range(n_groups):
             x_pos = np.arange(g*gs, (g+1)*gs)
             vals = data[g*gs:(g+1)*gs]
@@ -212,7 +214,12 @@ def plot_block(layer_idx, block_idx, token_idx, orig, rotated, results, output_p
                     ax.hlines(lvl, g*gs-0.5, (g+1)*gs-0.5, colors=colors[g], alpha=0.2, linewidth=0.5, linestyles='--')
         
         mse = res["total_mse"]
-        ax.set_title(f"{title}\nMean Block MSE = {mse:.6f}", fontsize=12)
+        mse_max = res.get("mse_max", 0.0)
+        mse_other = res.get("mse_other", 0.0)
+        
+        title_text = f"{title}\nTotal MSE = {mse:.6f}\nMax Pos MSE: {mse_max:.6f} | Others Mean MSE: {mse_other:.6f}"
+        
+        ax.set_title(title_text, fontsize=10)
         ax.set_ylabel("Value")
         ax.axhline(0, color='black', linewidth=0.5)
         ax.legend(fontsize=6, ncol=4, loc='upper right')
@@ -246,7 +253,7 @@ def main():
     calib_data = tokenizer(text, return_tensors="pt").to(device)
     activations = collect_activations(model, layers, calib_data, device)
     
-    # 量化器
+    # 量化�?
     nv_q = Quantizer(bits=4, format="nvfp", granularity="group", group_size=16, symmetric=True, scale_precision="e4m3")
     mx_q = Quantizer(bits=4, format="mxfp", granularity="group", group_size=32, symmetric=True, scale_precision="e8m0")
     transform = build_transform("hadamard", size=128, group_size=128).to(device)
@@ -259,22 +266,22 @@ def main():
         dim = X.shape[-1]
         n_blocks = dim // 128
         
-        # 找到含最大 Outlier 的 block
+        # 找到含最�?Outlier �?block
         X_blocks = X[:, :n_blocks*128].reshape(X.shape[0], n_blocks, 128)
         block_max = X_blocks.abs().max(dim=-1).values.max(dim=0).values  # (n_blocks,)
         best_block = block_max.argmax().item()
         
-        # 找到该 block 中 outlier 最大的 token
+        # 找到�?block �?outlier 最大的 token
         token_max = X_blocks[:, best_block, :].abs().max(dim=-1).values
         best_token = token_max.argmax().item()
         
-        # 也选一个"普通" token (中位数附近)
+        # 也选一�?普�? token (中位数附�?
         median_token = torch.argsort(token_max)[len(token_max)//2].item()
         
         for token_idx in [best_token, median_token]:
             block_vals = X_blocks[token_idx, best_block, :]  # (128,)
             results, orig, rotated = analyze_block(block_vals, nv_q, mx_q, transform, device)
-            print_report(layer_idx, best_block, token_idx, orig, rotated, results)
+            # print_report(layer_idx, best_block, token_idx, orig, rotated, results)
             
             tag = "outlier" if token_idx == best_token else "normal"
             plot_block(layer_idx, best_block, token_idx, orig, rotated, results,
@@ -285,185 +292,221 @@ def main():
             group_orig = orig[group_idx*16 : (group_idx+1)*16]
             group_rotated = rotated[group_idx*16 : (group_idx+1)*16]
             
+            # Compute group-level stats
+            max_idx_grp = np.argmax(np.abs(group_orig))
+            
+            q_norot = results['nvfp4_norot']['groups'][group_idx]['quantized']
+            err2_norot = (q_norot - group_orig)**2
+            norot_mse_max = err2_norot[max_idx_grp]
+            norot_mse_other = (np.sum(err2_norot) - norot_mse_max) / 15.0
+            
+            q_rot = results['nvfp4_rot']['groups'][group_idx]['quantized']
+            err2_rot = (q_rot - group_rotated)**2
+            rot_mse_max = err2_rot[max_idx_grp]
+            rot_mse_other = (np.sum(err2_rot) - rot_mse_max) / 15.0
+            
+            q_rot_l = results['nvfp4_rot_locked']['groups'][group_idx]['quantized']
+            err2_rot_l = (q_rot_l - group_rotated)**2
+            rot_l_mse_max = err2_rot_l[max_idx_grp]
+            rot_l_mse_other = (np.sum(err2_rot_l) - rot_l_mse_max) / 15.0
+            
             # Save for summary plot (only the specific 16-channel group)
             all_nv_results.append({
                 'layer': layer_idx,
                 'tag': tag,
                 'group_id': group_idx,
                 'norot_mse': results['nvfp4_norot']['groups'][group_idx]['mse'],
+                'norot_mse_max': norot_mse_max,
+                'norot_mse_other': norot_mse_other,
                 'rot_mse': results['nvfp4_rot']['groups'][group_idx]['mse'],
+                'rot_mse_max': rot_mse_max,
+                'rot_mse_other': rot_mse_other,
                 'rot_locked_mse': results['nvfp4_rot_locked']['groups'][group_idx]['mse'],
+                'rot_locked_mse_max': rot_l_mse_max,
+                'rot_locked_mse_other': rot_l_mse_other,
                 'orig': group_orig,
                 'rotated': group_rotated
             })
 
-    # 生成汇总图片
     plot_summary_comparison(all_nv_results, "nvfp4_all_layers_summary.png")
     
-    # 宏观全矩阵统计
-    run_macro_statistics(activations, transform, device)
-    
-    # 生成宏观图表（图表一和图表三）
-    plot_macro_visualizations(activations, device)
-    
-    # 针对 MxFP4 生成 1x2 对比诊断图 (Before vs After Hadamard-128)
-    plot_mx_macro_visualizations(activations, mx_q, transform, device)
+    # 宏观块级特征分析与散点图 (Phase 3 定量验证)
+    analyze_macro_block_features(activations, nv_q, mx_q, transform, device)
 
-def plot_mx_macro_visualizations(activations, quantizer_mx, transform, device):
+def analyze_macro_block_features(activations, quantizer_nv, quantizer_mx, transform_128, device):
     """
-    MxFP4 综合误差诊断分析方案 (MxFP4 Comprehensive Output Error Diagnostic)
-    生成 1x2 的高清对比图，对比旋转前 (Before Rotation) 和旋转后 (After Hadamard Rotation)。
+    全矩阵宏观特征分析：
+    同时分析 128-channel block 和 16-channel group。
+    用象限散点图和Scale压缩图验证效果A（小弟获益）和效果B（老大吃亏）的普遍存在。
     """
     print("\n" + "="*80)
-    print(" 🎨 GENERATING MXFP4 COMPREHENSIVE MACRO VISUALIZATIONS (1x2 Plot)")
+    print(" 🚀 RUNNING MACRO-DIAGNOSTIC STATISTICS (Decomposed A/B Effects)")
     print("="*80)
     
-    gs = 32 # MxFP4 Group Size
-    bins = [1, 4, 8, 12, 16, 24, float('inf')]
-    short_bin_names = ["1-4", "4-8", "8-12", "12-16", "16-24", ">24"]
+    from src.transforms.transforms import build_transform
+    transform_16 = build_transform("hadamard", size=16, group_size=16).to(device)
+    
+    gs_nv = 16
+    gs_mx = 32
+    block_size_128 = 128
+    block_size_16 = 16
     
     for layer_idx, data in activations.items():
-        print(f"  Generating MxFP4 plots for Layer {layer_idx}...")
-        X = data['X']
-        W = data['W']
-        out_dim = W.shape[0]
-        n_tokens = X.shape[0]
-        n_groups_per_token = X.shape[1] // gs
+        print(f"\n--- Layer {layer_idx} Macro Analysis ---")
+        X = data['X'].to(device)
+        n_tokens, dim = X.shape
+        n_blocks_128 = (n_tokens * dim) // block_size_128
+        n_groups_16 = (n_tokens * dim) // block_size_16
         
-        X_dev = X.to(device)
-        
-        # Calculate for BOTH Before and After Rotation
-        chart_data = {}
-        for rot_state, X_current in [("Before Rotation", X_dev), ("After Rotation (Hadamard-128)", transform(X_dev))]:
+        def compute_macro_metrics(X, X_q_norot, scales_norot, X_rot, X_q_rot, scales_rot, gs, block_size):
+            n_blocks = (n_tokens * dim) // block_size
             
-            # 1. 计算 Spikiness = max(|x|) / mean(|x|)
-            X_groups = X_current.view(-1, gs)
-            max_abs = X_groups.abs().max(dim=1).values
-            mean_abs = X_groups.abs().mean(dim=1)
-            spikiness = max_abs / (mean_abs + 1e-9)
+            err2_norot = (X_q_norot - X).pow(2).view(n_blocks, block_size)
+            mse_norot = err2_norot.mean(dim=1)
             
-            # 2. 计算量化 MSE
-            scales, zeros = quantizer_mx.get_quantization_params(X_current)
-            X_q = quantizer_mx(X_current, scales, zeros)
+            err2_rot = (X_q_rot - X_rot).pow(2).view(n_blocks, block_size)
+            mse_rot = err2_rot.mean(dim=1)
             
-            # 如果是旋转后，需要转回原空间计算真实输出损失
-            if rot_state == "Before Rotation":
-                err_sq = (X_q - X_current).pow(2).view(-1, gs).cpu()
-            else:
-                X_q_orig_space = transform(X_q)
-                err_sq = (X_q_orig_space - X_dev).pow(2).view(-1, gs).cpu()
+            delta_mse = (mse_rot - mse_norot).cpu().numpy()
+            
+            # Scale compression ratio (mean across sub-groups within the block)
+            sr = (scales_rot / (scales_norot + 1e-15)).view(n_blocks, -1).mean(dim=1).cpu().numpy()
+            
+            # High Loss Ratio calculation
+            def get_hlr(X_q, scales):
+                X_q_reshaped = X_q.view(-1, gs)
+                scales_reshaped = scales.view(-1, 1)
+                val_normalized = (X_q_reshaped.abs() / (scales_reshaped + 1e-15))
+                is_4 = (val_normalized - 4.0).abs() < 0.1
+                is_6 = (val_normalized - 6.0).abs() < 0.1
+                is_hl = is_4 | is_6
+                # reshape back to blocks
+                hl_per_block = is_hl.view(n_blocks, block_size).float().mean(dim=1)
+                return hl_per_block.cpu().numpy()
                 
-            W_g = W.view(out_dim, n_groups_per_token, gs).permute(1, 2, 0)
-            W_norm2 = W_g.pow(2).sum(dim=2) # (G, gs)
-            W_norm2_expanded = W_norm2.unsqueeze(0).expand(n_tokens, -1, -1).reshape(-1, gs)
+            hlr_norot = get_hlr(X_q_norot, scales_norot)
+            hlr_rot = get_hlr(X_q_rot, scales_rot)
+            delta_hlr = hlr_rot - hlr_norot
             
-            err_sq_out = err_sq * W_norm2_expanded / out_dim
-            total_output_mse = err_sq_out.sum().item()
-            
-            # Level binning
-            levels = X_q.abs().view(-1, gs).cpu() / (scales.view(-1, 1).cpu() + 1e-15)
-            
-            avg_mse_6x, avg_mse_4x, avg_mse_05x, avg_mse_0x, avg_mse_rest = [], [], [], [], []
-            counts_6x, counts_4x, counts_05x, counts_0x, counts_rest = [], [], [], [], []
-            freq_list = []
-            
-            for i in range(len(bins)-1):
-                low, high = bins[i], bins[i+1]
-                mask = (spikiness >= low) & (spikiness < high)
-                n_groups = mask.sum().item()
-                freq_list.append(n_groups / len(spikiness) * 100)
-                
-                if n_groups == 0:
-                    for l in [avg_mse_6x, avg_mse_4x, avg_mse_05x, avg_mse_0x, avg_mse_rest,
-                              counts_6x, counts_4x, counts_05x, counts_0x, counts_rest]:
-                        l.append(0.0)
-                else:
-                    bin_err = err_sq_out[mask.cpu()]
-                    bin_levels = levels[mask.cpu()]
-                    
-                    err_6x = (bin_err * (bin_levels >= 5.5)).sum().item() / total_output_mse * 100
-                    err_4x = (bin_err * ((bin_levels > 3.5) & (bin_levels < 4.5))).sum().item() / total_output_mse * 100
-                    err_05x = (bin_err * ((bin_levels > 0.25) & (bin_levels < 0.75))).sum().item() / total_output_mse * 100
-                    err_0x = (bin_err * (bin_levels < 0.25)).sum().item() / total_output_mse * 100
-                    
-                    mask_rest = ~( (bin_levels >= 5.5) | ((bin_levels > 3.5) & (bin_levels < 4.5)) | ((bin_levels > 0.25) & (bin_levels < 0.75)) | (bin_levels < 0.25) )
-                    err_rest = (bin_err * mask_rest).sum().item() / total_output_mse * 100
-                    
-                    c_6x = (bin_levels >= 5.5).sum().item() / n_groups
-                    c_4x = ((bin_levels > 3.5) & (bin_levels < 4.5)).sum().item() / n_groups
-                    c_05x = ((bin_levels > 0.25) & (bin_levels < 0.75)).sum().item() / n_groups
-                    c_0x = (bin_levels < 0.25).sum().item() / n_groups
-                    c_rest = mask_rest.sum().item() / n_groups
-                    
-                    avg_mse_6x.append(err_6x); avg_mse_4x.append(err_4x); avg_mse_05x.append(err_05x); avg_mse_0x.append(err_0x); avg_mse_rest.append(err_rest)
-                    counts_6x.append(c_6x); counts_4x.append(c_4x); counts_05x.append(c_05x); counts_0x.append(c_0x); counts_rest.append(c_rest)
-            
-            chart_data[rot_state] = {
-                'avg_mse_6x': avg_mse_6x, 'avg_mse_4x': avg_mse_4x, 'avg_mse_rest': avg_mse_rest,
-                'avg_mse_05x': avg_mse_05x, 'avg_mse_0x': avg_mse_0x,
-                'counts_6x': counts_6x, 'counts_4x': counts_4x, 'counts_rest': counts_rest,
-                'counts_05x': counts_05x, 'counts_0x': counts_0x, 'freq_list': freq_list
-            }
-            
-        # Plotting 1x2 Subplots
-        fig, axes = plt.subplots(1, 2, figsize=(24, 7))
-        x = np.arange(len(short_bin_names))
-        width = 0.6
+            return sr, delta_hlr, delta_mse
         
-        for ax_idx, title in enumerate(["Before Rotation", "After Rotation (Hadamard-128)"]):
-            ax1 = axes[ax_idx]
-            d = chart_data[title]
+        # ==========================================
+        # 1. 128-Channel Block 分析 (MXFP4 & NVFP4 Had128)
+        # ==========================================
+        X_rot128 = transform_128(X)
+        
+        # MXFP4
+        scales_mx, zeros_mx = quantizer_mx.get_quantization_params(X)
+        X_q_mx = quantizer_mx(X, scales_mx, zeros_mx)
+        scales_mx_rot128, zeros_mx_rot128 = quantizer_mx.get_quantization_params(X_rot128)
+        X_q_mx_rot128 = quantizer_mx(X_rot128, scales_mx_rot128, zeros_mx_rot128)
+        
+        sr_mx128, d_hlr_mx128, d_mse_mx128 = compute_macro_metrics(
+            X, X_q_mx, scales_mx, X_rot128, X_q_mx_rot128, scales_mx_rot128, gs_mx, block_size_128
+        )
+        
+        # NVFP4 (with global scale lock for rot)
+        scales_nv, zeros_nv = quantizer_nv.get_quantization_params(X)
+        X_q_nv = quantizer_nv(X, scales_nv, zeros_nv)
+        
+        quantizer_nv._track_global_scale = False
+        from src.quantization.quant_ops import FP8_E4M3_MAX, FP4_E2M1_MAX
+        from src.quantization.quantizer import get_reciprocal
+        act_max_val = X.abs().max().to(torch.float32).view(1)
+        locked_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(act_max_val)
+        quantizer_nv.global_scale = locked_scale.to(device)
+        
+        scales_nv_rot128, zeros_nv_rot128 = quantizer_nv.get_quantization_params(X_rot128)
+        X_q_nv_rot128 = quantizer_nv(X_rot128, scales_nv_rot128, zeros_nv_rot128)
+        
+        sr_nv128, d_hlr_nv128, d_mse_nv128 = compute_macro_metrics(
+            X, X_q_nv, scales_nv, X_rot128, X_q_nv_rot128, scales_nv_rot128, gs_nv, block_size_128
+        )
+        
+        # ==========================================
+        # 2. 16-Channel Group 分析 (NVFP4 Had16)
+        # ==========================================
+        X_rot16 = transform_16(X)
+        scales_nv_rot16, zeros_nv_rot16 = quantizer_nv.get_quantization_params(X_rot16)
+        X_q_nv_rot16 = quantizer_nv(X_rot16, scales_nv_rot16, zeros_nv_rot16)
+        
+        sr_nv16, d_hlr_nv16, d_mse_nv16 = compute_macro_metrics(
+            X, X_q_nv, scales_nv, X_rot16, X_q_nv_rot16, scales_nv_rot16, gs_nv, block_size_16
+        )
+        
+        quantizer_nv._track_global_scale = True
+        
+        # ==========================================
+        # 3. Spatial Distribution Processing
+        # ==========================================
+        G_128 = dim // block_size_128
+        G_16 = dim // block_size_16
+        
+        def compute_spatial_stats(delta_tot_np, G):
+            matrix = delta_tot_np.reshape(n_tokens, G)
+            prob_worse = (matrix > 0).sum(axis=0) / n_tokens * 100
+            total_mse = matrix.sum(axis=0)
+            return prob_worse, total_mse
             
-            b1 = ax1.bar(x, d['avg_mse_6x'], width, color='#2ca02c', label='Quantized to 6x (Outlier)' if ax_idx==0 else "")
-            b2 = ax1.bar(x, d['avg_mse_4x'], width, bottom=d['avg_mse_6x'], color='#bcbd22', label='Quantized to 4x' if ax_idx==0 else "")
+        prob_worse_nv128, total_mse_nv128 = compute_spatial_stats(d_mse_nv128, G_128)
+        prob_worse_mx128, total_mse_mx128 = compute_spatial_stats(d_mse_mx128, G_128)
+        prob_worse_nv16, total_mse_nv16 = compute_spatial_stats(d_mse_nv16, G_16)
+        
+        # ==========================================
+        # 4. Plotting New Mechanism Scatter and Spatial
+        # ==========================================
+        fig, axes = plt.subplots(2, 3, figsize=(24, 14))
+        
+        def plot_mechanism_scatter(ax, sr, d_hlr, d_mse, title):
+            # Define colormap: Green for negative (loss decrease), Red for positive (loss increase)
+            import matplotlib.colors as mcolors
+            max_abs = max(abs(d_mse.min()), abs(d_mse.max()), 1e-4)
+            norm = mcolors.SymLogNorm(linthresh=1e-4, vmin=-max_abs, vmax=max_abs, base=10)
+            scatter = ax.scatter(sr, d_hlr, c=d_mse, cmap='RdYlGn_r', alpha=0.6, s=10, norm=norm)
             
-            bottom_rest = np.array(d['avg_mse_6x'])+np.array(d['avg_mse_4x'])
-            b_rest = ax1.bar(x, d['avg_mse_rest'], width, bottom=bottom_rest, color='#ff7f0e', label='Quantized to Others (1x-3x)' if ax_idx==0 else "")
+            ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
+            ax.axvline(1, color='gray', linestyle='--', alpha=0.5)
+            ax.set_xlabel('Scale Ratio ($Scale_{Rot} / Scale_{NoRot}$)', fontweight='bold')
+            ax.set_ylabel('$\Delta$ High-Loss Ratio (Rot - NoRot)', fontweight='bold')
+            ax.set_xscale('log')
+            ax.set_title(title, fontweight='bold')
             
-            bottom_05x = bottom_rest+np.array(d['avg_mse_rest'])
-            b05 = ax1.bar(x, d['avg_mse_05x'], width, bottom=bottom_05x, color='#9467bd', label='Quantized to 0.5x' if ax_idx==0 else "")
+            cbar = plt.colorbar(scatter, ax=ax)
+            cbar.set_label('$\Delta$ Total MSE (Red = Worse, Green = Better)')
             
-            bottom_0x = bottom_05x+np.array(d['avg_mse_05x'])
-            b0 = ax1.bar(x, d['avg_mse_0x'], width, bottom=bottom_0x, color='#d62728', label='Quantized to 0 (Underflow Massacre)' if ax_idx==0 else "")
+        def plot_spatial(ax, prob_worse, total_mse, G, title):
+            ax.bar(range(G), prob_worse, color='salmon', width=1.0, alpha=0.8, label='Worsened (%)')
+            ax.bar(range(G), 100 - prob_worse, bottom=prob_worse, color='mediumseagreen', width=1.0, alpha=0.8, label='Improved (%)')
+            ax.axhline(50, color='black', linestyle='--', alpha=0.5)
+            ax.set_xlabel('Channel Group Index', fontweight='bold')
+            ax.set_ylabel('% of Tokens (Red=Worse, Green=Better)', fontweight='bold')
+            ax.set_ylim(0, 100)
+            ax.set_title(title, fontweight='bold')
             
-            def add_labels(bars, counts, threshold=1.0):
-                for i, rect in enumerate(bars):
-                    height = rect.get_height()
-                    if height > threshold:
-                        count_val = counts[i]
-                        if count_val >= 0.1:
-                            ax1.text(rect.get_x() + rect.get_width()/2., rect.get_y() + height/2.,
-                                     f"n={count_val:.1f}", ha='center', va='center', color='white', fontsize=9, fontweight='bold')
+            ax2 = ax.twinx()
+            ax2.plot(range(G), total_mse, color='blue', alpha=0.7, linewidth=1.5, label='Total ΔMSE')
+            ax2.set_yscale('symlog', linthresh=0.01)
+            ax2.axhline(0, color='blue', linestyle=':', alpha=0.5)
+            ax2.set_ylabel('Total $\Delta$MSE (symlog)', color='blue', fontweight='bold')
             
-            add_labels(b1, d['counts_6x'], threshold=2.0)
-            add_labels(b2, d['counts_4x'], threshold=2.0)
-            add_labels(b_rest, d['counts_rest'], threshold=2.0)
-            add_labels(b05, d['counts_05x'], threshold=2.0)
-            add_labels(b0, d['counts_0x'], threshold=2.0)
-            
-            ax1.set_xticks(x)
-            ax1.set_xticklabels(short_bin_names, rotation=45, fontsize=10)
-            ax1.set_ylabel('Total Output MSE Contribution (%)', fontweight='bold', fontsize=12)
-            ax1.set_xlabel('Spikiness Bin (Max / Mean)', fontweight='bold', fontsize=12)
-            ax1.set_title(title, fontsize=14, fontweight='bold')
-            ax1.grid(axis='y', linestyle='--', alpha=0.7)
-            
-            # Secondary Y-axis
-            ax2 = ax1.twinx()
-            ax2.plot(x, d['freq_list'], color='black', marker='o', linewidth=2.5, markersize=8, linestyle='-', label='Frequency of Groups (%)' if ax_idx==0 else "")
-            ax2.set_ylabel('Frequency of Groups (%)', color='black', fontweight='bold', fontsize=12)
-            ax2.set_ylim(0, max(max(d['freq_list'])*1.2, 10))
-            
-            if ax_idx == 0:
-                lines_1, labels_1 = ax1.get_legend_handles_labels()
-                lines_2, labels_2 = ax2.get_legend_handles_labels()
-                fig.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper center', bbox_to_anchor=(0.5, 1.05), ncol=3, fontsize=12)
-
-        plt.suptitle(f'Layer {layer_idx}: MxFP4 Comprehensive Error Diagnostic', y=1.1, fontsize=18, fontweight='bold')
-        fig.tight_layout()
-        plt.savefig(f"macro_mxfp4_comprehensive_L{layer_idx}.png", dpi=200, bbox_inches='tight')
+        plot_mechanism_scatter(axes[0, 0], sr_nv128, d_hlr_nv128, d_mse_nv128, 'NVFP4 (Had128) Mechanism Map')
+        plot_mechanism_scatter(axes[0, 1], sr_mx128, d_hlr_mx128, d_mse_mx128, 'MXFP4 (Had128) Mechanism Map')
+        plot_mechanism_scatter(axes[0, 2], sr_nv16, d_hlr_nv16, d_mse_nv16, 'NVFP4 (Had16) Mechanism Map')
+        
+        plot_spatial(axes[1, 0], prob_worse_nv128, total_mse_nv128, G_128, 'NVFP4 (Had128) Spatial Consistency')
+        plot_spatial(axes[1, 1], prob_worse_mx128, total_mse_mx128, G_128, 'MXFP4 (Had128) Spatial Consistency')
+        plot_spatial(axes[1, 2], prob_worse_nv16, total_mse_nv16, G_16, 'NVFP4 (Had16) Spatial Consistency')
+        
+        plt.suptitle(f'Layer {layer_idx}: Scale & High-Loss-Zone Impact on Total MSE', fontsize=18, fontweight='bold')
+        plt.tight_layout()
+        output_file = f"macro_scatter_L{layer_idx}.png"
+        plt.savefig(output_file, dpi=200, bbox_inches='tight')
         plt.close()
+        print(f"  New scatter plot saved to {output_file}")
         
+        del X, X_rot128, X_rot16
+        del X_q_mx, X_q_mx_rot128
+        del X_q_nv, X_q_nv_rot128, X_q_nv_rot16
         torch.cuda.empty_cache()
 
 def plot_summary_comparison(all_results, output_path):
@@ -480,15 +523,15 @@ def plot_summary_comparison(all_results, output_path):
         
         # NoRot Plot
         axes[i, 0].bar(range(16), res['orig'], color='skyblue', alpha=0.7)
-        axes[i, 0].set_title(f"L{layer} ({tag}) G{gid} - NoRot\nMSE: {res['norot_mse']:.6f}")
+        axes[i, 0].set_title(f"L{layer} ({tag}) G{gid} - NoRot\nGrp MSE: {res['norot_mse']:.4f} | Max: {res['norot_mse_max']:.4f} | Oth: {res['norot_mse_other']:.4f}", fontsize=10)
         
         # Rot Plot (Unlocked)
         axes[i, 1].bar(range(16), res['rotated'], color='salmon', alpha=0.7)
-        axes[i, 1].set_title(f"L{layer} ({tag}) G{gid} - Rotated (Unlocked)\nMSE: {res['rot_mse']:.6f}")
+        axes[i, 1].set_title(f"L{layer} ({tag}) G{gid} - Rot (Unlck)\nGrp MSE: {res['rot_mse']:.4f} | Max: {res['rot_mse_max']:.4f} | Oth: {res['rot_mse_other']:.4f}", fontsize=10)
         
         # Rot Plot (Locked)
         axes[i, 2].bar(range(16), res['rotated'], color='mediumpurple', alpha=0.7)
-        axes[i, 2].set_title(f"L{layer} ({tag}) G{gid} - Rotated (Locked)\nMSE: {res['rot_locked_mse']:.6f}")
+        axes[i, 2].set_title(f"L{layer} ({tag}) G{gid} - Rot (Lck)\nGrp MSE: {res['rot_locked_mse']:.4f} | Max: {res['rot_locked_mse_max']:.4f} | Oth: {res['rot_locked_mse_other']:.4f}", fontsize=10)
         
         for j in range(3):
             axes[i, j].axhline(0, color='black', linewidth=0.5)
@@ -498,346 +541,6 @@ def plot_summary_comparison(all_results, output_path):
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     print(f"  Summary figure saved to {output_path}")
-
-
-def run_macro_statistics(activations, transform, device):
-    """
-    全矩阵宏观诊断：定量分析各种 Outlier 组的出现频率和损失贡献。
-    重点评估 NVFP4 (group=16) 及其在 Hadamard 旋转前后的表现。
-    """
-    print("\n" + "="*80)
-    print(" 🚀 RUNNING MACRO-DIAGNOSTIC STATISTICS (NVFP4 Output MSE Analysis)")
-    print("="*80)
-    
-    from src.quantization.quantizer import Quantizer
-    quantizer_nv = Quantizer(bits=4, format="nvfp", granularity="group", group_size=16, symmetric=True, scale_precision="e4m3")
-    
-    gs = 16 # NVFP4 group size
-    
-    for layer_idx, data in activations.items():
-        X = data['X']
-        W = data['W']
-        
-        out_dim = W.shape[0]
-        n_tokens = X.shape[0]
-        n_groups_per_token = X.shape[1] // gs
-        
-        print(f"\n--- Layer {layer_idx} Macro Analysis ---")
-        
-        # 1. 计算 Spikiness (尖刺度) = 组内 max(|x|) / mean(|x|)
-        X_groups = X.view(-1, gs)
-        max_abs = X_groups.abs().max(dim=1).values
-        mean_abs = X_groups.abs().mean(dim=1)
-        spikiness = max_abs / (mean_abs + 1e-9)
-        
-        # 2. 计算量化 MSE
-        X_dev = X.to(device)
-        scales, zeros = quantizer_nv.get_quantization_params(X_dev)
-        X_q = quantizer_nv(X_dev, scales, zeros)
-        
-        err_sq_norot = (X_q - X_dev).pow(2).view(-1, gs).cpu()
-        
-        # --- 计算期望输出级损失 (Expected Output MSE Contribution) ---
-        # 提取权重的通道级强度，映射到输出空间
-        W_g = W.view(out_dim, n_groups_per_token, gs).permute(1, 2, 0)
-        W_norm2 = W_g.pow(2).sum(dim=2) # (G, gs)
-        W_norm2_expanded = W_norm2.unsqueeze(0).expand(n_tokens, -1, -1).reshape(-1, gs)
-        
-        err_sq_out = err_sq_norot * W_norm2_expanded / out_dim
-        output_mse_groups = err_sq_out.sum(dim=1) # (T*G,)
-        
-        # --- 组内误差归因 (Intra-Group Attribution based on Grid Levels) ---
-        extreme_mask = spikiness >= 8
-        mean_err_pct = None
-        mean_cnt = None
-        if extreme_mask.sum() > 0:
-            X_q_ext = X_q.view(-1, gs)[extreme_mask].cpu()
-            scales_ext = scales.view(-1, 1)[extreme_mask].cpu()
-            err_ext = err_sq_out[extreme_mask]
-            
-            levels = X_q_ext.abs() / (scales_ext + 1e-15)
-            
-            mask_6x = levels >= 5.5
-            mask_4x = (levels > 3.5) & (levels < 4.5)
-            mask_05x = (levels > 0.25) & (levels < 0.75)
-            mask_0x = levels < 0.25
-            mask_rest = ~(mask_6x | mask_4x | mask_05x | mask_0x)
-            
-            total_err = err_ext.sum(dim=1).clamp(min=1e-15)
-            
-            pct_6x = ((err_ext * mask_6x).sum(dim=1) / total_err * 100).mean().item()
-            pct_4x = ((err_ext * mask_4x).sum(dim=1) / total_err * 100).mean().item()
-            pct_05x = ((err_ext * mask_05x).sum(dim=1) / total_err * 100).mean().item()
-            pct_0x = ((err_ext * mask_0x).sum(dim=1) / total_err * 100).mean().item()
-            pct_rest = ((err_ext * mask_rest).sum(dim=1) / total_err * 100).mean().item()
-            
-            mean_err_pct = [pct_6x, pct_4x, pct_05x, pct_0x, pct_rest]
-            
-            cnt_6x = mask_6x.sum(dim=1).float().mean().item()
-            cnt_4x = mask_4x.sum(dim=1).float().mean().item()
-            cnt_05x = mask_05x.sum(dim=1).float().mean().item()
-            cnt_0x = mask_0x.sum(dim=1).float().mean().item()
-            cnt_rest = mask_rest.sum(dim=1).float().mean().item()
-            
-            mean_cnt = [cnt_6x, cnt_4x, cnt_05x, cnt_0x, cnt_rest]
-        
-        # --- 计算旋转后的期望输出级损失 (Rotated Output MSE) ---
-        X_rot = transform(X_dev)
-        scales_r, zeros_r = quantizer_nv.get_quantization_params(X_rot)
-        X_q_rot = quantizer_nv(X_rot, scales_r, zeros_r)
-        X_q_orig_space = transform(X_q_rot) # Hadamard is symmetric self-inverse
-        
-        err_sq_rot = (X_q_orig_space - X_dev).pow(2).view(-1, gs).cpu()
-        err_sq_out_rot = err_sq_rot * W_norm2_expanded / out_dim
-        output_mse_rot_groups = err_sq_out_rot.sum(dim=1)
-        
-        # 释放显存
-        del X_dev, X_q, X_rot, X_q_rot, X_q_orig_space
-        torch.cuda.empty_cache()
-        
-        total_output_mse = output_mse_groups.sum().item()
-        
-        # 3. 按 Block 的最大尖刺度进行分桶统计 (128-Block Binning)
-        output_mse_blocks = output_mse_groups.view(-1, 8).sum(dim=1)
-        output_mse_rot_blocks = output_mse_rot_groups.view(-1, 8).sum(dim=1)
-        
-        spikiness_matrix = spikiness.view(-1, 8)
-        block_spikiness_max = spikiness_matrix.max(dim=1).values
-        
-        bins = [1, 2, 4, 8, 10, 12, 14, 16, float('inf')]
-        bin_names = ["1-2 (Smooth)", "2-4 (Mild)", "4-8 (Spiky)", "8-10 (High)", "10-12 (Extreme)", "12-14 (Severe)", "14-16 (Isolated)", "16+ (Catastrophic)"]
-        
-        print(f"\n  [128-Block Level Diagnostic (8 groups per block)]")
-        print(f"{'Block Max Spikiness':>19} | {'Freq (%)':>8} | {'Loss Contrib(%)':>15} | {'Rot vs NoRot Ratio':>18} | Group Profile (Avg out of 8)")
-        print("-" * 115)
-        
-        for i in range(len(bins)-1):
-            low, high = bins[i], bins[i+1]
-            mask = (block_spikiness_max >= low) & (block_spikiness_max < high)
-            count = mask.sum().item()
-            
-            freq_pct = count / len(block_spikiness_max) * 100
-            if count > 0:
-                bin_mse_sum = output_mse_blocks[mask].sum().item()
-                bin_mse_rot_sum = output_mse_rot_blocks[mask].sum().item()
-                loss_contrib_pct = bin_mse_sum / total_output_mse * 100
-                rot_ratio = bin_mse_rot_sum / (bin_mse_sum + 1e-15)
-                
-                # Profile of the 8 groups within these blocks
-                spiky_in_bin = spikiness_matrix[mask] # (count, 8)
-                c_smooth = (spiky_in_bin < 4).sum(dim=1).float().mean().item()
-                c_spiky = ((spiky_in_bin >= 4) & (spiky_in_bin < 8)).sum(dim=1).float().mean().item()
-                c_ext = (spiky_in_bin >= 8).sum(dim=1).float().mean().item()
-                profile_str = f"{c_smooth:.1f} Smooth (<4), {c_spiky:.1f} Spiky (4-8), {c_ext:.1f} Extreme (>=8)"
-            else:
-                loss_contrib_pct = 0.0
-                rot_ratio = 0.0
-                profile_str = "N/A"
-                
-            print(f"{bin_names[i]:>19} | {freq_pct:>7.2f}% | {loss_contrib_pct:>14.2f}% | {rot_ratio:>17.2f}x | {profile_str}")
-            
-        if mean_err_pct is not None:
-            print(f"\n  [Intra-Group Attribution for Extreme Groups (Spikiness >= 8)]")
-            print(f"    Quantized to 6x scale           : {mean_err_pct[0]:>5.2f}% of Group OUTPUT MSE  (avg {mean_cnt[0]:.1f} elements)")
-            print(f"    Quantized to 4x scale           : {mean_err_pct[1]:>5.2f}% of Group OUTPUT MSE  (avg {mean_cnt[1]:.1f} elements)")
-            print(f"    Quantized to 0.5x scale         : {mean_err_pct[2]:>5.2f}% of Group OUTPUT MSE  (avg {mean_cnt[2]:.1f} elements)")
-            print(f"    Quantized to 0x (Underflow)     : {mean_err_pct[3]:>5.2f}% of Group OUTPUT MSE  (avg {mean_cnt[3]:.1f} elements)")
-            print(f"    Quantized to Others (1x-3x)     : {mean_err_pct[4]:>5.2f}% of Group OUTPUT MSE  (avg {mean_cnt[4]:.1f} elements)")
-
-
-def plot_macro_visualizations(activations, device):
-    """
-    NVFP4 综合误差诊断分析方案 (Comprehensive Output Error Diagnostic)
-    """
-    print("\n" + "="*80)
-    print(" 🎨 GENERATING MACRO VISUALIZATIONS (Output MSE Diagnostics)")
-    print("="*80)
-    
-    from src.quantization.quantizer import Quantizer
-    quantizer_nv = Quantizer(bits=4, format="nvfp", granularity="group", group_size=16, symmetric=True, scale_precision="e4m3")
-    
-    gs = 16 # NVFP4 Group Size
-    bins = [1, 2, 4, 8, 10, 12, 14, 16, float('inf')]
-    bin_names = ["1-2 (Smooth)", "2-4 (Mild)", "4-8 (Spiky)", "8-10 (High)", "10-12 (Extreme)", "12-14 (Severe)", "14-16 (Isolated)", "16+ (Catastrophic)"]
-    short_bin_names = ["1-2", "2-4", "4-8", "8-10", "10-12", "12-14", "14-16", "16+"]
-    
-    for layer_idx, data in activations.items():
-        print(f"  Generating plots for Layer {layer_idx}...")
-        X = data['X']
-        W = data['W']
-        out_dim = W.shape[0]
-        n_tokens = X.shape[0]
-        n_groups_per_token = X.shape[1] // gs
-        
-        X_groups = X.view(-1, gs)
-        max_abs = X_groups.abs().max(dim=1).values
-        mean_abs = X_groups.abs().mean(dim=1)
-        spikiness = max_abs / (mean_abs + 1e-9)
-        
-        X_dev = X.to(device)
-        scales_norot, zeros_norot = quantizer_nv.get_quantization_params(X_dev)
-        X_q = quantizer_nv(X_dev, scales_norot, zeros_norot)
-        
-        # --- 计算 Output MSE ---
-        err_sq_norot = (X_q - X_dev).pow(2).view(-1, gs).cpu()
-        W_g = W.view(out_dim, n_groups_per_token, gs).permute(1, 2, 0)
-        W_norm2 = W_g.pow(2).sum(dim=2)
-        W_norm2_expanded = W_norm2.unsqueeze(0).expand(n_tokens, -1, -1).reshape(-1, gs)
-        
-        err_sq_out = err_sq_norot * W_norm2_expanded / out_dim
-        total_output_mse = err_sq_out.sum().item() + 1e-15
-        
-        # --- Chart 1: Comprehensive Dual-Axis Stacked Bar Chart ---
-        levels_all = X_q.abs().view(-1, gs).cpu() / (scales_norot.view(-1, 1).cpu() + 1e-15)
-        
-        avg_mse_6x = []
-        avg_mse_4x = []
-        avg_mse_05x = []
-        avg_mse_0x = []
-        avg_mse_rest = []
-        
-        counts_6x = []
-        counts_4x = []
-        counts_05x = []
-        counts_0x = []
-        counts_rest = []
-        
-        freq_list = []
-        valid_bins = []
-        
-        for i in range(len(bins)-1):
-            mask = (spikiness >= bins[i]) & (spikiness < bins[i+1])
-            if mask.sum() > 0:
-                bin_err = err_sq_out[mask]
-                bin_levels = levels_all[mask]
-                
-                n_groups = mask.sum().item()
-                freq_list.append(n_groups / len(spikiness) * 100)
-                
-                # We now plot TOTAL OUTPUT MSE CONTRIBUTION (%) per bin
-                err_6x = (bin_err * (bin_levels >= 5.5)).sum().item() / total_output_mse * 100
-                err_4x = (bin_err * ((bin_levels > 3.5) & (bin_levels < 4.5))).sum().item() / total_output_mse * 100
-                err_05x = (bin_err * ((bin_levels > 0.25) & (bin_levels < 0.75))).sum().item() / total_output_mse * 100
-                err_0x = (bin_err * (bin_levels < 0.25)).sum().item() / total_output_mse * 100
-                
-                mask_rest = ~( (bin_levels >= 5.5) | ((bin_levels > 3.5) & (bin_levels < 4.5)) | ((bin_levels > 0.25) & (bin_levels < 0.75)) | (bin_levels < 0.25) )
-                err_rest = (bin_err * mask_rest).sum().item() / total_output_mse * 100
-                
-                # 计算组内平均元素个数 (Average counts of elements per group in this bin)
-                c_6x = (bin_levels >= 5.5).sum().item() / n_groups
-                c_4x = ((bin_levels > 3.5) & (bin_levels < 4.5)).sum().item() / n_groups
-                c_05x = ((bin_levels > 0.25) & (bin_levels < 0.75)).sum().item() / n_groups
-                c_0x = (bin_levels < 0.25).sum().item() / n_groups
-                c_rest = mask_rest.sum().item() / n_groups
-                
-                avg_mse_6x.append(err_6x)
-                avg_mse_4x.append(err_4x)
-                avg_mse_05x.append(err_05x)
-                avg_mse_0x.append(err_0x)
-                avg_mse_rest.append(err_rest)
-                
-                counts_6x.append(c_6x)
-                counts_4x.append(c_4x)
-                counts_05x.append(c_05x)
-                counts_0x.append(c_0x)
-                counts_rest.append(c_rest)
-                
-                valid_bins.append(short_bin_names[i])
-        
-        fig, ax1 = plt.subplots(figsize=(12, 7))
-        x = np.arange(len(valid_bins))
-        width = 0.6
-        
-        # Primary Y-axis: Stacked Bars for Output MSE Contribution %
-        b1 = ax1.bar(x, avg_mse_6x, width, color='#2ca02c', label='Quantized to 6x (Outlier)')
-        b2 = ax1.bar(x, avg_mse_4x, width, bottom=avg_mse_6x, color='#bcbd22', label='Quantized to 4x')
-        
-        bottom_rest = np.array(avg_mse_6x)+np.array(avg_mse_4x)
-        b_rest = ax1.bar(x, avg_mse_rest, width, bottom=bottom_rest, color='#ff7f0e', label='Quantized to Others (1x-3x)')
-        
-        bottom_05x = bottom_rest+np.array(avg_mse_rest)
-        b05 = ax1.bar(x, avg_mse_05x, width, bottom=bottom_05x, color='#9467bd', label='Quantized to 0.5x')
-        
-        bottom_0x = bottom_05x+np.array(avg_mse_05x)
-        b0 = ax1.bar(x, avg_mse_0x, width, bottom=bottom_0x, color='#d62728', label='Quantized to 0 (Underflow Massacre)')
-        
-        # Add Text Labels inside bars for element counts
-        # This solves the "is it 1 element or many?" question instantly
-        def add_labels(bars, counts, threshold=1.0):
-            for i, rect in enumerate(bars):
-                height = rect.get_height()
-                if height > threshold: # Only label if bar is tall enough to fit text
-                    count_val = counts[i]
-                    if count_val >= 0.1: # Only label if there is a meaningful count
-                        ax1.text(rect.get_x() + rect.get_width()/2., 
-                                 rect.get_y() + height/2.,
-                                 f"n={count_val:.1f}",
-                                 ha='center', va='center', color='white', fontsize=9, fontweight='bold')
-        
-        # Threshold for adding text (e.g. at least 2% contribution height to fit text)
-        add_labels(b1, counts_6x, threshold=2.0)
-        add_labels(b2, counts_4x, threshold=2.0)
-        add_labels(b_rest, counts_rest, threshold=2.0)
-        add_labels(b05, counts_05x, threshold=2.0)
-        add_labels(b0, counts_0x, threshold=2.0)
-        
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(valid_bins, rotation=45, fontsize=10)
-        ax1.set_ylabel('Total Output MSE Contribution (%)', fontweight='bold', fontsize=12)
-        ax1.set_xlabel('Spikiness Bin (Max / Mean)', fontweight='bold', fontsize=12)
-        
-        # Secondary Y-axis: Line plot for Frequency
-        ax2 = ax1.twinx()
-        ax2.plot(x, freq_list, color='black', marker='o', linewidth=2.5, markersize=8, linestyle='-', label='Frequency of Groups (%)')
-        ax2.set_ylabel('Frequency of Groups (%)', color='black', fontweight='bold', fontsize=12)
-        ax2.tick_params(axis='y', labelcolor='black')
-        ax2.set_ylim(0, max(max(freq_list)*1.2, 10)) # Ensure line doesn't cover top bars completely
-        
-        # Combine legends from both axes
-        lines_1, labels_1 = ax1.get_legend_handles_labels()
-        lines_2, labels_2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper center', bbox_to_anchor=(0.5, 1.15), ncol=3, fontsize=10)
-        
-        plt.title(f'Layer {layer_idx}: Comprehensive Output Error Diagnostic (Total = 100%)', pad=50, fontsize=15, fontweight='bold')
-        ax1.grid(axis='y', linestyle='--', alpha=0.7)
-        fig.tight_layout()
-        plt.savefig(f"macro_comprehensive_L{layer_idx}.png", dpi=200, bbox_inches='tight')
-        plt.close()
-        
-        # --- Chart 3: Scale Distribution ---
-        scales_orig = scales_norot.view(-1).cpu().numpy()
-        channel_max = X.abs().max(dim=0).values
-        clustered_perm = torch.argsort(channel_max, descending=True)
-        
-        X_clustered = X[:, clustered_perm].to(device)
-        scales_clustered, _ = quantizer_nv.get_quantization_params(X_clustered)
-        scales_clustered = scales_clustered.view(-1).cpu().numpy()
-        
-        plt.figure(figsize=(12, 5))
-        
-        plt.subplot(1, 2, 1)
-        plt.hist(scales_orig, bins=50, color='gray', alpha=0.7)
-        plt.title(f'Layer {layer_idx}: Original Scales\n(No Reordering)')
-        plt.xlabel('Group Scale')
-        plt.ylabel('Frequency (Log Scale)')
-        plt.yscale('log')
-        plt.grid(axis='y', linestyle='--', alpha=0.5)
-        
-        plt.subplot(1, 2, 2)
-        plt.hist(scales_clustered, bins=50, color='green', alpha=0.7)
-        plt.title(f'Layer {layer_idx}: Clustered Scales\n(Magnitude Clustering Reordering)')
-        plt.xlabel('Group Scale')
-        plt.yscale('log')
-        plt.grid(axis='y', linestyle='--', alpha=0.5)
-        
-        plt.suptitle(f"Layer {layer_idx}: Paradigm Shift - Rescuing the Scales", fontweight='bold')
-        plt.tight_layout()
-        plt.savefig(f"macro_scale_distribution_L{layer_idx}.png", dpi=150)
-        plt.close()
-        
-        del X_dev, X_q, X_clustered
-        torch.cuda.empty_cache()
-
 
 if __name__ == "__main__":
     main()
