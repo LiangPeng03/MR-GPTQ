@@ -1,158 +1,225 @@
-import os
-import sys
-import torch
-import numpy as np
-
-# 确保能引入项目内的模块
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
+import os, sys, torch, numpy as np
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.quantization.quantizer import Quantizer
 from src.transforms.transforms import build_transform
-
-def create_synthetic_tensors():
-    """
-    创建控制变量法所需的合成 16 维张量
-    """
-    base = 0.1
-    tensors = {}
-    
-    # 辅助函数：快速生成基础张量
-    def make_tensor(*peaks):
-        t = torch.full((16,), base)
-        for i, val in enumerate(peaks):
-            t[i] = val
-        return t
-
-    # 1. 单峰组 (Single Peak)
-    tensors["Single Peak (Positive)"] = make_tensor(100.0)
-    tensors["Single Peak (Negative)"] = make_tensor(-100.0)
-    
-    # 2. 等量双峰组 (Double Peak - Equal)
-    tensors["Double Peak (Same Sign)"] = make_tensor(100.0, 100.0)
-    tensors["Double Peak (Opposite Sign)"] = make_tensor(100.0, -100.0)
-    
-    # 3. 异量双峰组 (Double Peak - Unequal)
-    tensors["Double Peak (100, 50)"] = make_tensor(100.0, 50.0)
-    tensors["Double Peak (100, -50)"] = make_tensor(100.0, -50.0)
-    
-    # 4. 三峰组 (Triple Peak)
-    tensors["Triple Peak (Same Sign)"] = make_tensor(100.0, 100.0, 100.0)
-    tensors["Triple Peak (Mixed Sign)"] = make_tensor(100.0, 100.0, -100.0)
-    
-    # 5. 真实采样组 (Real Samples from Images)
-    tensors["Real Sample @!!(Same Sign)"] = torch.tensor([-0.4609,0.0552,-0.2139,0.063,0.0006,0.0032,1.5078,-0.0073,-0.2695,-25.75,0.0986,0.042,-0.016,-0.0486,-0.0055,0.017
-    ])
-    # 样本 1: 含有两个同号大值 (5.5938, 6.6562)
-    tensors["Real Sample (Same Sign)"] = torch.tensor([
-        -0.0635, 0.01, 5.5938, -0.2227, 6.6562, -0.0588, 0.0013, 0.0737, 
-        -0.0693, -0.0002, 0.0021, -0.0723, -0.0361, -0.015, -0.0266, -0.0049
-    ])
-    
-    # 样本 2: 含有异号大值 (1.5078, -25.75)
-    tensors["Real Sample (Opposite Sign)"] = torch.tensor([
-        -0.0635, 0.01, 5.5938, -0.2227, -6.6562, -0.0588, 0.0013, 0.0737, 
-        -0.0693, -0.0002, 0.0021, -0.0723, -0.0361, -0.015, -0.0266, -0.0049
-    ])
-    tensors["Real Sample 0 (Same Sign)"] = torch.tensor([
-        -0.0635, 0.01, 0.0738, -0.2227, 0.0562, -0.0588, 0.0013, 0.0737, 
-        -0.0693, -0.0002, 0.0021, -0.0723, -0.0361, -0.015, -0.0266, -0.0049
-    ])
-    
-    # 样本 2: 含有异号大值 (1.5078, -25.75)
-    tensors["Real Sample 0 (Opposite Sign)"] = torch.tensor([
-        -0.0635, 0.01, 0.0738, -0.2227, -0.0562, -0.0588, 0.0013, 0.0737, 
-        -0.0693, -0.0002, 0.0021, -0.0723, -0.0361, -0.015, -0.0266, -0.0049
-    ])
-    tensors["Real Sample 3 (same Sign)"] = torch.tensor([
-        -0.0635, 0.01, 5.5938, -0.2227, 6.6562, -0.0588, 5, 0.0737, 
-        -0.0693, -0.0002, 0.0021, -0.0723, -0.0361, -0.015, -0.0266, -0.0049
-    ])
-    tensors["Real Sample 3 (opposite Sign)"] = torch.tensor([
-        -0.0635, 0.01, 5.5938, -0.2227, -6.6562, -0.0588, -5, 0.0737, 
-        -0.0693, -0.0002, 0.0021, -0.0723, -0.0361, -0.015, -0.0266, -0.0049
-    ])
-    tensors["Real Sample 4 (same Sign)"] = torch.tensor([
-        -0.0635, 0.01, 5.5938, -0.2227, 6.6562, -0.0588, -5, 0.0737, 
-        -0.0693, -4.8, 0.0021, -0.0723, -0.0361, -0.015, -0.0266, -0.0049
-    ])
-    tensors["Real Sample 4 (opposite Sign)"] = torch.tensor([
-        -0.0635, 0.01, 5.5938, -0.2227, 6.6562, -0.0588, 5, 0.0737, 
-        -0.0693, 4.8, 0.0021, -0.0723, -0.0361, -0.015, -0.0266, -0.0049
-    ])
-    tensors["Real Sample 5 (same Sign)"] = torch.tensor([
-        -4.5, 0.01, 5.5938, -0.2227, 6.6562, -0.0588, -5, 0.0737, 
-        -0.0693, -4.8, 0.0021, -0.0723, -0.0361, -0.015, -0.0266, -0.0049
-    ])
-    tensors["Real Sample 5 (opposite Sign)"] = torch.tensor([
-        4.5, 0.01, 5.5938, -0.2227, 6.6562, -0.0588, 5, 0.0737, 
-        -0.0693, 4.8, 0.0021, -0.0723, -0.0361, -0.015, -0.0266, -0.0049
-    ])
-
-    # 6. 基准组 (Baseline)
-    torch.manual_seed(42)
-    tensors["Random Normal Noise"] = torch.randn(16) * 10
-    
-    return tensors
-
-def evaluate_tensor(name, t, quantizer, transform, device):
-    # 将输入转为 [1, 16] 的形式并移至 device
-    X = t.unsqueeze(0).to(device).bfloat16()
-    
-    # 1. 原始量化 MSE
-    scales, zeros = quantizer.get_quantization_params(X)
-    X_q_norot = quantizer(X, scales, zeros)
-    mse_norot = (X_q_norot - X).pow(2).mean().item()
-    
-    # 2. 旋转量化 MSE
-    X_rot = transform(X)
-    scales_rot, zeros_rot = quantizer.get_quantization_params(X_rot)
-    X_q_rot_inner = quantizer(X_rot, scales_rot, zeros_rot)
-    
-    # 为了对比，我们要看旋转后的“中间形态” X_rot 
-    # 以及反旋转回来后的量化结果 X_q_rot
-    X_q_rot = transform(X_q_rot_inner, inv_t=True)
-    mse_rot = (X_q_rot - X).pow(2).mean().item()
-    
-    delta_L = mse_rot - mse_norot
-    
-    return mse_norot, mse_rot, delta_L, X.squeeze(0).float().cpu().numpy(), X_rot.squeeze(0).detach().float().cpu().numpy()
+import matplotlib.pyplot as plt
 
 def main():
+    model_path = "meta-llama/Meta-Llama-3-8B"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cpu":
-        print("Warning: fast_hadamard_transform usually requires CUDA. This script might fail on CPU.")
+    layer_idx = 31
     
-    # 初始化量化器和变换 (NVFP4, E4M3, Group Size 16)
-    quantizer = Quantizer(
-        bits=4, 
-        symmetric=True, 
-        format="nvfp", 
-        granularity="group", 
-        group_size=16, 
-        scale_precision="e4m3"
-    )
+    print("Loading model and computing activations...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, low_cpu_mem_usage=True).to(device)
+    model.eval()
     
-    transform = build_transform("hadamard", group_size=16, device=device, dtype=torch.bfloat16)
+    text = "Detailed shape analysis of LLM activations. " * 300
+    calib_data = tokenizer(text, return_tensors="pt").to(device)
     
-    tensors = create_synthetic_tensors()
+    layer = model.model.layers[layer_idx].mlp.down_proj
+    cache = []
+    def hook(m, i, o): cache.append(i[0].detach())
+    handle = layer.register_forward_hook(hook)
+    with torch.no_grad():
+        model(**calib_data)
+    handle.remove()
     
-    print("=" * 100)
-    print("Synthetic Ablation Test: Impact of Activation Shape on Hadamard Rotation")
-    print("=" * 100)
+    X = cache[0].view(-1, cache[0].shape[-1]).float() # (300, 14336) on CUDA
+    dim = X.shape[-1]
     
-    for name, t in tensors.items():
-        orig_mse, rot_mse, delta, v_orig, v_rot = evaluate_tensor(name, t, quantizer, transform, device)
+    # ---------------- MXFP4 (Had128) Global Scan ----------------
+    print("\nScanning for MXFP4 (Had128) worst INCREASE block...")
+    mx_q = Quantizer(bits=4, format="mxfp", granularity="group", group_size=32, symmetric=True, scale_precision="e8m0")
+    t_128 = build_transform("hadamard", size=128, group_size=128).to(device)
+    
+    X_128 = X.view(-1, 128)
+    sc_nr_mx, z_nr_mx = mx_q.get_quantization_params(X_128)
+    q_nr_mx = mx_q(X_128, sc_nr_mx, z_nr_mx)
+    mse_nr_mx = ((q_nr_mx - X_128)**2).mean(dim=1)
+    
+    X_128_rot = t_128(X_128)
+    sc_r_mx, z_r_mx = mx_q.get_quantization_params(X_128_rot)
+    q_r_mx = mx_q(X_128_rot, sc_r_mx, z_r_mx)
+    mse_r_mx = ((q_r_mx - X_128_rot)**2).mean(dim=1)
+    
+    delta_mx = mse_r_mx - mse_nr_mx
+    worst_idx_mx = delta_mx.argmax().item()
+    
+    mx_token = worst_idx_mx // (dim // 128)
+    mx_block = worst_idx_mx % (dim // 128)
+    
+    print("\n" + "="*60)
+    print(f"MXFP4 WORST BLOCK FOUND: Token {mx_token}, Block 128-ch {mx_block}")
+    
+    block_128_orig = X_128[worst_idx_mx]
+    block_128_q_nr = q_nr_mx[worst_idx_mx]
+    block_128_rot = X_128_rot[worst_idx_mx]
+    block_128_q_r = q_r_mx[worst_idx_mx]
+    
+    mx_sub_deltas = []
+    print("\nSub-group (32-ch) Breakdown for this MXFP4 Block:")
+    for g in range(4):
+        sub_orig = block_128_orig[g*32:(g+1)*32]
+        sub_rot = block_128_rot[g*32:(g+1)*32]
+        mse_n = ((block_128_q_nr[g*32:(g+1)*32] - sub_orig)**2).mean().item()
+        mse_r = ((block_128_q_r[g*32:(g+1)*32] - sub_rot)**2).mean().item()
+        d = mse_r - mse_n
+        mx_sub_deltas.append(d)
+        print(f"  Group {g}: NoRot={mse_n:.6f}, Rot={mse_r:.6f}, Delta={d:>9.6f}")
         
-        # 标记变好还是变坏
-        status = "❌ 恶化" if delta > 0 else "✅ 改善"
-        if abs(delta) < 1e-5:
-            status = "➖ 极小"
+    worst_sub_idx = np.argmax(mx_sub_deltas)
+    block_delta_sum = sum(mx_sub_deltas)
+    contribution = (mx_sub_deltas[worst_sub_idx] / block_delta_sum) * 100 if block_delta_sum > 0 else 0
+    print("-" * 40)
+    print(f"Is it single-group driven? Max Sub-group is {worst_sub_idx}, contributing {contribution:.1f}% to the total block increase.")
+
+    # ---------------- NVFP4 (Had16) Global Scan ----------------
+    print("\nScanning for NVFP4 (Had16) best DECREASE block...")
+    nv_q = Quantizer(bits=4, format="nvfp", granularity="group", group_size=16, symmetric=True, scale_precision="e4m3")
+    nv_q._track_global_scale = False
+    from src.quantization.quant_ops import FP8_E4M3_MAX, FP4_E2M1_MAX
+    from src.quantization.quantizer import get_reciprocal
+    act_max_val = X.abs().max().to(torch.float32).view(1)
+    nv_q.global_scale = (FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(act_max_val)).to(device)
+
+    t_16 = build_transform("hadamard", size=16, group_size=16).to(device)
+    X_16 = X.view(-1, 16)
+    
+    sc_nr_nv, z_nr_nv = nv_q.get_quantization_params(X_16)
+    q_nr_nv = nv_q(X_16, sc_nr_nv, z_nr_nv)
+    mse_nr_nv = ((q_nr_nv - X_16)**2).mean(dim=1)
+    
+    X_16_rot = t_16(X_16)
+    sc_r_nv, z_r_nv = nv_q.get_quantization_params(X_16_rot)
+    q_r_nv = nv_q(X_16_rot, sc_r_nv, z_r_nv)
+    mse_r_nv = ((q_r_nv - X_16_rot)**2).mean(dim=1)
+    
+    delta_nv = mse_r_nv - mse_nr_nv
+    best_idx_nv = delta_nv.argmin().item()
+    
+    nv_token = best_idx_nv // (dim // 16)
+    nv_block = best_idx_nv % (dim // 16)
+    
+    print("\n" + "="*60)
+    print(f"NVFP4 BEST BLOCK FOUND: Token {nv_token}, Block 16-ch {nv_block}")
+    
+    block_16_orig = X_16[best_idx_nv]
+    block_16_q_nr = q_nr_nv[best_idx_nv]
+    block_16_rot = X_16_rot[best_idx_nv]
+    block_16_q_r = q_r_nv[best_idx_nv]
+    
+    def print_top3(orig, q, title):
+        print(f"\n{title}:")
+        orig_np = orig if isinstance(orig, np.ndarray) else orig.cpu().numpy()
+        q_np = q if isinstance(q, np.ndarray) else q.cpu().numpy()
+        sorted_idx = np.argsort(np.abs(orig_np))[::-1]
+        for i in range(3):
+            idx = sorted_idx[i]
+            print(f"  Index {idx:>3}: Orig = {orig_np[idx]:>9.4f} | Quant = {q_np[idx]:>9.4f} | AbsErr = {abs(orig_np[idx]-q_np[idx]):>9.4f}")
             
-        print(f"Profile: {name}")
-        print(f"  MSE: {orig_mse:.4f} (Orig) -> {rot_mse:.4f} (Rot) | Delta L: {delta:.4f} {status}")
-        print(f"  Orig Values: {[float(f'{x:.2f}') for x in v_orig]}")
-        print(f"  Rot  Values: {[float(f'{x:.2f}') for x in v_rot]}")
-        print("-" * 100)
+    print_top3(block_128_orig, block_128_q_nr, "Top 3 Absolute Values - MXFP4 NoRot (128-ch)")
+    print_top3(block_128_rot, block_128_q_r, "Top 3 Absolute Values - MXFP4 Rot (128-ch)")
+    print("-" * 40)
+    print_top3(block_16_orig, block_16_q_nr, "Top 3 Absolute Values - NVFP4 NoRot (16-ch)")
+    print_top3(block_16_rot, block_16_q_r, "Top 3 Absolute Values - NVFP4 Rot (16-ch)")
+
+    # ---------------- Token-wise Channel Stats ----------------
+    print("\n" + "="*60)
+    print("Channel-wise Statistics over 300 Tokens for the selected blocks:")
+    
+    # MXFP4 Stats
+    X_mx_block = X[:, mx_block*128 : (mx_block+1)*128]
+    mx_mean_abs = X_mx_block.abs().mean(dim=0)
+    mx_max = X_mx_block.max(dim=0).values
+    mx_min = X_mx_block.min(dim=0).values
+    
+    print(f"\n[MXFP4 128-ch Block {mx_block}] Top 3 Channels by Mean Absolute Value:")
+    sorted_mean_mx = torch.argsort(mx_mean_abs, descending=True)
+    for i in range(3):
+        idx = sorted_mean_mx[i].item()
+        print(f"  Channel {idx:>3}: MeanAbs = {mx_mean_abs[idx]:>8.4f}")
+        
+    print(f"\n[MXFP4 128-ch Block {mx_block}] Top 3 Channels by True Maximum Value:")
+    sorted_max_mx = torch.argsort(mx_max, descending=True)
+    for i in range(3):
+        idx = sorted_max_mx[i].item()
+        print(f"  Channel {idx:>3}: Max = {mx_max[idx]:>9.4f}, Min = {mx_min[idx]:>9.4f}")
+
+    print(f"\n[MXFP4 128-ch Block {mx_block}] Top 3 Channels by True Minimum Value (Most Negative):")
+    sorted_min_mx = torch.argsort(mx_min, descending=False)
+    for i in range(3):
+        idx = sorted_min_mx[i].item()
+        print(f"  Channel {idx:>3}: Min = {mx_min[idx]:>9.4f}, Max = {mx_max[idx]:>9.4f}")
+
+    # NVFP4 Stats
+    X_nv_block = X[:, nv_block*16 : (nv_block+1)*16]
+    nv_mean_abs = X_nv_block.abs().mean(dim=0)
+    nv_max = X_nv_block.max(dim=0).values
+    nv_min = X_nv_block.min(dim=0).values
+    
+    print(f"\n[NVFP4 16-ch Block {nv_block}] Top 3 Channels by Mean Absolute Value:")
+    sorted_mean_nv = torch.argsort(nv_mean_abs, descending=True)
+    for i in range(3):
+        idx = sorted_mean_nv[i].item()
+        print(f"  Channel {idx:>3}: MeanAbs = {nv_mean_abs[idx]:>8.4f}")
+        
+    print(f"\n[NVFP4 16-ch Block {nv_block}] Top 3 Channels by True Maximum Value:")
+    sorted_max_nv = torch.argsort(nv_max, descending=True)
+    for i in range(3):
+        idx = sorted_max_nv[i].item()
+        print(f"  Channel {idx:>3}: Max = {nv_max[idx]:>9.4f}, Min = {nv_min[idx]:>9.4f}")
+
+    print(f"\n[NVFP4 16-ch Block {nv_block}] Top 3 Channels by True Minimum Value (Most Negative):")
+    sorted_min_nv = torch.argsort(nv_min, descending=False)
+    for i in range(3):
+        idx = sorted_min_nv[i].item()
+        print(f"  Channel {idx:>3}: Min = {nv_min[idx]:>9.4f}, Max = {nv_max[idx]:>9.4f}")
+    print("="*60 + "\n")
+    
+    print("\nGenerating combined 2x2 plot: combined_extreme_cases.png")
+    fig, axes = plt.subplots(2, 2, figsize=(20, 10))
+    
+    # 1. MXFP4 NoRot
+    ax = axes[0, 0]
+    x_128 = np.arange(128)
+    ax.bar(x_128, block_128_orig.cpu().numpy(), alpha=0.5, color='skyblue', label='Original')
+    ax.scatter(x_128, block_128_q_nr.cpu().numpy(), color='blue', s=15, zorder=5, label='Quantized')
+    for g in range(1, 4):
+        ax.axvline(g*32 - 0.5, color='gray', linestyle='--', alpha=0.5)
+    ax.set_title(f"MXFP4 NoRot (128-ch) - MSE: {mse_nr_mx[worst_idx_mx]:.6f}")
+    ax.legend()
+
+    # 2. MXFP4 Rot
+    ax = axes[0, 1]
+    ax.bar(x_128, block_128_rot.cpu().numpy(), alpha=0.5, color='salmon', label='Rotated')
+    ax.scatter(x_128, block_128_q_r.cpu().numpy(), color='red', s=15, zorder=5, label='Quantized')
+    for g in range(1, 4):
+        ax.axvline(g*32 - 0.5, color='gray', linestyle='--', alpha=0.5)
+    ax.set_title(f"MXFP4 Rot (128-ch) - MSE: {mse_r_mx[worst_idx_mx]:.6f}")
+    ax.legend()
+    
+    # 3. NVFP4 NoRot
+    ax = axes[1, 0]
+    x_16 = np.arange(16)
+    ax.bar(x_16, block_16_orig.cpu().numpy(), alpha=0.5, color='lightgreen', label='Original')
+    ax.scatter(x_16, block_16_q_nr.cpu().numpy(), color='darkgreen', s=30, zorder=5, label='Quantized')
+    ax.set_title(f"NVFP4 NoRot (16-ch) - MSE: {mse_nr_nv[best_idx_nv]:.6f}")
+    ax.set_xticks(np.arange(0, 16, 2))
+    ax.legend()
+    
+    # 4. NVFP4 Rot
+    ax = axes[1, 1]
+    ax.bar(x_16, block_16_rot.cpu().numpy(), alpha=0.5, color='orange', label='Rotated')
+    ax.scatter(x_16, block_16_q_r.cpu().numpy(), color='darkorange', s=30, zorder=5, label='Quantized')
+    ax.set_title(f"NVFP4 Rot (16-ch) - MSE: {mse_r_nv[best_idx_nv]:.6f}")
+    ax.set_xticks(np.arange(0, 16, 2))
+    ax.legend()
+    
+    plt.suptitle("Micro Analysis of Extreme Quantization Effects\nTop: MXFP4 Worst Increase | Bottom: NVFP4 Best Decrease", fontweight='bold', fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig("combined_extreme_cases.png", dpi=150)
+    plt.close()
 
 if __name__ == "__main__":
     main()
