@@ -355,10 +355,43 @@ def gptq_quantization(
                 for h in lock_hooks: h.remove()
             
         if do_channel_resort:
+            def get_combined_weight(block, name):
+                if name == "qkv":
+                    w = torch.cat([block.self_attn.q_proj.weight, block.self_attn.k_proj.weight, block.self_attn.v_proj.weight], dim=0)
+                elif name == "o":
+                    w = block.self_attn.o_proj.weight
+                elif name == "gate_up":
+                    w = torch.cat([block.mlp.gate_proj.weight, block.mlp.up_proj.weight], dim=0)
+                elif name == "down":
+                    w = block.mlp.down_proj.weight
+                else:
+                    return None
+                return w.float()
+
             act_means = {}
             for name, caches in list(act_caches.items()):
                 X = torch.cat(caches, dim=0) # (N_tokens, Dim)
-                if args.channel_resort in ["P95", "minmax"]:
+                if args.channel_resort == "stagger":
+                    import math
+                    threshold_A = torch.quantile(X.abs().float(), 0.9375, dim=1, keepdim=True)
+                    is_outlier_A = (X.abs() > threshold_A).float().to(device)
+                    
+                    W = get_combined_weight(block, name).to(device)
+                    threshold_W = torch.quantile(W.abs(), 0.9375, dim=1, keepdim=True)
+                    is_outlier_W = (W.abs() > threshold_W).float()
+                    
+                    N_tokens = X.shape[0]
+                    M_out = W.shape[0]
+                    if getattr(args, "stagger_lambda", "auto") == "auto":
+                        lambda_W = math.sqrt(N_tokens / M_out) if M_out > 0 else 1.0
+                    else:
+                        lambda_W = float(args.stagger_lambda)
+                        
+                    joint_profile = torch.cat([is_outlier_A, is_outlier_W * lambda_W], dim=0)
+                    ch_freq = joint_profile.mean(dim=0)
+                    
+                    act_means[name] = {"mask": joint_profile, "freq": ch_freq}
+                elif args.channel_resort in ["P95", "minmax"]:
                     act_means[name] = torch.quantile(X.float(), 0.95, dim=0).to(device)
                 else: # "mean" or "R_val"
                     act_means[name] = X.float().mean(dim=0).to(device)
@@ -540,12 +573,44 @@ def gptq_quantization(
                     perm.extend(b)
                 return torch.tensor(perm, device=act_stat.device, dtype=torch.long)
 
+            def compute_co_occurrence_staggered_perm(is_outlier_mask, ch_freq, group_size=16):
+                sorted_channels_list = torch.argsort(ch_freq, descending=True).tolist()
+                n_tokens, dim = is_outlier_mask.shape
+                n_groups = max(1, dim // group_size)
+                
+                opt_groups = [[] for _ in range(n_groups)]
+                group_profiles = torch.zeros((n_groups, n_tokens), device=is_outlier_mask.device, dtype=torch.float32)
+                group_sizes = torch.zeros(n_groups, device=is_outlier_mask.device, dtype=torch.long)
+                
+                for ch in sorted_channels_list:
+                    c_profile = is_outlier_mask[:, ch].float()
+                    penalties = torch.mv(group_profiles, c_profile)
+                    penalties[group_sizes >= group_size] = float('inf')
+                    
+                    best_group = penalties.argmin().item()
+                    opt_groups[best_group].append(ch)
+                    group_profiles[best_group] += c_profile
+                    group_sizes[best_group] += 1
+                    
+                perm = []
+                for g in opt_groups: perm.extend(g)
+                return torch.tensor(perm, device=is_outlier_mask.device, dtype=torch.long)
+
             for name, mean_val in act_means.items():
-                abs_vals = mean_val.abs()
                 w_norm = get_combined_weight_norm(block, name)
-                if w_norm is None:
-                    w_norm = torch.ones_like(abs_vals)
-                N = abs_vals.shape[0]
+                
+                if args.channel_resort == "stagger":
+                    mask = mean_val["mask"]
+                    freq = mean_val["freq"]
+                    N = freq.shape[0]
+                    if w_norm is None:
+                        w_norm = torch.ones(N, device=freq.device)
+                else:
+                    abs_vals = mean_val.abs()
+                    N = abs_vals.shape[0]
+                    if w_norm is None:
+                        w_norm = torch.ones_like(abs_vals)
+                
                 quant_group_size = args.a_group_size if args.a_group_size else 16
                 
                 if args.channel_resort in ["mean", "P95"]:
@@ -608,6 +673,25 @@ def gptq_quantization(
                                 p[i : i + h_group_size] = block_perm + i
                         print(f"    [{name:8}] Scale-First Greedy Fill (gs={gs}) completed.")
                     resort_perms[name] = p
+                elif args.channel_resort == "stagger":
+                    if "o" in name:
+                        head_dim = model.config.hidden_size // model.config.num_attention_heads
+                        h_group_size = head_dim
+                    else:
+                        h_group_size = -1
+                        
+                    if h_group_size <= 0:
+                        p = compute_co_occurrence_staggered_perm(mask, freq, group_size=quant_group_size)
+                    else:
+                        p = torch.zeros(N, device=freq.device, dtype=torch.long)
+                        for i in range(0, N, h_group_size):
+                            block_mask = mask[:, i : i + h_group_size]
+                            block_freq = freq[i : i + h_group_size]
+                            block_gs = min(quant_group_size, h_group_size)
+                            block_perm = compute_co_occurrence_staggered_perm(block_mask, block_freq, group_size=block_gs)
+                            p[i : i + h_group_size] = block_perm + i
+                    resort_perms[name] = p
+                    print(f"    [{name:8}] Staggered Reordering (P93.75) completed.")
                 else:
                     # Old Resonance R_val Strategy
                     h_group_size = args.hadamard_group_size

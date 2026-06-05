@@ -40,10 +40,10 @@ for MODEL in "${MODELS[@]}"; do
         --model_name_or_path=$MODEL \
         --format=nvfp \
         --w_bits=4 \
-        --a_bits=16 \
+        --a_bits=4 \
         --w_group_size=16 \
         --a_group_size=16 \
-        --transform_class=hadamard \
+        --transform_class=identity \
         --w_observer=mse \
         --quantization_order=activation \
         --hadamard_group_size=16 \
@@ -52,9 +52,10 @@ for MODEL in "${MODELS[@]}"; do
         --rel_damp=0.01 \
         --sequence_length=2048 \
         --dtype=bfloat16 \
-        --gptq \
+        --channel_resort stagger \
+        --show_act_mse \
         --fuse_global_scale \
-        --lock_global_scale \
+        --gptq \
         --eval_perplexity \
         --eval_openllm \
         --lm_eval_tasks piqa winogrande"

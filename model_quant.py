@@ -269,8 +269,14 @@ def parse_args():
         "--channel_resort",
         type=str,
         default="none",
-        choices=["none", "mean", "P95", "minmax"],
-        help="Apply grid-aware channel reordering (GridSort) based on channel 'mean' or 'P95', 'minmax', or use 'none' to skip.",
+        choices=["none", "mean", "P95", "minmax", "stagger"],
+        help="Apply grid-aware channel reordering based on channel 'mean' or 'P95', 'minmax', 'stagger' (Co-occurrence-aware), or use 'none' to skip.",
+    )
+    parser.add_argument(
+        "--stagger_lambda",
+        type=str,
+        default="auto",
+        help="Balance coefficient for Joint W/A Staggering. Can be 'auto' (sqrt(N/M)) or a float value (e.g. '0.5', '1.0').",
     )
     parser.add_argument(
         "--outlier_ratio",
@@ -390,9 +396,9 @@ def parse_args():
         assert args.w_bits == 4, "`export_quantization` is only supported for 4 bit weights."
         assert args.a_bits == 4, "`export_quantization` is only supported for 4 bit activations."
         
-    if args.format == "nvfp" and args.channel_resort == "minmax":
+    if args.format == "nvfp" and args.channel_resort in ["minmax", "stagger"]:
         if args.transform_class != "identity":
-            print("Forcing transform_class to 'identity' since format is nvfp and channel_resort is 'minmax'.")
+            print(f"Forcing transform_class to 'identity' since format is nvfp and channel_resort is '{args.channel_resort}'.")
             args.transform_class = "identity"
             
     return args
