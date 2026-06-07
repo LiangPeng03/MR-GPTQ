@@ -88,13 +88,11 @@ def main():
     # We will test these strategies
     strategies = [
         {"name": "Baseline", "args": {"channel_resort": "none", "transform_class": "identity", "stagger_lambda": "auto"}},
-        {"name": "Stagger_A", "args": {"channel_resort": "stagger", "transform_class": "identity", "stagger_lambda": "0.0"}},
-        {"name": "Stagger_W", "args": {"channel_resort": "stagger", "transform_class": "identity", "stagger_lambda": "W_only"}},
-        # {"name": "Stagger_W_A_Auto", "args": {"channel_resort": "stagger", "transform_class": "identity", "stagger_lambda": "auto"}},
-        # {"name": "Stagger_W_A_0.5", "args": {"channel_resort": "stagger", "transform_class": "identity", "stagger_lambda": "0.5"}},
-        # {"name": "Stagger_W_A_1.0", "args": {"channel_resort": "stagger", "transform_class": "identity", "stagger_lambda": "1.0"}},
-        {"name": "Stagger_W_A_2.0", "args": {"channel_resort": "stagger", "transform_class": "identity", "stagger_lambda": "2.0"}},
-        {"name": "Stagger_A_Swap", "args": {"channel_resort": "stagger_swap", "transform_class": "identity", "stagger_lambda": "2.0"}},
+        # {"name": "Stagger_A", "args": {"channel_resort": "stagger", "transform_class": "identity", "stagger_lambda": "0.0"}},
+        # {"name": "Stagger_W", "args": {"channel_resort": "stagger", "transform_class": "identity", "stagger_lambda": "W_only"}},
+        # {"name": "Stagger_W_A_2.0", "args": {"channel_resort": "stagger", "transform_class": "identity", "stagger_lambda": "2.0"}},
+        {"name": "KMeans_FP4", "args": {"channel_resort": "kmeans_fp4", "transform_class": "identity", "stagger_lambda": "0.0"}},
+        {"name": "KMeans_FP4_W", "args": {"channel_resort": "kmeans_fp4_w", "transform_class": "identity", "stagger_lambda": "0.0"}},
     ]
     
     stats = {} # layer -> name -> strat -> metrics
@@ -300,6 +298,108 @@ def main():
                         
                     perm = []
                     for g in opt_groups: perm.extend(g)
+                elif strat_args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w"]:
+                    # ============================================================
+                    # NVFP4-Aware K-Means++ Channel Grouping
+                    # ============================================================
+                    if strat_args.channel_resort == "kmeans_fp4":
+                        target_mat = X
+                    else:
+                        target_mat = W
+                    
+                    # Subsample tokens/rows to drastically speed up the distance calculations
+                    # 4096 samples are statistically more than enough to capture the magnitude patterns
+                    max_samples = 4096
+                    if target_mat.shape[0] > max_samples:
+                        # Use a deterministic subset for reproducibility
+                        subset_idx = torch.linspace(0, target_mat.shape[0] - 1, max_samples, dtype=torch.long, device=device)
+                        X_abs_T = target_mat[subset_idx].abs().T.float()  # (dim, max_samples)
+                    else:
+                        X_abs_T = target_mat.abs().T.float()  # (dim, N_items)
+                    
+                    # NVFP4 E2M1 grid multipliers
+                    grid_mults = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device, dtype=torch.float32)
+                    
+                    def compute_loss_distances(all_ch_abs, ref_ch_abs, chunk_size=256):
+                        """Batch compute loss distance of all channels to one reference channel with chunking."""
+                        ref = ref_ch_abs.unsqueeze(0)  # (1, N_tokens)
+                        n_ch = all_ch_abs.shape[0]
+                        losses = torch.zeros(n_ch, device=device, dtype=torch.float32)
+                        
+                        for i in range(0, n_ch, chunk_size):
+                            chunk = all_ch_abs[i:i+chunk_size]
+                            p_max = torch.maximum(chunk, ref)  # (chunk_size, N_tokens)
+                            p_min = torch.minimum(chunk, ref)  # (chunk_size, N_tokens)
+                            scale = (p_max / 6.0).clamp(min=1e-10)  # (chunk_size, N_tokens)
+                            grid = scale.unsqueeze(-1) * grid_mults  # (chunk_size, N_tokens, 8)
+                            diff = (p_min.unsqueeze(-1) - grid).abs()  # (chunk_size, N_tokens, 8)
+                            min_q = grid.gather(-1, diff.argmin(-1, keepdim=True)).squeeze(-1)
+                            losses[i:i+chunk_size] = ((p_min - min_q) ** 2).sum(dim=1)
+                            
+                        return losses
+                    
+                    # --- Phase 1: K-Means++ Seed Selection ---
+                    ch_sums = X_abs_T.sum(dim=1)  # (dim,)
+                    accumulated_dist = torch.zeros(dim, device=device, dtype=torch.float32)
+                    seed_order = []
+                    
+                    # First seed: channel with largest absolute sum
+                    first_seed = ch_sums.argmax().item()
+                    seed_order.append(first_seed)
+                    accumulated_dist[first_seed] = -float('inf')
+                    
+                    # Compute distances to first seed
+                    dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed])
+                    accumulated_dist += dists
+                    accumulated_dist[first_seed] = -float('inf')  # re-set after addition
+                    
+                    for k in range(1, n_groups):
+                        new_seed = accumulated_dist.argmax().item()
+                        seed_order.append(new_seed)
+                        accumulated_dist[new_seed] = -float('inf')
+                        # Update accumulated distances
+                        dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed])
+                        accumulated_dist += dists
+                        # Already-selected seeds stay at -inf
+                    
+                    # --- Phase 2: Greedy Filling ---
+                    opt_groups = [[s] for s in seed_order]
+                    group_maxes = X_abs_T[seed_order].clone()  # (n_groups, N_tokens)
+                    group_sizes = torch.ones(n_groups, device=device, dtype=torch.long)
+                    
+                    # Remaining channels sorted by absolute sum (descending)
+                    seed_set = set(seed_order)
+                    remaining = [c for c in range(dim) if c not in seed_set]
+                    remaining_sums = ch_sums[remaining]
+                    sorted_order = torch.argsort(remaining_sums, descending=True)
+                    remaining_sorted = [remaining[i] for i in sorted_order.tolist()]
+                    
+                    for c in remaining_sorted:
+                        c_abs = X_abs_T[c]  # (N_tokens,)
+                        losses = torch.zeros(n_groups, device=device, dtype=torch.float32)
+                        ref = c_abs.unsqueeze(0)  # (1, N_tokens)
+                        
+                        # Chunking over groups to avoid OOM
+                        for i in range(0, n_groups, 256):
+                            g_chunk = group_maxes[i:i+256]
+                            p_max = torch.maximum(ref, g_chunk)
+                            p_min = torch.minimum(ref, g_chunk)
+                            scale = (p_max / 6.0).clamp(min=1e-10)
+                            grid = scale.unsqueeze(-1) * grid_mults
+                            diff = (p_min.unsqueeze(-1) - grid).abs()
+                            min_q = grid.gather(-1, diff.argmin(-1, keepdim=True)).squeeze(-1)
+                            losses[i:i+256] = ((p_min - min_q) ** 2).sum(dim=1)
+                        
+                        # Exclude full groups
+                        losses[group_sizes >= 16] = float('inf')
+                        best_g = losses.argmin().item()
+                        
+                        opt_groups[best_g].append(c)
+                        group_maxes[best_g] = torch.maximum(group_maxes[best_g], c_abs)
+                        group_sizes[best_g] += 1
+                    
+                    perm = []
+                    for g in opt_groups: perm.extend(g)
                 else:
                     # Baseline: no permutation
                     perm = list(range(dim))
@@ -356,6 +456,8 @@ def main():
                 del X_perm, W_perm, X_q, W_q, Y_fp16, Y_q, Y_q_W, Y_q_A
                 if strat_args.channel_resort in ["stagger", "stagger_swap"]:
                     del joint_profile, group_profiles, group_sizes
+                if strat_args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w"]:
+                    del X_abs_T, group_maxes, group_sizes
                 torch.cuda.empty_cache()
             
             del block_copy

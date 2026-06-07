@@ -393,6 +393,14 @@ def gptq_quantization(
                     act_means[name] = {"mask": joint_profile, "freq": ch_freq}
                 elif args.channel_resort in ["P95", "minmax"]:
                     act_means[name] = torch.quantile(X.float(), 0.95, dim=0).to(device)
+                elif args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w"]:
+                    max_samples = 4096
+                    if X.shape[0] > max_samples:
+                        subset_idx = torch.linspace(0, X.shape[0] - 1, max_samples, dtype=torch.long, device=X.device)
+                        X_sub = X[subset_idx].float().to(device)
+                    else:
+                        X_sub = X.float().to(device)
+                    act_means[name] = X_sub
                 else: # "mean" or "R_val"
                     act_means[name] = X.float().mean(dim=0).to(device)
                 del X
@@ -596,6 +604,76 @@ def gptq_quantization(
                 for g in opt_groups: perm.extend(g)
                 return torch.tensor(perm, device=is_outlier_mask.device, dtype=torch.long)
 
+            def compute_kmeans_fp4_perm(X_abs_T, group_size=16):
+                dim = X_abs_T.shape[0]
+                n_groups = dim // group_size
+                device = X_abs_T.device
+                grid_mults = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device, dtype=torch.float32)
+                
+                def compute_loss_distances(all_ch_abs, ref_ch_abs, chunk_size=256):
+                    ref = ref_ch_abs.unsqueeze(0)
+                    n_ch = all_ch_abs.shape[0]
+                    losses = torch.zeros(n_ch, device=device, dtype=torch.float32)
+                    for i in range(0, n_ch, chunk_size):
+                        chunk = all_ch_abs[i:i+chunk_size]
+                        p_max = torch.maximum(chunk, ref)
+                        p_min = torch.minimum(chunk, ref)
+                        scale = (p_max / 6.0).clamp(min=1e-10)
+                        grid = scale.unsqueeze(-1) * grid_mults
+                        diff = (p_min.unsqueeze(-1) - grid).abs()
+                        min_q = grid.gather(-1, diff.argmin(-1, keepdim=True)).squeeze(-1)
+                        losses[i:i+chunk_size] = ((p_min - min_q) ** 2).sum(dim=1)
+                    return losses
+
+                ch_sums = X_abs_T.sum(dim=1)
+                accumulated_dist = torch.zeros(dim, device=device, dtype=torch.float32)
+                seed_order = []
+                first_seed = ch_sums.argmax().item()
+                seed_order.append(first_seed)
+                accumulated_dist[first_seed] = -float('inf')
+                dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed])
+                accumulated_dist += dists
+                accumulated_dist[first_seed] = -float('inf')
+                
+                for k in range(1, n_groups):
+                    new_seed = accumulated_dist.argmax().item()
+                    seed_order.append(new_seed)
+                    accumulated_dist[new_seed] = -float('inf')
+                    dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed])
+                    accumulated_dist += dists
+
+                opt_groups = [[s] for s in seed_order]
+                group_maxes = X_abs_T[seed_order].clone()
+                group_sizes = torch.ones(n_groups, device=device, dtype=torch.long)
+                seed_set = set(seed_order)
+                remaining = [c for c in range(dim) if c not in seed_set]
+                remaining_sums = ch_sums[remaining]
+                sorted_order = torch.argsort(remaining_sums, descending=True)
+                remaining_sorted = [remaining[i] for i in sorted_order.tolist()]
+
+                for c in remaining_sorted:
+                    c_abs = X_abs_T[c]
+                    losses = torch.zeros(n_groups, device=device, dtype=torch.float32)
+                    ref = c_abs.unsqueeze(0)
+                    for i in range(0, n_groups, 256):
+                        g_chunk = group_maxes[i:i+256]
+                        p_max = torch.maximum(ref, g_chunk)
+                        p_min = torch.minimum(ref, g_chunk)
+                        scale = (p_max / 6.0).clamp(min=1e-10)
+                        grid = scale.unsqueeze(-1) * grid_mults
+                        diff = (p_min.unsqueeze(-1) - grid).abs()
+                        min_q = grid.gather(-1, diff.argmin(-1, keepdim=True)).squeeze(-1)
+                        losses[i:i+256] = ((p_min - min_q) ** 2).sum(dim=1)
+                    losses[group_sizes >= group_size] = float('inf')
+                    best_g = losses.argmin().item()
+                    opt_groups[best_g].append(c)
+                    group_maxes[best_g] = torch.maximum(group_maxes[best_g], c_abs)
+                    group_sizes[best_g] += 1
+                
+                perm = []
+                for g in opt_groups: perm.extend(g)
+                return torch.tensor(perm, device=device, dtype=torch.long)
+
             for name, mean_val in act_means.items():
                 w_norm = get_combined_weight_norm(block, name)
                 
@@ -605,6 +683,10 @@ def gptq_quantization(
                     N = freq.shape[0]
                     if w_norm is None:
                         w_norm = torch.ones(N, device=freq.device)
+                elif args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w"]:
+                    N = mean_val.shape[1]
+                    if w_norm is None:
+                        w_norm = torch.ones(N, device=mean_val.device)
                 else:
                     abs_vals = mean_val.abs()
                     N = abs_vals.shape[0]
@@ -692,6 +774,37 @@ def gptq_quantization(
                             p[i : i + h_group_size] = block_perm + i
                     resort_perms[name] = p
                     print(f"    [{name:8}] Staggered Reordering (P93.75) completed.")
+                elif args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w"]:
+                    W = get_combined_weight(block, name).to(device)
+                    if args.channel_resort == "kmeans_fp4":
+                        target_mat = mean_val # X_sub
+                    else:
+                        target_mat = W
+                        # Subsample target_mat (W) if using kmeans_fp4_w
+                        max_samples = 4096
+                        if target_mat.shape[0] > max_samples:
+                            subset_idx = torch.linspace(0, target_mat.shape[0] - 1, max_samples, dtype=torch.long, device=target_mat.device)
+                            target_mat = target_mat[subset_idx]
+                            
+                    X_abs_T = target_mat.abs().T.float()
+                    
+                    if "o" in name:
+                        head_dim = model.config.hidden_size // model.config.num_attention_heads
+                        h_group_size = head_dim
+                    else:
+                        h_group_size = -1
+                        
+                    if h_group_size <= 0:
+                        p = compute_kmeans_fp4_perm(X_abs_T, group_size=quant_group_size)
+                    else:
+                        p = torch.zeros(N, device=X_abs_T.device, dtype=torch.long)
+                        for i in range(0, N, h_group_size):
+                            block_X_abs_T = X_abs_T[i : i + h_group_size]
+                            block_gs = min(quant_group_size, h_group_size)
+                            block_perm = compute_kmeans_fp4_perm(block_X_abs_T, group_size=block_gs)
+                            p[i : i + h_group_size] = block_perm + i
+                    print(f"    [{name:8}] KMeans FP4 grouping (target={args.channel_resort}, gs={quant_group_size}) completed.")
+                    resort_perms[name] = p
                 else:
                     # Old Resonance R_val Strategy
                     h_group_size = args.hadamard_group_size

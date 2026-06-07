@@ -269,8 +269,8 @@ def parse_args():
         "--channel_resort",
         type=str,
         default="none",
-        choices=["none", "mean", "P95", "minmax", "stagger"],
-        help="Apply grid-aware channel reordering based on channel 'mean' or 'P95', 'minmax', 'stagger' (Co-occurrence-aware), or use 'none' to skip.",
+        choices=["none", "mean", "P95", "minmax", "stagger", "kmeans_fp4", "kmeans_fp4_w"],
+        help="Apply grid-aware channel reordering based on channel 'mean' or 'P95', 'minmax', 'stagger' (Co-occurrence-aware), 'kmeans_fp4' or use 'none' to skip.",
     )
     parser.add_argument(
         "--stagger_lambda",
@@ -396,7 +396,7 @@ def parse_args():
         assert args.w_bits == 4, "`export_quantization` is only supported for 4 bit weights."
         assert args.a_bits == 4, "`export_quantization` is only supported for 4 bit activations."
         
-    if args.format == "nvfp" and args.channel_resort in ["minmax", "stagger"]:
+    if args.format == "nvfp" and args.channel_resort in ["minmax", "stagger", "kmeans_fp4", "kmeans_fp4_w"]:
         if args.transform_class != "identity":
             print(f"Forcing transform_class to 'identity' since format is nvfp and channel_resort is '{args.channel_resort}'.")
             args.transform_class = "identity"

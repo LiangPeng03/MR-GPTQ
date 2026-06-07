@@ -1,6 +1,6 @@
 #!/bin/bash
 
-gpu_id=0
+gpu_id=1
 export CUDA_VISIBLE_DEVICES=$gpu_id
 
 export OMP_NUM_THREADS=8
@@ -14,9 +14,9 @@ MODEL5="Qwen/Qwen3-8B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL1} \
+    --model_name_or_path=${MODEL3} \
     --format=nvfp \
-    --w_bits=4 \
+    --w_bits=16 \
     --a_bits=4 \
     --w_group_size=16 \
     --a_group_size=16 \
@@ -30,9 +30,7 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --sequence_length=2048 \
     --dtype=bfloat16 \
     --fuse_global_scale \
-    --gptq \
-    --channel_resort stagger \
-    --stagger_lambda auto \
+    --channel_resort kmeans_fp4 \
     --show_act_mse \
     --eval_perplexity \
     --eval_openllm \
