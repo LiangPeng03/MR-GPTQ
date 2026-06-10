@@ -1,3 +1,6 @@
+"""
+关键测试程序: macro_scatter.png, macro_block.png, nvfp4_all_layers_summary.png
+"""
 import os, sys, torch, numpy as np
 import matplotlib.pyplot as plt
 import matplotlib

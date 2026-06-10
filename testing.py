@@ -1,5 +1,6 @@
 """
 test_scale_opt.py - 验证"MSE-Optimal Scale"与闭式解(LSS)对NVFP4激活量化的改善效果
+证明LSS对激活量化损失的减小能力以及增加的推理时间开销
 """
 import torch
 import gc
@@ -73,7 +74,7 @@ def scale_to_e4m3(raw_scale, global_scale):
         .to(torch.float32) \
         .mul(get_reciprocal(global_scale))
 
-# 方法1: MinMax (Baseline)
+# 方法1: MinMax (Baseline) - 量化+反量化
 def quantize_minmax(x_groups, global_scale):
     abs_max = x_groups.abs().amax(dim=1, keepdim=True)
     raw_scales = abs_max / 6.0
@@ -84,7 +85,18 @@ def quantize_minmax(x_groups, global_scale):
     x_q = cast_to_fp4(x_normalized)
     return x_q * scales
 
-# 方法2: LSS 闭式解
+# 方法1: MinMax (Baseline) - 仅量化
+def quantize_minmax_only(x_groups, global_scale):
+    abs_max = x_groups.abs().amax(dim=1, keepdim=True)
+    raw_scales = abs_max / 6.0
+    raw_scales[raw_scales == 0] = 1.0
+    scales = scale_to_e4m3(raw_scales, global_scale)
+    
+    x_normalized = x_groups / scales
+    x_q = cast_to_fp4(x_normalized)
+    return x_q, scales
+
+# 方法2: LSS 闭式解 - 量化+反量化
 def quantize_lss(x_groups, global_scale):
     abs_x = x_groups.abs()
     
@@ -111,6 +123,33 @@ def quantize_lss(x_groups, global_scale):
     x_q = cast_to_fp4(x_normalized)
     return x_q * scales
 
+# 方法2: LSS 闭式解 - 仅量化
+def quantize_lss_only(x_groups, global_scale):
+    abs_x = x_groups.abs()
+    
+    # 1. 基础 MinMax 寻找初步格点
+    abs_max = abs_x.amax(dim=1, keepdim=True)
+    s_0 = abs_max / 6.0
+    s_0[s_0 == 0] = 1.0
+    
+    # 2. 试投格点
+    x_norm = abs_x / s_0
+    g = cast_to_fp4(x_norm).abs()
+    
+    # 3. 闭式解计算最佳 Scale
+    num = (abs_x * g).sum(dim=1, keepdim=True)
+    den = (g * g).sum(dim=1, keepdim=True)
+    
+    den[den == 0] = 1.0
+    raw_scales = num / den
+    raw_scales[abs_max == 0] = 1.0
+    
+    # 4. 转换精度并真正量化
+    scales = scale_to_e4m3(raw_scales, global_scale)
+    x_normalized = x_groups / scales
+    x_q = cast_to_fp4(x_normalized)
+    return x_q, scales
+
 # 权重量化使用 MSE 搜索 (模拟真实 MR-GPTQ 行为)
 def quantize_weight_mse(w_groups, global_scale, scale_search_iters=100, max_scale_shrink_factor=0.80):
     abs_max = w_groups.abs().amax(dim=1, keepdim=True)
@@ -118,23 +157,27 @@ def quantize_weight_mse(w_groups, global_scale, scale_search_iters=100, max_scal
     init_raw_scales[init_raw_scales == 0] = 1.0
     
     best_quantization_error = torch.full((w_groups.shape[0],), float("inf"), device=w_groups.device)
-    best_dequant = torch.zeros_like(w_groups)
+    best_scales = torch.zeros_like(init_raw_scales)
     
-    for i in range(scale_search_iters):
+    for i in range(scale_search_iters + 1):
         scale_shrink_factor = 1 - i * max_scale_shrink_factor / scale_search_iters
-        candidate_raw = scale_shrink_factor * init_raw_scales
-        candidate_scales = scale_to_e4m3(candidate_raw, global_scale)
+        candidate_scales = scale_shrink_factor * init_raw_scales
         
         x_normalized = w_groups / candidate_scales
         x_q = cast_to_fp4(x_normalized)
         x_dequant = x_q * candidate_scales
         
-        error = ((w_groups - x_dequant) ** 2).sum(dim=1)
+        error = (w_groups - x_dequant).abs().pow(2.4).sum(dim=1)
         improved = error < best_quantization_error
         if improved.any():
             best_quantization_error[improved] = error[improved]
-            best_dequant[improved] = x_dequant[improved]
+            best_scales[improved] = candidate_scales[improved]
             
+    best_scales = scale_to_e4m3(best_scales, global_scale)
+    x_normalized = w_groups / best_scales
+    x_q = cast_to_fp4(x_normalized)
+    best_dequant = x_q * best_scales
+    
     return best_dequant
 
 # 评估函数: 计算纯激活量化误差
@@ -276,19 +319,61 @@ def main():
         block = block.cpu()
         torch.cuda.empty_cache()
     
-    print("\n" + "=" * 110)
-    print("Performance Benchmark (Time & Memory on a large dummy matrix)")
-    print("-" * 110)
+    # ========== 性能基准测试 ==========
+    timing_strategies = {
+        "MinMax (Q+DQ)": quantize_minmax,
+        "MinMax (Q only)": quantize_minmax_only,
+        "LSS (Q+DQ)": quantize_lss,
+        "LSS (Q only)": quantize_lss_only,
+    }
+    
     dummy_x = torch.randn(4096 * 4096, device=device, dtype=torch.bfloat16).view(-1, 16)
     outlier_mask = torch.rand_like(dummy_x) > 0.99
     dummy_x[outlier_mask] *= 10.0 
     dummy_global_scale = torch.tensor([1.0], device=device)
-    
-    print(f"{'Strategy':<18} | {'Exec Time (ms)':<15} | {'Peak Extra Mem (MB)':<20} | {'Throughput (GB/s)'}")
-    print("-" * 110)
     tensor_size_gb = dummy_x.numel() * dummy_x.element_size() / (1024**3)
     
-    for strat_name, quant_fn in strategies.items():
+    # --- 量化+反量化 时间对比 ---
+    print("\n" + "=" * 110)
+    print("Performance Benchmark: Quantize + Dequantize (on a large dummy matrix)")
+    print("-" * 110)
+    print(f"{'Strategy':<18} | {'Exec Time (ms)':<15} | {'Peak Extra Mem (MB)':<20} | {'Throughput (GB/s)'}")
+    print("-" * 110)
+    
+    for strat_name in ["MinMax (Q+DQ)", "LSS (Q+DQ)"]:
+        quant_fn = timing_strategies[strat_name]
+        for _ in range(5):
+            _ = quant_fn(dummy_x, dummy_global_scale)
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        torch.cuda.reset_peak_memory_stats()
+        mem_before = torch.cuda.memory_allocated()
+        
+        start_event.record()
+        for _ in range(20):
+            res = quant_fn(dummy_x, dummy_global_scale)
+        end_event.record()
+        torch.cuda.synchronize()
+        
+        time_ms = start_event.elapsed_time(end_event) / 20.0
+        peak_mem = torch.cuda.max_memory_allocated() - mem_before
+        peak_mem_mb = peak_mem / (1024 * 1024)
+        throughput = tensor_size_gb / (time_ms / 1000.0)
+        
+        print(f"{strat_name:<18} | {time_ms:>13.3f}   | {peak_mem_mb:>17.2f}    | {throughput:>14.2f}")
+        del res
+        torch.cuda.empty_cache()
+    
+    # --- 仅量化 时间对比 ---
+    print("\n" + "=" * 110)
+    print("Performance Benchmark: Quantize Only (output scale + quantized values)")
+    print("-" * 110)
+    print(f"{'Strategy':<18} | {'Exec Time (ms)':<15} | {'Peak Extra Mem (MB)':<20} | {'Throughput (GB/s)'}")
+    print("-" * 110)
+    
+    for strat_name in ["MinMax (Q only)", "LSS (Q only)"]:
+        quant_fn = timing_strategies[strat_name]
         for _ in range(5):
             _ = quant_fn(dummy_x, dummy_global_scale)
         torch.cuda.synchronize()
