@@ -223,7 +223,7 @@ def parse_args():
         "--a_observer",
         type=str,
         default="minmax",
-        choices=["minmax"],
+        choices=["minmax","lss"],
         help="Activation observer.",
     )
     parser.add_argument(

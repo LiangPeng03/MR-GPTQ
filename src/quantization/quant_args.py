@@ -24,6 +24,7 @@ class QuantizationObserver(str, Enum):
     """
     MINMAX = "minmax"
     MSE = "mse"
+    LSS = "lss"
 
 class QuantizationOrder(str, Enum):
     """

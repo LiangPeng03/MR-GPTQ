@@ -133,6 +133,27 @@ class Quantizer:
                     if not self.symmetric:
                         zeros[improved_ids] = candidate_zeros[improved_ids]
 
+        elif self.observer == QuantizationObserver.LSS:
+            if not self.symmetric:
+                raise NotImplementedError("LSS observer only supports symmetric quantization.")
+            abs_x = x.abs()
+            s_0 = scales.clone()
+            s_0[s_0 == 0] = 1.0
+            
+            # Get grid assignments (g_i)
+            # Use quant_fn with scale s_0. This returns cast_to_fp4(abs_x / s_0) for NVFP4.
+            g = self.quant_fn(abs_x, s_0, zeros, self.q_min, self.q_max)
+            g = g.abs() # Ensure positive grid values
+            
+            num = (abs_x * g).sum(dim=reduce_dim, keepdim=True)
+            den = (g * g).sum(dim=reduce_dim, keepdim=True)
+            
+            den_zero = (den == 0)
+            den[den_zero] = 1.0
+            
+            lss_scales = num / den
+            scales = torch.where(den_zero, scales, lss_scales)
+
         # Reshape back
         if self.group_size:
             x = x.flatten(dim, dim + 1)

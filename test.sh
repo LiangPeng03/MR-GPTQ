@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- 配置区 ---
-GPU_ID=1
+GPU_ID=0
 LOG_FILE="eval_summary_stagger_lambda.log"
 PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
@@ -16,7 +16,7 @@ MODELS=(
 
 # 待测试的 Lambda 列表
 # LAMBDAS=("auto" "0.5" "1.0" "2.0")
-LAMBDAS=("1.5" "2.5" "3.0" "4.0")
+LAMBDAS=("2")
 
 # 屏蔽冗余 Warning 和日志
 export CUDA_VISIBLE_DEVICES=$GPU_ID
@@ -49,7 +49,7 @@ for MODEL in "${MODELS[@]}"; do
             --w_group_size=16 \
             --a_group_size=16 \
             --transform_class=identity \
-            --channel_resort=stagger \
+            --channel_resort=kmeans_fp4 \
             --stagger_lambda=$LAMBDA_VAL \
             --w_observer=mse \
             --quantization_order=activation \

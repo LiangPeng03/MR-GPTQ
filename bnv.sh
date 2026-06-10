@@ -39,12 +39,13 @@ for MODEL in "${MODELS[@]}"; do
     CMD="$PYTHON_BIN model_quant.py \
         --model_name_or_path=$MODEL \
         --format=nvfp \
-        --w_bits=16 \
+        --w_bits=4 \
         --a_bits=4 \
         --w_group_size=16 \
         --a_group_size=16 \
         --transform_class=identity \
         --w_observer=mse \
+        --a_observer=lss \
         --quantization_order=activation \
         --hadamard_group_size=16 \
         --dataset_name_or_path=fineweb-edu \
@@ -52,7 +53,9 @@ for MODEL in "${MODELS[@]}"; do
         --rel_damp=0.01 \
         --sequence_length=2048 \
         --dtype=bfloat16 \
-        --channel_resort kmeans_fp4 \
+        --gptq \
+        --channel_resort=stagger \
+        --stagger_lambda=0 \
         --show_act_mse \
         --fuse_global_scale \
         --eval_perplexity \
