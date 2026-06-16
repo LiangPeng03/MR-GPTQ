@@ -604,13 +604,13 @@ def gptq_quantization(
                 for g in opt_groups: perm.extend(g)
                 return torch.tensor(perm, device=is_outlier_mask.device, dtype=torch.long)
 
-            def compute_kmeans_fp4_perm(X_abs_T, group_size=16):
+            def compute_kmeans_fp4_perm(X_abs_T, group_size=16, channel_weights=None, act_alpha=0.0):
                 dim = X_abs_T.shape[0]
                 n_groups = dim // group_size
                 device = X_abs_T.device
                 grid_mults = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device, dtype=torch.float32)
                 
-                def compute_loss_distances(all_ch_abs, ref_ch_abs, chunk_size=256):
+                def compute_loss_distances(all_ch_abs, ref_ch_abs, chunk_size=256, c_weights=None):
                     ref = ref_ch_abs.unsqueeze(0)
                     n_ch = all_ch_abs.shape[0]
                     losses = torch.zeros(n_ch, device=device, dtype=torch.float32)
@@ -622,16 +622,30 @@ def gptq_quantization(
                         grid = scale.unsqueeze(-1) * grid_mults
                         diff = (p_min.unsqueeze(-1) - grid).abs()
                         min_q = grid.gather(-1, diff.argmin(-1, keepdim=True)).squeeze(-1)
-                        losses[i:i+chunk_size] = ((p_min - min_q) ** 2).sum(dim=1)
+                        mse = (p_min - min_q) ** 2
+                        if act_alpha > 0.0:
+                            act_weight = p_min.abs() ** act_alpha
+                            mse = mse * act_weight
+                        mse = mse.sum(dim=1)
+                        if c_weights is not None:
+                            mse = mse * c_weights[i:i+chunk_size]
+                        losses[i:i+chunk_size] = mse
                     return losses
 
-                ch_sums = X_abs_T.sum(dim=1)
+                if act_alpha > 0.0:
+                    ch_sums = (X_abs_T ** (1.0 + act_alpha)).sum(dim=1)
+                else:
+                    ch_sums = X_abs_T.sum(dim=1)
+                
+                if channel_weights is not None:
+                    ch_sums = ch_sums * channel_weights
+
                 accumulated_dist = torch.zeros(dim, device=device, dtype=torch.float32)
                 seed_order = []
                 first_seed = ch_sums.argmax().item()
                 seed_order.append(first_seed)
                 accumulated_dist[first_seed] = -float('inf')
-                dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed])
+                dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed], c_weights=channel_weights)
                 accumulated_dist += dists
                 accumulated_dist[first_seed] = -float('inf')
                 
@@ -639,7 +653,7 @@ def gptq_quantization(
                     new_seed = accumulated_dist.argmax().item()
                     seed_order.append(new_seed)
                     accumulated_dist[new_seed] = -float('inf')
-                    dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed])
+                    dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed], c_weights=channel_weights)
                     accumulated_dist += dists
 
                 opt_groups = [[s] for s in seed_order]
@@ -788,22 +802,37 @@ def gptq_quantization(
                             
                     X_abs_T = target_mat.abs().T.float()
                     
-                    if "o" in name:
+                    alpha = getattr(args, "kmeans_alpha", 0.0)
+                    if args.channel_resort == "kmeans_fp4" and alpha > 0.0:
+                        W_norm = torch.norm(W, p=2, dim=0) # Shape: (In_Features,)
+                        channel_weights = W_norm ** alpha
+                    else:
+                        channel_weights = None
+                        
+                    act_alpha = getattr(args, "kmeans_act_alpha", 0.0)
+                    
+                    if name == "down" and getattr(args, "kmeans_block_size", 0) != -1:
+                        if getattr(args, "kmeans_block_size", 0) > 0:
+                            h_group_size = args.kmeans_block_size
+                        else:
+                            h_group_size = model.config.hidden_size // model.config.num_attention_heads
+                    elif name == "o":
                         head_dim = model.config.hidden_size // model.config.num_attention_heads
                         h_group_size = head_dim
                     else:
                         h_group_size = -1
                         
                     if h_group_size <= 0:
-                        p = compute_kmeans_fp4_perm(X_abs_T, group_size=quant_group_size)
+                        p = compute_kmeans_fp4_perm(X_abs_T, group_size=quant_group_size, channel_weights=channel_weights, act_alpha=act_alpha)
                     else:
                         p = torch.zeros(N, device=X_abs_T.device, dtype=torch.long)
                         for i in range(0, N, h_group_size):
                             block_X_abs_T = X_abs_T[i : i + h_group_size]
                             block_gs = min(quant_group_size, h_group_size)
-                            block_perm = compute_kmeans_fp4_perm(block_X_abs_T, group_size=block_gs)
+                            block_cw = channel_weights[i : i + h_group_size] if channel_weights is not None else None
+                            block_perm = compute_kmeans_fp4_perm(block_X_abs_T, group_size=block_gs, channel_weights=block_cw, act_alpha=act_alpha)
                             p[i : i + h_group_size] = block_perm + i
-                    print(f"    [{name:8}] KMeans FP4 grouping (target={args.channel_resort}, gs={quant_group_size}) completed.")
+                    print(f"    [{name:8}] KMeans FP4 grouping (target={args.channel_resort}, gs={quant_group_size}, w_alpha={alpha}, act_alpha={act_alpha}) completed.")
                     resort_perms[name] = p
                 else:
                     # Old Resonance R_val Strategy

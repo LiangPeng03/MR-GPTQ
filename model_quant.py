@@ -279,6 +279,24 @@ def parse_args():
         help="Balance coefficient for Joint W/A Staggering. Can be 'auto' (sqrt(N/M)) or a float value (e.g. '0.5', '1.0').",
     )
     parser.add_argument(
+        "--kmeans_block_size",
+        type=int,
+        default=0,
+        help="Block size for K-means channel resorting applied to down_proj. If 0, uses head_dim. If -1, uses global K-means.",
+    )
+    parser.add_argument(
+        "--kmeans_alpha",
+        type=float,
+        default=0.0,
+        help="Alpha parameter for weighting K-means FP4 loss by weight norm.",
+    )
+    parser.add_argument(
+        "--kmeans_act_alpha",
+        type=float,
+        default=0.0,
+        help="Alpha parameter for weighting K-means FP4 loss by activation magnitude itself.",
+    )
+    parser.add_argument(
         "--outlier_ratio",
         type=float,
         default=0.01,

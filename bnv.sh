@@ -41,11 +41,11 @@ for MODEL in "${MODELS[@]}"; do
         --format=nvfp \
         --w_bits=4 \
         --a_bits=4 \
+        --seed=0 \
         --w_group_size=16 \
         --a_group_size=16 \
         --transform_class=identity \
         --w_observer=mse \
-        --a_observer=lss \
         --quantization_order=activation \
         --hadamard_group_size=16 \
         --dataset_name_or_path=fineweb-edu \
@@ -54,9 +54,10 @@ for MODEL in "${MODELS[@]}"; do
         --sequence_length=2048 \
         --dtype=bfloat16 \
         --gptq \
-        --channel_resort=stagger \
-        --stagger_lambda=0 \
         --show_act_mse \
+        --channel_resort=kmeans_fp4 \
+        --kmeans_block_size -1 \
+        --kmeans_alpha 2 \
         --fuse_global_scale \
         --eval_perplexity \
         --eval_openllm \

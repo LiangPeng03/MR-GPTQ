@@ -575,7 +575,12 @@ def rtn_quantization(
                             
                     X_abs_T = target_mat.abs().T.float()
                     
-                    if "o" in name:
+                    if name == "down" and getattr(args, "kmeans_block_size", 0) != -1:
+                        if getattr(args, "kmeans_block_size", 0) > 0:
+                            h_group_size = args.kmeans_block_size
+                        else:
+                            h_group_size = model.config.hidden_size // model.config.num_attention_heads
+                    elif name == "o":
                         head_dim = model.config.hidden_size // model.config.num_attention_heads
                         h_group_size = head_dim
                     else:
