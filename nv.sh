@@ -16,8 +16,8 @@ MODEL5="Qwen/Qwen3-8B"
 $HOME/.conda/envs/awq/bin/python model_quant.py \
     --model_name_or_path=${MODEL5} \
     --format=nvfp \
-    --w_bits=16 \
-    --a_bits=16 \
+    --w_bits=4 \
+    --a_bits=4 \
     --seed=0 \
     --w_group_size=16 \
     --a_group_size=16 \
@@ -31,14 +31,10 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --sequence_length=2048 \
     --dtype=bfloat16 \
     --fuse_global_scale \
-    --gptq \
-    --channel_resort=kmeans_fp4 \
-    --kmeans_block_size -1 \
-    --kmeans_alpha 0 \
-    --kmeans_act_alpha 0.5 \
     --show_act_mse \
+    --eval_perplexity \
     --eval_openllm \
-    --lm_eval_tasks arc_challenge hellaswag \
+    --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge \
     # --lm_eval_tasks piqa winogrande \
     # --lm_eval_tasks piqa arc_challenge winogrande \
 

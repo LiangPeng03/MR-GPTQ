@@ -349,6 +349,13 @@ def parse_args():
     # Eval params
     parser.add_argument("--eval_perplexity", action="store_true", help="whether to eval perplexity after quantization.")
     parser.add_argument("--eval_openllm", action="store_true", help="whether to eval OpenLLM v1 openllm after quantization.")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit number of examples per task for lm_eval (None = full dataset). "
+             "Mirrors four-over-six convention: 400 for hellaswag/arc_challenge.",
+    )
     # LM eval params
     parser.add_argument(
         "--lm_eval_batch_size",
@@ -538,7 +545,7 @@ def main():
         _orig_max_pos = model.config.max_position_embeddings
         model.config.max_position_embeddings = min(model.config.max_position_embeddings, 2048)
 
-        def _run_task(task_name, num_fewshot=0, batch_size=1, **extra_kwargs):
+        def _run_task(task_name, num_fewshot=0, batch_size=1, limit=None, **extra_kwargs):
             """Run a single lm_eval task with fresh HFLM to avoid accumulated state."""
             import gc
             gc.collect()
@@ -550,12 +557,11 @@ def main():
                 batch_size=batch_size,
                 max_length=2048,
             )
-            task_results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks=[task_name],
-                num_fewshot=num_fewshot,
-                **extra_kwargs,
-            )["results"]
+            eval_kwargs = {"model": lm, "tasks": [task_name], "num_fewshot": num_fewshot}
+            if limit is not None:
+                eval_kwargs["limit"] = limit
+            eval_kwargs.update(extra_kwargs)
+            task_results = lm_eval.simple_evaluate(**eval_kwargs)["results"]
             results.update(task_results)
             print(make_table({"results": task_results, "versions": {}, "n-shot": {}, "higher_is_better": {}}))
             # Immediately free HFLM and all its internal state
@@ -565,26 +571,29 @@ def main():
 
         # Winogrande (5-shot) - Can handle larger batch
         if "winogrande" in args.lm_eval_tasks:
-            _run_task("winogrande", num_fewshot=5, batch_size=64)
-        # Hellaswag (10-shot) - Medium batch
+            _run_task("winogrande", num_fewshot=5, batch_size=64, limit=args.limit)
+        # Hellaswag (10-shot) - Medium batch, limit=400 (four-over-six convention)
         if "hellaswag" in args.lm_eval_tasks:
-            _run_task("hellaswag", num_fewshot=10, batch_size=8)
+            _run_task("hellaswag", num_fewshot=10, batch_size=8, limit=400)
         # PIQA (0-shot) - Can handle very large batch
         if "piqa" in args.lm_eval_tasks:
-            _run_task("piqa", num_fewshot=0, batch_size=64)
-        # ARC Challenge (25-shot) - Must keep batch_size=1
+            _run_task("piqa", num_fewshot=0, batch_size=64, limit=args.limit)
+        # ARC Challenge (25-shot) - Must keep batch_size=1, limit=400 (four-over-six convention)
         if "arc_challenge" in args.lm_eval_tasks:
-            _run_task("arc_challenge", num_fewshot=25, batch_size=8)
+            _run_task("arc_challenge", num_fewshot=25, batch_size=8, limit=400)
+        # BoolQ (0-shot) - Passages are long, use smaller batch
+        if "boolq" in args.lm_eval_tasks:
+            _run_task("boolq", num_fewshot=0, batch_size=8, limit=args.limit)
         # GSM8K (requires chat template)
         if "gsm8k_llama" in args.lm_eval_tasks:
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
-                _run_task("gsm8k_llama", apply_chat_template=True, fewshot_as_multiturn=True, batch_size=8)
+                _run_task("gsm8k_llama", apply_chat_template=True, fewshot_as_multiturn=True, batch_size=8, limit=args.limit)
             else:
                 print("Skipping gsm8k_llama: no chat template.")
         # MMLU CoT (requires chat template)
         if "mmlu_cot_llama" in args.lm_eval_tasks:
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
-                _run_task("mmlu_cot_llama", apply_chat_template=True, fewshot_as_multiturn=True, batch_size=8)
+                _run_task("mmlu_cot_llama", apply_chat_template=True, fewshot_as_multiturn=True, batch_size=8, limit=args.limit)
             else:
                 print("Skipping mmlu_cot_llama: no chat template.")
 

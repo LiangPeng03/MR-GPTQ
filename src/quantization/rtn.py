@@ -674,7 +674,9 @@ def rtn_quantization(
                 if isinstance(layer, QLinear):
                     # Weights are unrotated at this point, so this naturally captures the unrotated weight global scale.
                     if layer.weight_quantizer is not None:
-                        layer.weight_quantizer.get_quantization_params(layer.weight)
+                        # Compute global_scale directly from max abs (avoids expensive get_quantization_params MSE search)
+                        max_val = layer.weight.abs().max().to(torch.float32).view(1)
+                        layer.weight_quantizer.global_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(max_val)
                         layer.weight_quantizer._track_global_scale = False
                     
                     if layer.act_quantizer is not None:
@@ -704,6 +706,12 @@ def rtn_quantization(
                     )
                     quantized_mlp.gate_proj.weight_quantizer.global_scale = gate_up_global_scale
                     quantized_mlp.up_proj.weight_quantizer.global_scale = gate_up_global_scale
+
+        # Experimental: disable train_mode before calibration (like GPTQ)
+        # Skip W4 weight quant during forward; activation scale calibrated on FP16 weights
+        for layer_name, layer in block.named_modules():
+            if isinstance(layer, QLinear):
+                layer._train_mode = False
 
         # Calibrate activations (if needed)
         if need_calibration:
@@ -752,6 +760,16 @@ def rtn_quantization(
                             "act_global_scale": act_global_scale.clone()
                         }  
         
+
+        # Offload calibration inputs to CPU to free GPU memory for fix_parametrization
+        for i in range(len(input_args)):
+            if isinstance(input_args[i], torch.Tensor):
+                input_args[i] = input_args[i].cpu()
+        for kw in input_kwargs:
+            for k in kw:
+                if isinstance(kw[k], torch.Tensor):
+                    kw[k] = kw[k].cpu()
+        torch.cuda.empty_cache()
 
         # 3. Fix model parametrization
         quantized_attn.fix_parametrization()

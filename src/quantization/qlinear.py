@@ -78,7 +78,18 @@ class QLinear(nn.Linear):
                 bias = out_transform(bias, inv_t=True, dim=0)
 
         if self.weight_quantizer is not None:
-            w_scales, w_zeros = self.weight_quantizer.get_quantization_params(weight)
+            # Compute scales/zeros on CPU to avoid GPU OOM during MSE search
+            orig_device = weight.device
+            weight_cpu = weight.cpu()
+            # Temporarily move global_scale to CPU to avoid device mismatch in quantizer
+            gs = self.weight_quantizer.global_scale
+            gs_cpu = gs.cpu()
+            self.weight_quantizer.global_scale = gs_cpu
+            w_scales_cpu, w_zeros_cpu = self.weight_quantizer.get_quantization_params(weight_cpu)
+            self.weight_quantizer.global_scale = gs  # restore
+            w_scales = w_scales_cpu.to(orig_device)
+            w_zeros = w_zeros_cpu.to(orig_device)
+            del weight_cpu, w_scales_cpu, w_zeros_cpu, gs_cpu
             weight = self.weight_quantizer(weight, w_scales, w_zeros)
             self.weight_quantizer._track_global_scale = False
 
