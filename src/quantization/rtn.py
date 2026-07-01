@@ -391,13 +391,13 @@ def rtn_quantization(
                 for g in opt_groups: perm.extend(g)
                 return torch.tensor(perm, device=is_outlier_mask.device, dtype=torch.long)
 
-            def compute_kmeans_fp4_perm(X_abs_T, group_size=16):
+            def compute_kmeans_fp4_perm(X_abs_T, group_size=16, channel_weights=None, act_alpha=0.0):
                 dim = X_abs_T.shape[0]
                 n_groups = dim // group_size
                 device = X_abs_T.device
                 grid_mults = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device, dtype=torch.float32)
                 
-                def compute_loss_distances(all_ch_abs, ref_ch_abs, chunk_size=256):
+                def compute_loss_distances(all_ch_abs, ref_ch_abs, chunk_size=256, c_weights=None):
                     ref = ref_ch_abs.unsqueeze(0)
                     n_ch = all_ch_abs.shape[0]
                     losses = torch.zeros(n_ch, device=device, dtype=torch.float32)
@@ -409,16 +409,29 @@ def rtn_quantization(
                         grid = scale.unsqueeze(-1) * grid_mults
                         diff = (p_min.unsqueeze(-1) - grid).abs()
                         min_q = grid.gather(-1, diff.argmin(-1, keepdim=True)).squeeze(-1)
-                        losses[i:i+chunk_size] = ((p_min - min_q) ** 2).sum(dim=1)
+                        mse = (p_min - min_q) ** 2
+                        if act_alpha > 0.0:
+                            act_weight = p_min.abs() ** act_alpha
+                            mse = mse * act_weight
+                        mse = mse.sum(dim=1)
+                        if c_weights is not None:
+                            mse = mse * c_weights[i:i+chunk_size]
+                        losses[i:i+chunk_size] = mse
                     return losses
 
-                ch_sums = X_abs_T.sum(dim=1)
+                if act_alpha > 0.0:
+                    ch_sums = (X_abs_T ** (1.0 + act_alpha)).sum(dim=1)
+                else:
+                    ch_sums = X_abs_T.sum(dim=1)
+                
+                if channel_weights is not None:
+                    ch_sums = ch_sums * channel_weights
                 accumulated_dist = torch.zeros(dim, device=device, dtype=torch.float32)
                 seed_order = []
                 first_seed = ch_sums.argmax().item()
                 seed_order.append(first_seed)
                 accumulated_dist[first_seed] = -float('inf')
-                dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed])
+                dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed], c_weights=channel_weights)
                 accumulated_dist += dists
                 accumulated_dist[first_seed] = -float('inf')
                 
@@ -426,11 +439,12 @@ def rtn_quantization(
                     new_seed = accumulated_dist.argmax().item()
                     seed_order.append(new_seed)
                     accumulated_dist[new_seed] = -float('inf')
-                    dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed])
+                    dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed], c_weights=channel_weights)
                     accumulated_dist += dists
 
                 opt_groups = [[s] for s in seed_order]
                 group_maxes = X_abs_T[seed_order].clone()
+                is_assigned = torch.zeros(dim, dtype=torch.bool, device=device)
                 group_sizes = torch.ones(n_groups, device=device, dtype=torch.long)
                 seed_set = set(seed_order)
                 remaining = [c for c in range(dim) if c not in seed_set]
@@ -575,6 +589,15 @@ def rtn_quantization(
                             
                     X_abs_T = target_mat.abs().T.float()
                     
+                    alpha = getattr(args, "kmeans_alpha", 0.0)
+                    if args.channel_resort == "kmeans_fp4" and alpha > 0.0:
+                        W_norm = torch.norm(W, p=2, dim=0) # Shape: (In_Features,)
+                        channel_weights = W_norm ** alpha
+                    else:
+                        channel_weights = None
+                        
+                    act_alpha = getattr(args, "kmeans_act_alpha", 0.0)
+                    
                     if name == "down" and getattr(args, "kmeans_block_size", 0) != -1:
                         if getattr(args, "kmeans_block_size", 0) > 0:
                             h_group_size = args.kmeans_block_size
@@ -587,13 +610,14 @@ def rtn_quantization(
                         h_group_size = -1
                         
                     if h_group_size <= 0:
-                        p = compute_kmeans_fp4_perm(X_abs_T, group_size=quant_group_size)
+                        p = compute_kmeans_fp4_perm(X_abs_T, group_size=quant_group_size, channel_weights=channel_weights, act_alpha=act_alpha)
                     else:
                         p = torch.zeros(N, device=X_abs_T.device, dtype=torch.long)
                         for i in range(0, N, h_group_size):
                             block_X_abs_T = X_abs_T[i : i + h_group_size]
+                            block_channel_weights = channel_weights[i : i + h_group_size] if channel_weights is not None else None
                             block_gs = min(quant_group_size, h_group_size)
-                            block_perm = compute_kmeans_fp4_perm(block_X_abs_T, group_size=block_gs)
+                            block_perm = compute_kmeans_fp4_perm(block_X_abs_T, group_size=block_gs, channel_weights=block_channel_weights, act_alpha=act_alpha)
                             p[i : i + h_group_size] = block_perm + i
                     print(f"    [{name:8}] KMeans FP4 grouping (target={args.channel_resort}, gs={quant_group_size}) completed.")
                     resort_perms[name] = p
@@ -650,17 +674,20 @@ def rtn_quantization(
 
         # 2. Replace blocks with quantized versions
         quantized_attn = get_attention_layer(model.config)(
-            model.config, layer_idx=block_idx,
+            model.config,
+            layer_idx=block_idx,
             weight_quantizer_kwargs=weight_quantizer_kwargs,
             act_quantizer_kwargs=act_quantizer_kwargs,
-            qkv_in_transform=qkv_in_transform, o_in_transform=o_in_transform
-        )
+            qkv_in_transform=qkv_in_transform,
+            o_in_transform=o_in_transform
+        ).to(device=device, dtype=orig_dtype)
         quantized_mlp = get_mlp_layer(model.config)(
             model.config,
             weight_quantizer_kwargs=weight_quantizer_kwargs,
             act_quantizer_kwargs=act_quantizer_kwargs,
-            gate_up_in_transform=gate_up_in_transform, down_in_transform=down_in_transform
-        )
+            gate_up_in_transform=gate_up_in_transform,
+            down_in_transform=down_in_transform
+        ).to(device=device, dtype=orig_dtype)
 
         quantized_attn.load_state_dict(block.self_attn.state_dict(), strict=False)
         quantized_mlp.load_state_dict(block.mlp.state_dict(), strict=False)
@@ -707,11 +734,17 @@ def rtn_quantization(
                     quantized_mlp.gate_proj.weight_quantizer.global_scale = gate_up_global_scale
                     quantized_mlp.up_proj.weight_quantizer.global_scale = gate_up_global_scale
 
-        # Experimental: disable train_mode before calibration (like GPTQ)
-        # Skip W4 weight quant during forward; activation scale calibrated on FP16 weights
+        # For calibration: keep _train_mode=True so transforms (e.g. PermutationTransform from 
+        # channel_resort) are correctly applied to weights during forward pass.
+        # Temporarily remove weight_quantizer to skip W4 quantization during calibration,
+        # so activation scales are calibrated on FP16 (transformed) weights.
+        # Without this, F.linear(perm(x), W_unrotated) produces wrong activation distributions
+        # when channel_resort is active, causing severe accuracy degradation.
+        saved_weight_quantizers = {}
         for layer_name, layer in block.named_modules():
             if isinstance(layer, QLinear):
-                layer._train_mode = False
+                saved_weight_quantizers[layer_name] = layer.weight_quantizer
+                layer.weight_quantizer = None
 
         # Calibrate activations (if needed)
         if need_calibration:
@@ -719,6 +752,12 @@ def rtn_quantization(
             for inp_args, inp_kwargs in zip(input_args, input_kwargs):
                 with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
                     block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
+
+        # Restore weight quantizers and disable train_mode for fix_parametrization
+        for layer_name, layer in block.named_modules():
+            if isinstance(layer, QLinear):
+                layer.weight_quantizer = saved_weight_quantizers.get(layer_name)
+                layer._train_mode = False
 
         
         if args.export_quantized_model:
@@ -813,6 +852,9 @@ def rtn_quantization(
 
         clear_device_cache(garbage_collection=True)
 
+    # Free the large input caches before evaluation
+    del input_args
+    del input_kwargs
     clear_device_cache(garbage_collection=True)
 
     return quantized_state_dict, non_quantized_state_dict

@@ -119,7 +119,7 @@ class Quantizer:
             best_quantization_error = torch.full(x.shape[:-1], float("inf"), device=x.device, dtype=x.dtype)
 
             for i in range(scale_search_iters):
-                scale_shrink_factor = 1 - i * max_scale_shrink_factor / scale_search_iters
+                scale_shrink_factor = 1.1 - i * 0.6 / scale_search_iters
                 candidate_scales = scale_shrink_factor * init_scales
                 candidate_zeros = torch.zeros_like(x_min) if self.symmetric else -(x_min / candidate_scales).round() 
                 q = self.quant_fn(x, candidate_scales, candidate_zeros, self.q_min, self.q_max)

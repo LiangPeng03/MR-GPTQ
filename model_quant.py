@@ -510,10 +510,52 @@ def main():
         for _ in range(3): gc.collect()
         torch.cuda.empty_cache()
         
+        # DIAGNOSTIC: Check GPU after cleanup
+        print(f"\n[MEM DIAG] After model.to('cpu') + empty_cache:")
+        print(f"[MEM DIAG]   PyTorch allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        print(f"[MEM DIAG]   PyTorch reserved:  {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+        
+        # Strip weight_quantizer from QLinear modules - not needed when _train_mode=False
+        from src.quantization.qlinear import QLinear as _QLinear
+        for name, module in model.named_modules():
+            if isinstance(module, _QLinear):
+                module.weight_quantizer = None
+        
         # Now move model back to GPU - it should be the ONLY major thing on VRAM now
         model = model.to(device)
-        # Enable KV cache for faster autoregressive evaluation
-        model.config.use_cache = True
+        # Disable KV cache to prevent returning massive past_key_values (saves ~5.5GB VRAM for batch_size=64)
+        model.config.use_cache = False
+
+        # === Memory Diagnostics ===
+        param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+        buffer_bytes = sum(b.numel() * b.element_size() for b in model.buffers())
+        print(f"\n[MEM DIAG] Model parameters: {param_bytes / 1e9:.2f} GB")
+        print(f"[MEM DIAG] Model buffers: {buffer_bytes / 1e9:.2f} GB")
+        print(f"[MEM DIAG] Total model tensors: {(param_bytes + buffer_bytes) / 1e9:.2f} GB")
+        # Check for FP32 params
+        fp32_bytes = sum(p.numel() * p.element_size() for p in model.parameters() if p.dtype == torch.float32)
+        if fp32_bytes > 0:
+            print(f"[MEM DIAG] WARNING: {fp32_bytes / 1e9:.2f} GB of FP32 parameters found!")
+            for name, p in model.named_parameters():
+                if p.dtype == torch.float32:
+                    print(f"  FP32 param: {name} shape={list(p.shape)} ({p.numel() * 4 / 1e6:.1f} MB)")
+        # Check non-parameter module attributes that are tensors on GPU
+        non_param_gpu_bytes = 0
+        for name, module in model.named_modules():
+            for attr_name in dir(module):
+                if attr_name.startswith('_'):
+                    continue
+                try:
+                    attr = getattr(module, attr_name)
+                    if isinstance(attr, torch.Tensor) and attr.is_cuda and not any(attr.data_ptr() == p.data_ptr() for p in model.parameters()):
+                        non_param_gpu_bytes += attr.numel() * attr.element_size()
+                except:
+                    pass
+        if non_param_gpu_bytes > 0:
+            print(f"[MEM DIAG] Non-parameter GPU tensors: {non_param_gpu_bytes / 1e9:.2f} GB")
+        print(f"[MEM DIAG] PyTorch allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        print(f"[MEM DIAG] PyTorch reserved:  {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+        print(f"=== End Memory Diagnostics ===\n")
 
     wikitext2_ppl = None
     c4_ppl = None
@@ -532,8 +574,14 @@ def main():
         if args.log_wandb:
             wandb.log({"eval/wikitext2_ppl": wikitext2_ppl, "eval/c4_ppl": c4_ppl})
 
-        # Free memory before OpenLLM eval
-        import gc
+        # Ensure all model weights are contiguous to avoid on-the-fly allocations during F.linear
+        for param in model.parameters():
+            if not param.is_contiguous():
+                param.data = param.data.contiguous()
+                
+        # NOTE: WE MUST CLEAR CACHE AFTER QUANTIZATION BEFORE LM EVAL
+        if 'calibration_data' in locals():
+            del calibration_data
         gc.collect()
         torch.cuda.empty_cache()
 

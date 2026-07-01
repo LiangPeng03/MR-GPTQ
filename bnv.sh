@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- 配置区 ---
-GPU_ID=1
+GPU_ID=0
 LOG_FILE="eval_summary.log"
 PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
@@ -26,7 +26,7 @@ export PYTHONWARNINGS="ignore"
 echo "" >> $LOG_FILE
 echo "==========================================================" >> $LOG_FILE
 echo "Batch Run Started at: $(date)" >> $LOG_FILE
-printf "%-30s | %-8s | %-8s | %-8s | %-8s | %-8s\n" "Model" "W-PPL" "C4-PPL" "PIQA" "ARC-C" "WINO" >> $LOG_FILE
+printf "%-30s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s\n" "Model" "W-PPL" "C4-PPL" "PIQA" "ARC-C" "WINO" "BOOLQ" "HELLA" >> $LOG_FILE
 echo "----------------------------------------------------------" >> $LOG_FILE
 
 # --- 循环运行 ---
@@ -46,6 +46,7 @@ for MODEL in "${MODELS[@]}"; do
         --a_group_size=16 \
         --transform_class=identity \
         --w_observer=mse \
+        --a_observer=lss \
         --quantization_order=activation \
         --hadamard_group_size=16 \
         --dataset_name_or_path=fineweb-edu \
@@ -53,7 +54,6 @@ for MODEL in "${MODELS[@]}"; do
         --rel_damp=0.01 \
         --sequence_length=2048 \
         --dtype=bfloat16 \
-        --gptq \
         --show_act_mse \
         --channel_resort=kmeans_fp4 \
         --kmeans_block_size -1 \
@@ -61,7 +61,7 @@ for MODEL in "${MODELS[@]}"; do
         --fuse_global_scale \
         --eval_perplexity \
         --eval_openllm \
-        --lm_eval_tasks piqa winogrande"
+        --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge"
 
     # 运行并静默非核心输出
     tmp_out="tmp_eval.out"
@@ -85,12 +85,14 @@ for MODEL in "${MODELS[@]}"; do
     PIQA=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; d=json.load(sys.stdin).get('results', {}); v=d.get('piqa'); print(f'{v:.5f}' if isinstance(v, (int, float)) else 'N/A')")
     ARC=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; d=json.load(sys.stdin).get('results', {}); v=d.get('arc_challenge'); print(f'{v:.5f}' if isinstance(v, (int, float)) else 'N/A')")
     WINO=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; d=json.load(sys.stdin).get('results', {}); v=d.get('winogrande'); print(f'{v:.5f}' if isinstance(v, (int, float)) else 'N/A')")
+    BOOLQ=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; d=json.load(sys.stdin).get('results', {}); v=d.get('boolq'); print(f'{v:.5f}' if isinstance(v, (int, float)) else 'N/A')")
+    HELLA=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; d=json.load(sys.stdin).get('results', {}); v=d.get('hellaswag'); print(f'{v:.5f}' if isinstance(v, (int, float)) else 'N/A')")
 
     # 打印到屏幕
     echo "Result: Wiki-PPL: $WIKI_PPL, PIQA: $PIQA"
     
     # 格式化写入日志
-    printf "%-30s | %-8s | %-8s | %-8s | %-8s | %-8s\n" "$MODEL" "$WIKI_PPL" "$C4_PPL" "$PIQA" "$ARC" "$WINO" >> $LOG_FILE
+    printf "%-30s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s\n" "$MODEL" "$WIKI_PPL" "$C4_PPL" "$PIQA" "$ARC" "$WINO" "$BOOLQ" "$HELLA" >> $LOG_FILE
     
     rm $tmp_out
 done

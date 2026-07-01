@@ -78,18 +78,29 @@ class QLinear(nn.Linear):
                 bias = out_transform(bias, inv_t=True, dim=0)
 
         if self.weight_quantizer is not None:
-            # Compute scales/zeros on CPU to avoid GPU OOM during MSE search
-            orig_device = weight.device
-            weight_cpu = weight.cpu()
-            # Temporarily move global_scale to CPU to avoid device mismatch in quantizer
-            gs = self.weight_quantizer.global_scale
-            gs_cpu = gs.cpu()
-            self.weight_quantizer.global_scale = gs_cpu
-            w_scales_cpu, w_zeros_cpu = self.weight_quantizer.get_quantization_params(weight_cpu)
-            self.weight_quantizer.global_scale = gs  # restore
-            w_scales = w_scales_cpu.to(orig_device)
-            w_zeros = w_zeros_cpu.to(orig_device)
-            del weight_cpu, w_scales_cpu, w_zeros_cpu, gs_cpu
+            # MinMax is fast on GPU, but MSE searches can cause OOM on large matrices.
+            # Process in chunks to keep memory usage low while staying on GPU.
+            orig_track = self.weight_quantizer._track_global_scale
+            if orig_track and hasattr(self.weight_quantizer, "scale_precision") and self.weight_quantizer.scale_precision.value == "e4m3":
+                from .quant_ops import FP8_E4M3_MAX, FP4_E2M1_MAX
+                from .quantizer import get_reciprocal
+                max_val = weight.abs().max().to(torch.float32).view(1)
+                current_global_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(max_val)
+                self.weight_quantizer.global_scale = torch.minimum(self.weight_quantizer.global_scale.to(weight.device), current_global_scale)
+                self.weight_quantizer._track_global_scale = False
+                
+            chunk_size = 256
+            w_scales_list = []
+            w_zeros_list = []
+            for i in range(0, weight.shape[0], chunk_size):
+                chunk = weight[i:i+chunk_size]
+                s, z = self.weight_quantizer.get_quantization_params(chunk)
+                w_scales_list.append(s)
+                if z is not None:
+                    w_zeros_list.append(z)
+            w_scales = torch.cat(w_scales_list, dim=0)
+            w_zeros = torch.cat(w_zeros_list, dim=0) if w_zeros_list else None
+            
             weight = self.weight_quantizer(weight, w_scales, w_zeros)
             self.weight_quantizer._track_global_scale = False
 
