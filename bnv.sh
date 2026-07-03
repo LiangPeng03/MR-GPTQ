@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- 配置区 ---
-GPU_ID=0
+GPU_ID=1
 LOG_FILE="eval_summary.log"
 PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
@@ -49,13 +49,14 @@ for MODEL in "${MODELS[@]}"; do
         --a_observer=lss \
         --quantization_order=activation \
         --hadamard_group_size=16 \
-        --dataset_name_or_path=fineweb-edu \
+        --dataset_name_or_path=c4 \
         --num_sequences=128 \
         --rel_damp=0.01 \
         --sequence_length=2048 \
         --dtype=bfloat16 \
         --show_act_mse \
-        --channel_resort=kmeans_fp4 \
+        --gptq \
+        --channel_resort=kmeans_fp4_top3 \
         --kmeans_block_size -1 \
         --kmeans_alpha 2 \
         --fuse_global_scale \

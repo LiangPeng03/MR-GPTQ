@@ -261,10 +261,10 @@ def compute_group_diagnostics(tensor, group_size=16):
         'max_mse_pct': max_mse_pct,
     }
 
-def optimize_channel_scales_top3_search(X, W, weight_mse_ratio=2.0, group_size=16):
+def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=2.0, group_size=16, top_k=5, num_rounds=3):
     """
-    Top-3 Channel 3D Joint Tree Search for NVFP4 Channel Scaling.
-    Targets the Top-3 max channels of X to lower the group max and evaluate 11x11x11 grid.
+    Coordinate Descent Joint Tree Search for NVFP4 Channel Scaling.
+    Targets Top-K channels and optimizes them iteratively for num_rounds.
     """
     device = X.device
     in_features = X.shape[1]
@@ -274,13 +274,13 @@ def optimize_channel_scales_top3_search(X, W, weight_mse_ratio=2.0, group_size=1
     
     S_g = torch.ones((num_groups, group_size), device=device) # [num_groups, 16]
     
-    # 候选缩放值 (0.5 到 1.5 之间，11个点正好包含 1.0)
-    candidates = torch.linspace(0.5, 1.5, steps=11, device=device)
+    # 21 个候选缩放值 (0.5 到 1.5 之间，步长 0.05，包含 1.0)
+    candidates = torch.linspace(0.5, 1.5, steps=21, device=device)
+    num_cands = candidates.shape[0]
     
     X_g = X.view(T, num_groups, group_size)
     W_g = W.view(OutDim, num_groups, group_size)
     
-    # 提取全局 scale，用于 Weight 的 E4M3 缩放限制模拟
     gs_w = compute_global_scale(W)
     
     def calc_mse_positive_inplace(mat_temp, gs=None):
@@ -288,7 +288,6 @@ def optimize_channel_scales_top3_search(X, W, weight_mse_ratio=2.0, group_size=1
         raw_scale = vmax.mul_(1/6.0).clamp_(min=1e-10)
         scale = scale_to_e4m3(raw_scale, gs) if gs is not None else raw_scale
         
-        # In-place 避免创建巨大中间张量，成倍加速并降低显存
         mat_temp.div_(scale)
         quantized = torch.where(mat_temp > 5.0, 6.0,
                       torch.where(mat_temp >= 3.5, 4.0,
@@ -300,26 +299,15 @@ def optimize_channel_scales_top3_search(X, W, weight_mse_ratio=2.0, group_size=1
     abs_X_g = X_g.abs()
     abs_W_g = W_g.abs()
     
-    # 必须 clone，因为 calc 已经是 in-place 破坏性操作了
     base_act_mse = calc_mse_positive_inplace(abs_X_g.clone()) # [num_groups]
     base_w_mse = calc_mse_positive_inplace(abs_W_g.clone(), gs=gs_w) # [num_groups]
     
     X_vmax_per_channel = abs_X_g.amax(dim=0) # [num_groups, 16]
-    top3_vals, top3_idx = torch.topk(X_vmax_per_channel, k=3, dim=-1) # [num_groups, 3]
+    topk_vals, topk_idx = torch.topk(X_vmax_per_channel, k=top_k, dim=-1) # [num_groups, top_k]
     
-    grid = torch.cartesian_prod(candidates, candidates, candidates) # [1331, 3]
-    num_cands = grid.shape[0]
-    
-    best_score = torch.full((num_groups,), float('inf'), device=device)
-    best_c = torch.ones((num_groups, 3), device=device)
-    
-    # 动态切块以求得 Python 循环和 GPU 显存的最佳平衡点
-    target_elements = 600_000_000 # 约 400MB 单个张量，峰值可控制在 ~1.5GB
+    target_elements = 600_000_000 # 峰值显存控制
     max_dim = max(T, OutDim)
-    bg_target = max(1, target_elements // (max_dim * 16))
-    
-    chunk_B = min(num_cands, bg_target)
-    chunk_G = max(1, bg_target // chunk_B)
+    chunk_G = max(1, target_elements // (max_dim * 16 * num_cands))
     
     for g_start in range(0, num_groups, chunk_G):
         g_end = min(g_start + chunk_G, num_groups)
@@ -327,38 +315,42 @@ def optimize_channel_scales_top3_search(X, W, weight_mse_ratio=2.0, group_size=1
         
         X_g_chunk = abs_X_g[:, g_start:g_end, :] # [T, G_curr, 16]
         W_g_chunk = abs_W_g[:, g_start:g_end, :] # [OutDim, G_curr, 16]
-        top3_idx_chunk = top3_idx[g_start:g_end] # [G_curr, 3]
+        topk_idx_chunk = topk_idx[g_start:g_end] # [G_curr, top_k]
         
-        for c_start in range(0, num_cands, chunk_B):
-            c_end = min(c_start + chunk_B, num_cands)
-            c_chunk = grid[c_start:c_end] # [B_curr, 3]
-            B_curr = c_chunk.shape[0]
-            
-            temp_S = torch.ones((B_curr, G_curr, group_size), device=device)
-            top3_idx_expanded = top3_idx_chunk.unsqueeze(0).expand(B_curr, G_curr, 3)
-            c_expanded = c_chunk.unsqueeze(1).expand(B_curr, G_curr, 3)
-            temp_S.scatter_(2, top3_idx_expanded, c_expanded)
-            
-            X_temp = X_g_chunk.unsqueeze(0) * temp_S.unsqueeze(1) # [B_curr, T, G_curr, 16]
-            W_temp = W_g_chunk.unsqueeze(0) / temp_S.unsqueeze(1) # [B_curr, OutDim, G_curr, 16]
-            
-            act_mse = calc_mse_positive_inplace(X_temp) # [B_curr, G_curr]
-            w_mse = calc_mse_positive_inplace(W_temp, gs=gs_w) # [B_curr, G_curr]
-            
-            b_act = base_act_mse[g_start:g_end].unsqueeze(0) + 1e-12
-            b_w = base_w_mse[g_start:g_end].unsqueeze(0) + 1e-12
-            score = (act_mse / b_act) + weight_mse_ratio * (w_mse / b_w) # [B_curr, G_curr]
-            
-            min_score, min_idx = score.min(dim=0) # [G_curr]
-            
-            improved = min_score < best_score[g_start:g_end]
-            best_score[g_start:g_end] = torch.where(improved, min_score, best_score[g_start:g_end])
-            
-            best_c_in_chunk = c_chunk[min_idx] # [G_curr, 3]
-            best_c[g_start:g_end] = torch.where(improved.unsqueeze(1), best_c_in_chunk, best_c[g_start:g_end])
-            
-    S_g.scatter_(1, top3_idx, best_c)
-    
+        b_act = base_act_mse[g_start:g_end].unsqueeze(0) + 1e-12
+        b_w = base_w_mse[g_start:g_end].unsqueeze(0) + 1e-12
+        
+        # 本地维护最优的 Scale 矩阵
+        local_S = torch.ones((G_curr, group_size), device=device)
+        
+        for r in range(num_rounds):
+            for k in range(top_k):
+                # temp_S 继承当前的最佳 scale [num_cands, G_curr, 16]
+                temp_S = local_S.unsqueeze(0).expand(num_cands, G_curr, group_size).clone()
+                
+                # 针对第 k 个目标通道，替换为 21 个候选值
+                target_ch_idx = topk_idx_chunk[:, k] # [G_curr]
+                c_expanded = candidates.unsqueeze(1).expand(num_cands, G_curr)
+                idx_expanded = target_ch_idx.unsqueeze(0).unsqueeze(-1).expand(num_cands, G_curr, 1)
+                temp_S.scatter_(2, idx_expanded, c_expanded.unsqueeze(-1))
+                
+                X_temp = X_g_chunk.unsqueeze(0) * temp_S.unsqueeze(1) # [21, T, G_curr, 16]
+                W_temp = W_g_chunk.unsqueeze(0) / temp_S.unsqueeze(1) # [21, OutDim, G_curr, 16]
+                
+                act_mse = calc_mse_positive_inplace(X_temp) # [21, G_curr]
+                w_mse = calc_mse_positive_inplace(W_temp, gs=gs_w) # [21, G_curr]
+                
+                score = (act_mse / b_act) + weight_mse_ratio * (w_mse / b_w) # [21, G_curr]
+                
+                # 取得 21 个候选中的最低分数及其索引
+                min_score, min_idx = score.min(dim=0) # [G_curr]
+                
+                # 直接更新为当前找到的最优解（这保证了严格的单调下降或持平）
+                best_c = candidates[min_idx] # [G_curr]
+                local_S.scatter_(1, target_ch_idx.unsqueeze(1), best_c.unsqueeze(1))
+                
+        S_g[g_start:g_end] = local_S
+        
     S_out = S_g.view(-1)
     
     # 打印统计信息
@@ -367,7 +359,7 @@ def optimize_channel_scales_top3_search(X, W, weight_mse_ratio=2.0, group_size=1
     max_s = S_out.max().item()
     pct_high = (S_out > 1.2).float().mean().item() * 100
     pct_low = (S_out < 0.8).float().mean().item() * 100
-    print(f"      [Top3 Search] S_g Dist: Mean={mean_s:.3f}, Min={min_s:.3f}, Max={max_s:.3f} | >1.2: {pct_high:.1f}%, <0.8: {pct_low:.1f}%")
+    print(f"      [Coord Descent Search] S_g Dist: Mean={mean_s:.3f}, Min={min_s:.3f}, Max={max_s:.3f} | >1.2: {pct_high:.1f}%, <0.8: {pct_low:.1f}%")
     
     return S_out
 
@@ -423,8 +415,8 @@ def run_kmeans_experiment(X, W, perm_km, group_size=16):
     results["km_w_submax_mse_pct"] = diag_km_w['submax_mse_pct']
     results["km_w_max_mse_pct"] = diag_km_w['max_mse_pct']
     
-    # 4. Scaled (KMeans + Top3 Search)
-    S_gics = optimize_channel_scales_top3_search(X_perm, W_perm, weight_mse_ratio=3.0, group_size=group_size)
+    # 4. Scaled (KMeans + Coordinate Descent Search)
+    S_gics = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=1.0, group_size=group_size, top_k=5, num_rounds=3)
     X_scaled = X_perm * S_gics
     W_scaled = W_perm / S_gics
     

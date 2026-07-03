@@ -1,6 +1,6 @@
 #!/bin/bash
 
-gpu_id=1
+gpu_id=0
 export CUDA_VISIBLE_DEVICES=$gpu_id
 
 export OMP_NUM_THREADS=8
@@ -26,14 +26,14 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --a_observer=lss \
     --quantization_order=activation \
     --hadamard_group_size=16 \
-    --dataset_name_or_path=fineweb-edu \
+    --dataset_name_or_path=c4 \
     --num_sequences=128 \
     --rel_damp=0.01 \
     --sequence_length=2048 \
     --dtype=bfloat16 \
     --fuse_global_scale \
     --gptq \
-    --channel_resort=kmeans_fp4 \
+    --channel_resort=kmeans_fp4_top3 \
     --kmeans_block_size -1 \
     --kmeans_alpha 2 \
     --kmeans_act_alpha 0 \
