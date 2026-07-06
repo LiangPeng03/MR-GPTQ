@@ -592,7 +592,10 @@ def rtn_quantization(
                     alpha = getattr(args, "kmeans_alpha", 0.0)
                     if args.channel_resort in ["kmeans_fp4", "kmeans_fp4_top3"] and alpha > 0.0:
                         W_norm = torch.norm(W, p=2, dim=0) # Shape: (In_Features,)
-                        channel_weights = W_norm ** alpha
+                        X_norm = torch.norm(mean_val, p=2, dim=0) # Act Norm
+                        # Use W_norm * X_norm to align with true output contribution
+                        # channel_weights = (W_norm * X_norm) ** alpha
+                        channel_weights = (W_norm) ** alpha
                     else:
                         channel_weights = None
                         

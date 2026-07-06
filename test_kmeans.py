@@ -302,8 +302,15 @@ def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=2.0, group
     base_act_mse = calc_mse_positive_inplace(abs_X_g.clone()) # [num_groups]
     base_w_mse = calc_mse_positive_inplace(abs_W_g.clone(), gs=gs_w) # [num_groups]
     
-    X_vmax_per_channel = abs_X_g.amax(dim=0) # [num_groups, 16]
-    topk_vals, topk_idx = torch.topk(X_vmax_per_channel, k=top_k, dim=-1) # [num_groups, top_k]
+    norm2_X = (X_g.float() ** 2).sum(dim=0) # [num_groups, 16]
+    norm2_W = (W_g.float() ** 2).sum(dim=0) # [num_groups, 16]
+    
+    max_X_c = abs_X_g.amax(dim=0) # [num_groups, 16]
+    median_X_c = abs_X_g.median(dim=0).values # [num_groups, 16]
+    spikiness = max_X_c / (median_X_c + 1e-12) # [num_groups, 16]
+    
+    sensitivity_c = norm2_X * norm2_W * spikiness # [num_groups, 16]
+    topk_vals, topk_idx = torch.topk(sensitivity_c, k=top_k, dim=-1) # [num_groups, top_k]
     
     target_elements = 600_000_000 # 峰值显存控制
     max_dim = max(T, OutDim)
