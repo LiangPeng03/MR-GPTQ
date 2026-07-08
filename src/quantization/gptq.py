@@ -139,7 +139,7 @@ class GPTQ:
         if self.export_quantized_model:
             qweight = torch.empty(self.W.shape, device=device, dtype=dtype)
         # Get scales and zeros 
-        scales, zeros = self.quantizer.get_quantization_params(self.W) 
+        scales, zeros = self.quantizer.get_quantization_params(self.W, H=self.H) 
         # Dirty hack for GPTQ quantization
         self.quantizer.group_size = None
         # Get permutation
@@ -869,7 +869,7 @@ def gptq_quantization(
                     
                     print(f"    [{name:8}] Running Coordinate Descent Channel Scale Search...")
                     is_mlp = "gate_up" in name or "down" in name
-                    beta = 0.3 if is_mlp else 0
+                    beta = 0.9 if is_mlp else 0
                     S_top3 = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=1, group_size=quant_group_size, top_k=5, num_rounds=3, nonlinear_beta=beta)
                     
                     if not hasattr(block, "gics_scales"):

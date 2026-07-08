@@ -87,6 +87,7 @@ class Quantizer:
     def get_quantization_params(
         self, 
         x: torch.Tensor,
+        H: Optional[torch.Tensor] = None,
         # MSE observer quantization params
         scale_search_iters: int = 100,
         max_scale_shrink_factor: float = 0.80,
@@ -118,13 +119,46 @@ class Quantizer:
             init_scales = scales.clone() 
             best_quantization_error = torch.full(x.shape[:-1], float("inf"), device=x.device, dtype=x.dtype)
 
+            if H is not None:
+                if x.ndim == 3:
+                    num_groups = x.shape[1]
+                    gs = x.shape[2]
+                    H_g = torch.stack([
+                        H[g * gs : (g + 1) * gs, g * gs : (g + 1) * gs]
+                        for g in range(num_groups)
+                    ]).to(x.device, dtype=x.dtype)
+                else:
+                    H_g = None
+                    
+            prev_q = None
+
             for i in range(scale_search_iters):
                 scale_shrink_factor = 1.1 - i * 0.6 / scale_search_iters
                 candidate_scales = scale_shrink_factor * init_scales
                 candidate_zeros = torch.zeros_like(x_min) if self.symmetric else -(x_min / candidate_scales).round() 
                 q = self.quant_fn(x, candidate_scales, candidate_zeros, self.q_min, self.q_max)
+                
+                if prev_q is not None:
+                    changed = (q != prev_q).any(dim=-1)
+                    if not changed.any():
+                        continue
+                else:
+                    changed = torch.ones_like(best_quantization_error, dtype=torch.bool)
+                
+                prev_q = q.clone()
+                
                 x_reconstructed = self.dequant_fn(q, candidate_scales, candidate_zeros)
-                quantization_error = (x - x_reconstructed).abs_().pow_(error_norm).sum(dim=-1)
+                dW = x - x_reconstructed
+                
+                if H is not None:
+                    dW_unsq = dW.unsqueeze(-2)
+                    H_eval = H_g.unsqueeze(0) if x.ndim == 3 else H.unsqueeze(0)
+                    res = torch.matmul(dW_unsq, H_eval)
+                    quant_err_full = (res.squeeze(-2) * dW).sum(dim=-1)
+                else:
+                    quant_err_full = dW.abs_().pow_(error_norm).sum(dim=-1)
+                    
+                quantization_error = torch.where(changed, quant_err_full, torch.tensor(float('inf'), device=x.device, dtype=x.dtype))
 
                 if (quantization_error < best_quantization_error).any():
                     improved_ids = torch.where(quantization_error < best_quantization_error)

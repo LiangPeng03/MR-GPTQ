@@ -14,7 +14,7 @@ MODEL5="Qwen/Qwen3-8B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL5} \
+    --model_name_or_path=${MODEL2} \
     --format=nvfp \
     --w_bits=4 \
     --a_bits=4 \
