@@ -868,8 +868,9 @@ def gptq_quantization(
                     W_perm = W[:, p]
                     
                     print(f"    [{name:8}] Running Coordinate Descent Channel Scale Search...")
-                    # Pass weight_mse_ratio=3.0 as default, matching test_kmeans.py
-                    S_top3 = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=1, group_size=quant_group_size, top_k=5, num_rounds=3)
+                    is_mlp = "gate_up" in name or "down" in name
+                    beta = 0.3 if is_mlp else 0
+                    S_top3 = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=1, group_size=quant_group_size, top_k=5, num_rounds=3, nonlinear_beta=beta)
                     
                     if not hasattr(block, "gics_scales"):
                         block.gics_scales = {}

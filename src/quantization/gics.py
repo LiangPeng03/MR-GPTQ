@@ -12,10 +12,10 @@ def scale_to_e4m3(raw_scale, global_scale):
         .to(torch.float32) \
         .mul(get_reciprocal(global_scale))
 
-def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=3.0, group_size=16, top_k=5, num_rounds=3):
+def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=3.0, group_size=16, top_k=5, num_rounds=3, nonlinear_beta=0.0):
     """
     Coordinate Descent Joint Tree Search for NVFP4 Channel Scaling.
-    Targets Top-K channels and optimizes them iteratively for num_rounds.
+    Uses Trace Trick to minimize output MSE directly, with optional non-linear weighting.
     """
     device = X.device
     in_features = X.shape[1]
@@ -34,36 +34,38 @@ def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=3.0, group
     
     gs_w = compute_global_scale(W)
     
-    def calc_mse_positive_inplace(mat_temp, gs=None):
-        vmax = mat_temp.amax(dim=-1, keepdim=True)
+    def quantize_nvfp4(tensor, gs=None):
+        vmax = tensor.abs().amax(dim=-1, keepdim=True)
         raw_scale = vmax.mul_(1/6.0).clamp_(min=1e-10)
         scale = scale_to_e4m3(raw_scale, gs) if gs is not None else raw_scale
         
-        mat_temp.div_(scale)
-        quantized = torch.where(mat_temp > 5.0, 6.0,
-                      torch.where(mat_temp >= 3.5, 4.0,
-                      torch.where(mat_temp >= 1.75, torch.round(mat_temp),
-                                             torch.round(mat_temp * 2.0) * 0.5)))
-        mat_temp.sub_(quantized).pow_(2).mul_(scale.pow(2))
-        return mat_temp.sum(dim=(-3, -1))
+        normalized = tensor / scale
+        abs_norm = normalized.abs()
+        q_abs = torch.where(abs_norm > 5.0, 6.0,
+                  torch.where(abs_norm >= 3.5, 4.0,
+                  torch.where(abs_norm >= 1.75, torch.round(abs_norm),
+                                         torch.round(abs_norm * 2.0) * 0.5)))
+        return q_abs.copysign(normalized) * scale
+
+    # 非线性输出加权
+    if nonlinear_beta > 0.0:
+        H = torch.einsum('t i, t j -> i j', X.float(), X.float())
+        W_float = W.float()
+        W_H = torch.einsum('o i, i j -> o j', W_float, H)
+        w = torch.einsum('o j, o j -> o', W_float, W_H) # shape [OutDim]
+        s = (w + 1e-12) ** (nonlinear_beta / 4.0)
+    else:
+        s = torch.ones(OutDim, device=device)
         
-    abs_X_g = X_g.abs()
-    abs_W_g = W_g.abs()
+    s_view = s.view(OutDim, 1, 1) # 方便广播到 W_g 维度
     
-    base_act_mse = calc_mse_positive_inplace(abs_X_g.clone()) # [num_groups]
-    base_w_mse = calc_mse_positive_inplace(abs_W_g.clone(), gs=gs_w) # [num_groups]
-    
+    # 依然保留敏感度选取 top-k (使用简单的 norm2_X * norm2_W)
     norm2_X = (X_g.float() ** 2).sum(dim=0) # [num_groups, 16]
     norm2_W = (W_g.float() ** 2).sum(dim=0) # [num_groups, 16]
-    
-    max_X_c = abs_X_g.amax(dim=0) # [num_groups, 16]
-    median_X_c = abs_X_g.median(dim=0).values # [num_groups, 16]
-    spikiness = max_X_c / (median_X_c + 1e-12) # [num_groups, 16]
-    
-    sensitivity_c = norm2_X * norm2_W #* spikiness # [num_groups, 16]
+    sensitivity_c = norm2_X * norm2_W # [num_groups, 16]
     topk_vals, topk_idx = torch.topk(sensitivity_c, k=top_k, dim=-1) # [num_groups, top_k]
     
-    target_elements = 400_000_000 # 峰值显存控制
+    target_elements = 200_000_000 # 峰值显存控制
     max_dim = max(T, OutDim)
     chunk_G = max(1, target_elements // (max_dim * 16 * num_cands))
     
@@ -71,34 +73,47 @@ def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=3.0, group
         g_end = min(g_start + chunk_G, num_groups)
         G_curr = g_end - g_start
         
-        X_g_chunk = abs_X_g[:, g_start:g_end, :] # [T, G_curr, 16]
-        W_g_chunk = abs_W_g[:, g_start:g_end, :] # [OutDim, G_curr, 16]
+        # 使用原始有符号的 X_g 和 W_g 进行 Trace Trick 计算
+        C = X_g[:, g_start:g_end, :].float() # [T, G_curr, 16]
+        D_unscaled = W_g[:, g_start:g_end, :].float() # [OutDim, G_curr, 16]
+        D = D_unscaled * s_view
+        
         topk_idx_chunk = topk_idx[g_start:g_end] # [G_curr, top_k]
         
-        b_act = base_act_mse[g_start:g_end].unsqueeze(0) + 1e-12
-        b_w = base_w_mse[g_start:g_end].unsqueeze(0) + 1e-12
+        # 预计算当前 chunk 的常量 Trace 矩阵
+        CC = torch.einsum('t g i, t g j -> g i j', C, C)
+        DD = torch.einsum('o g i, o g j -> g i j', D, D)
+        term3 = (CC * DD).sum(dim=(-1, -2)) # [G_curr]
         
         # 本地维护最优的 Scale 矩阵
         local_S = torch.ones((G_curr, group_size), device=device)
         
         for r in range(num_rounds):
             for k in range(top_k):
-                # temp_S 继承当前的最佳 scale [num_cands, G_curr, 16]
                 temp_S = local_S.unsqueeze(0).expand(num_cands, G_curr, group_size).clone()
                 
-                # 针对第 k 个目标通道，替换为 21 个候选值
                 target_ch_idx = topk_idx_chunk[:, k] # [G_curr]
                 c_expanded = candidates.unsqueeze(1).expand(num_cands, G_curr)
                 idx_expanded = target_ch_idx.unsqueeze(0).unsqueeze(-1).expand(num_cands, G_curr, 1)
                 temp_S.scatter_(2, idx_expanded, c_expanded.unsqueeze(-1))
                 
-                X_temp = X_g_chunk.unsqueeze(0) * temp_S.unsqueeze(1) # [21, T, G_curr, 16]
-                W_temp = W_g_chunk.unsqueeze(0) / temp_S.unsqueeze(1) # [21, OutDim, G_curr, 16]
+                X_temp = C.unsqueeze(0) * temp_S.unsqueeze(1) # [21, T, G_curr, 16]
+                W_temp = D_unscaled.unsqueeze(0) / temp_S.unsqueeze(1) # [21, OutDim, G_curr, 16]
                 
-                act_mse = calc_mse_positive_inplace(X_temp) # [21, G_curr]
-                w_mse = calc_mse_positive_inplace(W_temp, gs=gs_w) # [21, G_curr]
+                A = quantize_nvfp4(X_temp).float() # X_q: [21, T, G_curr, 16]
+                W_q = quantize_nvfp4(W_temp, gs=gs_w).float() # W_q
+                B = W_q * s_view.unsqueeze(0) # [21, OutDim, G_curr, 16]
                 
-                score = (act_mse / b_act) + weight_mse_ratio * (w_mse / b_w) # [21, G_curr]
+                # Trace Trick 运算
+                AA = torch.einsum('v t g i, v t g j -> v g i j', A, A)
+                BB = torch.einsum('v o g i, v o g j -> v g i j', B, B)
+                AC = torch.einsum('v t g i, t g j -> v g i j', A, C)
+                DB = torch.einsum('o g i, v o g j -> v g i j', D, B)
+                
+                term1 = (AA * BB).sum(dim=(-1, -2)) # [21, G_curr]
+                term2 = -2.0 * (AC * DB.transpose(-1, -2)).sum(dim=(-1, -2)) # [21, G_curr]
+                
+                score = term1 + term2 + term3.unsqueeze(0) # [21, G_curr]
                 
                 # 取得 21 个候选中的最低分数及其索引
                 min_score, min_idx = score.min(dim=0) # [G_curr]
@@ -117,6 +132,6 @@ def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=3.0, group
     max_s = S_out.max().item()
     pct_high = (S_out > 1.2).float().mean().item() * 100
     pct_low = (S_out < 0.8).float().mean().item() * 100
-    print(f"      [Coord Descent Search] S_g Dist: Mean={mean_s:.3f}, Min={min_s:.3f}, Max={max_s:.3f} | >1.2: {pct_high:.1f}%, <0.8: {pct_low:.1f}%")
+    print(f"      [Coord Descent Trace] S_g Dist: Mean={mean_s:.3f}, Min={min_s:.3f}, Max={max_s:.3f} | >1.2: {pct_high:.1f}%, <0.8: {pct_low:.1f}%")
     
     return S_out
