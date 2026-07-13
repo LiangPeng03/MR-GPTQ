@@ -11,6 +11,8 @@ MODEL2="meta-llama/Llama-2-7b-hf"
 MODEL3="meta-llama/Meta-Llama-3-8B"
 MODEL4="Qwen/Qwen3-0.6B"
 MODEL5="Qwen/Qwen3-8B"
+MODEL6="meta-llama/Llama-3.2-1B"
+MODEL7="Qwen/Qwen3-1.7B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
@@ -39,8 +41,8 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --kmeans_act_alpha 0 \
     --show_act_mse \
     --eval_perplexity \
-    # --eval_openllm \
-    # --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge \
+    --eval_openllm \
+    --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge \
     # --lm_eval_tasks piqa winogrande \
     # --lm_eval_tasks piqa arc_challenge winogrande \
 

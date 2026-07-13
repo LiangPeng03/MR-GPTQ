@@ -327,7 +327,14 @@ def gptq_quantization(
                             act_caches[name] = []
                         # Collect up to 16 sequences to estimate P95 without OOM
                         if len(act_caches[name]) < 16:
-                            act_caches[name].append(inp[0].detach().cpu().float().abs().view(-1, inp[0].shape[-1]))
+                            val = inp[0].detach().float()
+                            
+                            # --- NEW: Apply transform on GPU if mr_kmeans before taking abs ---
+                            if getattr(args, "transform_order", "kmeans_mr") == "mr_kmeans" and getattr(args, "transform_class", "identity") != "identity":
+                                temp_transform = build_transform(args.transform_class, size=val.shape[-1], **transform_kwargs).to(val.device)
+                                val = temp_transform(val)
+                                
+                            act_caches[name].append(val.abs().cpu().view(-1, val.shape[-1]))
                     return _hook
 
                 resort_hooks.append(block.self_attn.q_proj.register_forward_hook(hook_factory("qkv")))
@@ -366,11 +373,19 @@ def gptq_quantization(
                     w = block.mlp.down_proj.weight
                 else:
                     return None
-                return w.float()
+                w = w.float()
+                
+                # --- NEW: Apply transform if mr_kmeans ---
+                if getattr(args, "transform_order", "kmeans_mr") == "mr_kmeans" and getattr(args, "transform_class", "identity") != "identity":
+                    temp_transform = build_transform(args.transform_class, size=w.shape[1], **transform_kwargs).to(w.device)
+                    w = temp_transform(w, inv_t=True)
+                
+                return w
 
             act_means = {}
             for name, caches in list(act_caches.items()):
                 X = torch.cat(caches, dim=0) # (N_tokens, Dim)
+                
                 if args.channel_resort == "stagger":
                     import math
                     threshold_A = torch.quantile(X.abs().float(), 0.9375, dim=1, keepdim=True)
@@ -886,11 +901,19 @@ def gptq_quantization(
             
             def build_composite_with_gics(name, base_transform):
                 transforms_list = []
+                order = getattr(args, "transform_order", "kmeans_mr")
+                
+                if order == "mr_kmeans":
+                    transforms_list.append(base_transform)
+                    
                 if name in resort_perms:
                     transforms_list.append(PermutationTransform(resort_perms[name]))
                 if hasattr(block, "gics_scales") and name in block.gics_scales:
                     transforms_list.append(DiagonalScaleTransform(block.gics_scales[name]))
-                transforms_list.append(base_transform)
+                    
+                if order == "kmeans_mr":
+                    transforms_list.append(base_transform)
+                    
                 return CompositeTransform(transforms_list) if len(transforms_list) > 1 else base_transform
 
             if "qkv" in resort_perms:

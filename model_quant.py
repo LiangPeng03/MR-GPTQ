@@ -160,6 +160,14 @@ def parse_args():
         help="Number of calibration sequences."
     )
     # Quantization params
+
+    parser.add_argument(
+        "--transform_order",
+        type=str,
+        default="kmeans_mr",
+        choices=["kmeans_mr", "mr_kmeans"],
+        help="Ordering of transformations when combining MR and KMeans channel resort",
+    )
     parser.add_argument(
         "--format",
         type=str,
@@ -421,11 +429,8 @@ def parse_args():
         assert args.w_bits == 4, "`export_quantization` is only supported for 4 bit weights."
         assert args.a_bits == 4, "`export_quantization` is only supported for 4 bit activations."
         
-    if args.format == "nvfp" and args.channel_resort in ["minmax", "stagger", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
-        if args.transform_class != "identity":
-            print(f"Forcing transform_class to 'identity' since format is nvfp and channel_resort is '{args.channel_resort}'.")
-            args.transform_class = "identity"
-            
+    # Removed check that forces transform_class to identity. 
+    # We now fully support combining MR and KMeans!
     return args
 
 
