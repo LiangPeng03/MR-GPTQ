@@ -11,7 +11,9 @@ MODELS=(
     "Qwen/Qwen3-0.6B"
     "Qwen/Qwen3-8B"
     "meta-llama/Meta-Llama-3-8B"
-    "meta-llama/Llama-2-7b-hf"
+    # "meta-llama/Llama-2-7b-hf"
+    "meta-llama/Llama-3.2-1B"
+    "Qwen/Qwen3-1.7B"
 )
 
 # 屏蔽冗余 Warning 和日志

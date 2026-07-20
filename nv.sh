@@ -16,7 +16,7 @@ MODEL7="Qwen/Qwen3-1.7B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL1} \
+    --model_name_or_path=${MODEL4} \
     --format=nvfp \
     --w_bits=4 \
     --a_bits=4 \
@@ -41,8 +41,8 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --kmeans_act_alpha 0 \
     --show_act_mse \
     --eval_perplexity \
-    --eval_openllm \
-    --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge \
+    # --eval_openllm \
+    # --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge \
     # --lm_eval_tasks piqa winogrande \
     # --lm_eval_tasks piqa arc_challenge winogrande \
 

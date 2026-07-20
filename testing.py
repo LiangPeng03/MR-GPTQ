@@ -150,6 +150,87 @@ def quantize_lss_only(x_groups, global_scale):
     x_q = cast_to_fp4(x_normalized)
     return x_q, scales
 
+# 方法3: 4/6 (Four Over Six) 自适应 block scale - 量化+反量化
+def quantize_4o6(x_groups, global_scale, scale_rule='mse'):
+    """
+    Four Over Six (4/6): Adaptive block scale selection for NVFP4.
+    对每个 group 同时尝试 scale=abs_max/6 (标准) 和 scale=abs_max/4，
+    按给定 rule (mse/mae/abs_max) 逐 group 择优。
+    """
+    abs_x = x_groups.abs()
+    abs_max = abs_x.amax(dim=1, keepdim=True)
+    
+    # Scale candidate 1: /6 (standard NVFP4)
+    s_6 = abs_max / 6.0
+    s_6[s_6 == 0] = 1.0
+    scales_6 = scale_to_e4m3(s_6, global_scale)
+    
+    # Scale candidate 2: /4 (four over six)
+    s_4 = abs_max / 4.0
+    s_4[s_4 == 0] = 1.0
+    scales_4 = scale_to_e4m3(s_4, global_scale)
+    
+    # Quantize using both scales
+    x_q_6 = cast_to_fp4(x_groups / scales_6)
+    x_deq_6 = x_q_6 * scales_6
+    x_q_4 = cast_to_fp4(x_groups / scales_4)
+    x_deq_4 = x_q_4 * scales_4
+    
+    # Per-group error comparison
+    if scale_rule == 'mse':
+        err_6 = ((x_groups - x_deq_6) ** 2).sum(dim=1)
+        err_4 = ((x_groups - x_deq_4) ** 2).sum(dim=1)
+    elif scale_rule == 'mae':
+        err_6 = (x_groups - x_deq_6).abs().sum(dim=1)
+        err_4 = (x_groups - x_deq_4).abs().sum(dim=1)
+    elif scale_rule == 'abs_max':
+        err_6 = (x_groups - x_deq_6).abs().max(dim=1).values
+        err_4 = (x_groups - x_deq_4).abs().max(dim=1).values
+    else:
+        raise ValueError(f"Unknown scale_rule: {scale_rule}")
+    
+    # Select better scale per group
+    select_4 = (err_4 < err_6).unsqueeze(1)
+    x_q = torch.where(select_4, x_q_4, x_q_6)
+    scales = torch.where(select_4, scales_4, scales_6)
+    
+    return x_q * scales
+
+# 方法3: 4/6 (Four Over Six) - 仅量化
+def quantize_4o6_only(x_groups, global_scale, scale_rule='mse'):
+    """仅量化，输出 (quantized_values, scales) — 真实推理路径"""
+    abs_x = x_groups.abs()
+    abs_max = abs_x.amax(dim=1, keepdim=True)
+    
+    s_6 = abs_max / 6.0
+    s_6[s_6 == 0] = 1.0
+    scales_6 = scale_to_e4m3(s_6, global_scale)
+    
+    s_4 = abs_max / 4.0
+    s_4[s_4 == 0] = 1.0
+    scales_4 = scale_to_e4m3(s_4, global_scale)
+    
+    x_q_6 = cast_to_fp4(x_groups / scales_6)
+    x_deq_6 = x_q_6 * scales_6
+    x_q_4 = cast_to_fp4(x_groups / scales_4)
+    x_deq_4 = x_q_4 * scales_4
+    
+    if scale_rule == 'mse':
+        err_6 = ((x_groups - x_deq_6) ** 2).sum(dim=1)
+        err_4 = ((x_groups - x_deq_4) ** 2).sum(dim=1)
+    elif scale_rule == 'mae':
+        err_6 = (x_groups - x_deq_6).abs().sum(dim=1)
+        err_4 = (x_groups - x_deq_4).abs().sum(dim=1)
+    elif scale_rule == 'abs_max':
+        err_6 = (x_groups - x_deq_6).abs().max(dim=1).values
+        err_4 = (x_groups - x_deq_4).abs().max(dim=1).values
+    
+    select_4 = (err_4 < err_6).unsqueeze(1)
+    x_q = torch.where(select_4, x_q_4, x_q_6)
+    scales = torch.where(select_4, scales_4, scales_6)
+    
+    return x_q, scales
+
 # 权重量化使用 MSE 搜索 (模拟真实 MR-GPTQ 行为)
 def quantize_weight_mse(w_groups, global_scale, scale_search_iters=100, max_scale_shrink_factor=0.80):
     abs_max = w_groups.abs().amax(dim=1, keepdim=True)
@@ -180,29 +261,53 @@ def quantize_weight_mse(w_groups, global_scale, scale_search_iters=100, max_scal
     
     return best_dequant
 
-# 评估函数: 计算纯激活量化误差
-def eval_quant_error_only(X, quant_fn, global_scale, group_size=16):
+# 评估函数: 计算纯激活量化误差（分批处理，节省显存）
+def eval_quant_error_only(X_list, quant_fn, global_scale, group_size=16, chunk_size=512):
+    """X_list: list of activation tensors (already on device), or a single tensor.
+    分批计算 MSE，避免一次性加载全部数据到 GPU。"""
+    total_sq_err = 0.0
+    total_n = 0
     with torch.no_grad():
-        X_groups = X.contiguous().view(-1, group_size)
-        X_q = quant_fn(X_groups, global_scale).view(X.shape)
-        mse = ((X - X_q) ** 2).mean().item()
-    return mse
+        if isinstance(X_list, torch.Tensor):
+            X_list = [X_list]
+        for X_chunk in X_list:
+            if X_chunk.numel() == 0:
+                continue
+            # 进一步切成 sub-chunks 以控制峰值显存
+            N = X_chunk.shape[0]
+            for start in range(0, N, chunk_size):
+                X_sub = X_chunk[start:start+chunk_size]
+                X_groups = X_sub.contiguous().view(-1, group_size)
+                X_q = quant_fn(X_groups, global_scale).view(X_sub.shape)
+                total_sq_err += ((X_sub - X_q) ** 2).sum().item()
+                total_n += X_sub.numel()
+    return total_sq_err / total_n if total_n > 0 else 0.0
 
-def eval_output_mse(X, W, quant_fn, global_scale_X, global_scale_W, group_size=16, chunk_size=4096):
-    N_tokens = X.shape[0]
-    total_mse = 0.0
+def eval_output_mse(X_list, W, quant_fn, global_scale_X, global_scale_W, group_size=16, chunk_size=512):
+    """X_list: list of activation tensors (already on device), or a single tensor.
+    分批计算 output MSE，避免一次性加载全部数据到 GPU。"""
+    total_sq_err = 0.0
+    total_tokens = 0
+    out_dim = W.shape[0]
     with torch.no_grad():
         W_groups = W.contiguous().view(-1, group_size)
-        # 用 MSE 搜索量化权重
+        # 用 MSE 搜索量化权重（一次性，W 单层不会太大）
         W_q = quantize_weight_mse(W_groups, global_scale_W).view(W.shape)
-        for i in range(0, N_tokens, chunk_size):
-            X_chunk = X[i:i+chunk_size]
-            Y_fp16 = X_chunk @ W.T
-            X_groups = X_chunk.contiguous().view(-1, group_size)
-            X_q = quant_fn(X_groups, global_scale_X).view(X_chunk.shape)
-            Y_q = X_q @ W_q.T
-            total_mse += ((Y_fp16 - Y_q) ** 2).sum().item()
-    return total_mse / (N_tokens * W.shape[0])
+        if isinstance(X_list, torch.Tensor):
+            X_list = [X_list]
+        for X_chunk in X_list:
+            if X_chunk.numel() == 0:
+                continue
+            N = X_chunk.shape[0]
+            for start in range(0, N, chunk_size):
+                X_sub = X_chunk[start:start+chunk_size]
+                Y_fp16 = X_sub @ W.T
+                X_groups = X_sub.contiguous().view(-1, group_size)
+                X_q = quant_fn(X_groups, global_scale_X).view(X_sub.shape)
+                Y_q = X_q @ W_q.T
+                total_sq_err += ((Y_fp16 - Y_q) ** 2).sum().item()
+                total_tokens += X_sub.shape[0]
+    return total_sq_err / (total_tokens * out_dim) if total_tokens > 0 else 0.0
 
 def main():
     parser = argparse.ArgumentParser()
@@ -244,6 +349,7 @@ def main():
     strategies = {
         "MinMax (baseline)": quantize_minmax,
         "LSS (Closed-form)": quantize_lss,
+        "4/6 (MSE)": quantize_4o6,
     }
     
     print("\n" + "=" * 110)
@@ -288,15 +394,23 @@ def main():
         
         for mat_name in matrix_names:
             if mat_name not in act_caches: continue
-            X = torch.cat(act_caches[mat_name], dim=0).to(device)
+            # 分批计算 global_scale（只需 max，逐 chunk 累积即可）
+            act_list = act_caches[mat_name]
+            act_abs_max = 0.0
+            for x_chunk in act_list:
+                am = x_chunk.abs().max().item()
+                if am > act_abs_max:
+                    act_abs_max = am
+            gs_X = (FP8_E4M3_MAX * FP4_E2M1_MAX / max(act_abs_max, 1e-15))
+            gs_X = torch.tensor([gs_X], device=device)
+            
             W = get_combined_weight(block, mat_name).to(device)
-            gs_X = compute_global_scale(X)
             gs_W = compute_global_scale(W)
             
             baseline_results = {}
             for strat_name, quant_fn in strategies.items():
-                act_mse = eval_quant_error_only(X, quant_fn, gs_X)
-                out_mse_wa = eval_output_mse(X, W, quant_fn, gs_X, gs_W)
+                act_mse = eval_quant_error_only(act_list, quant_fn, gs_X)
+                out_mse_wa = eval_output_mse(act_list, W, quant_fn, gs_X, gs_W)
                 
                 if strat_name == "MinMax (baseline)":
                     baseline_results = {"act": act_mse, "out_wa": out_mse_wa}
@@ -305,8 +419,11 @@ def main():
                     act_pct = (act_mse - baseline_results["act"]) / (baseline_results["act"] + 1e-15) * 100
                     outwa_pct = (out_mse_wa - baseline_results["out_wa"]) / (baseline_results["out_wa"] + 1e-15) * 100
                     print(f"{'':5} | {'':8} | {strat_name:<18} | {act_mse:.6e} ({act_pct:+.1f}%) | {out_mse_wa:.6e} ({outwa_pct:+.1f}%)")
-            del X, W
+            del W, act_list
             torch.cuda.empty_cache()
+        # 清空 activation caches
+        for k in list(act_caches.keys()):
+            act_caches[k] = None
         del act_caches
         
         for i in range(len(input_args)):
@@ -319,12 +436,11 @@ def main():
         block = block.cpu()
         torch.cuda.empty_cache()
     
-    # ========== 性能基准测试 ==========
+    # ========== 性能基准测试 (真实推理路径: 仅量化, 输出 scale + 量化值) ==========
     timing_strategies = {
-        "MinMax (Q+DQ)": quantize_minmax,
         "MinMax (Q only)": quantize_minmax_only,
-        "LSS (Q+DQ)": quantize_lss,
         "LSS (Q only)": quantize_lss_only,
+        "4/6 (Q only)": quantize_4o6_only,
     }
     
     dummy_x = torch.randn(4096 * 4096, device=device, dtype=torch.bfloat16).view(-1, 16)
@@ -333,46 +449,14 @@ def main():
     dummy_global_scale = torch.tensor([1.0], device=device)
     tensor_size_gb = dummy_x.numel() * dummy_x.element_size() / (1024**3)
     
-    # --- 量化+反量化 时间对比 ---
-    print("\n" + "=" * 110)
-    print("Performance Benchmark: Quantize + Dequantize (on a large dummy matrix)")
-    print("-" * 110)
-    print(f"{'Strategy':<18} | {'Exec Time (ms)':<15} | {'Peak Extra Mem (MB)':<20} | {'Throughput (GB/s)'}")
-    print("-" * 110)
-    
-    for strat_name in ["MinMax (Q+DQ)", "LSS (Q+DQ)"]:
-        quant_fn = timing_strategies[strat_name]
-        for _ in range(5):
-            _ = quant_fn(dummy_x, dummy_global_scale)
-        torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        torch.cuda.reset_peak_memory_stats()
-        mem_before = torch.cuda.memory_allocated()
-        
-        start_event.record()
-        for _ in range(20):
-            res = quant_fn(dummy_x, dummy_global_scale)
-        end_event.record()
-        torch.cuda.synchronize()
-        
-        time_ms = start_event.elapsed_time(end_event) / 20.0
-        peak_mem = torch.cuda.max_memory_allocated() - mem_before
-        peak_mem_mb = peak_mem / (1024 * 1024)
-        throughput = tensor_size_gb / (time_ms / 1000.0)
-        
-        print(f"{strat_name:<18} | {time_ms:>13.3f}   | {peak_mem_mb:>17.2f}    | {throughput:>14.2f}")
-        del res
-        torch.cuda.empty_cache()
-    
-    # --- 仅量化 时间对比 ---
+    # --- 真实推理路径性能对比 (Quantize Only) ---
     print("\n" + "=" * 110)
     print("Performance Benchmark: Quantize Only (output scale + quantized values)")
     print("-" * 110)
     print(f"{'Strategy':<18} | {'Exec Time (ms)':<15} | {'Peak Extra Mem (MB)':<20} | {'Throughput (GB/s)'}")
     print("-" * 110)
     
-    for strat_name in ["MinMax (Q only)", "LSS (Q only)"]:
+    for strat_name in ["MinMax (Q only)", "LSS (Q only)", "4/6 (Q only)"]:
         quant_fn = timing_strategies[strat_name]
         for _ in range(5):
             _ = quant_fn(dummy_x, dummy_global_scale)
@@ -391,7 +475,7 @@ def main():
         time_ms = start_event.elapsed_time(end_event) / 20.0
         peak_mem = torch.cuda.max_memory_allocated() - mem_before
         peak_mem_mb = peak_mem / (1024 * 1024)
-        throughput = tensor_size_gb / (time_ms / 1000.0)
+        throughput = tensor_size_gb / (time_ms / 1000.0) if time_ms > 0 else 0.0
         
         print(f"{strat_name:<18} | {time_ms:>13.3f}   | {peak_mem_mb:>17.2f}    | {throughput:>14.2f}")
         del res
