@@ -1,10 +1,14 @@
 #!/bin/bash
 
+export HF_ALLOW_CODE_EVAL="1"
+export HF_DATASETS_TRUST_REMOTE_CODE="1"
+
 gpu_id=1
 export CUDA_VISIBLE_DEVICES=$gpu_id
 
 export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
+export HF_DATASETS_TRUST_REMOTE_CODE=1
 
 MODEL1="HuggingFaceTB/SmolLM2-135M"
 MODEL2="meta-llama/Llama-2-7b-hf"
@@ -16,10 +20,10 @@ MODEL7="Qwen/Qwen3-1.7B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL4} \
+    --model_name_or_path=${MODEL5} \
     --format=nvfp \
-    --w_bits=4 \
-    --a_bits=4 \
+    --w_bits=16 \
+    --a_bits=16 \
     --seed=0 \
     --w_group_size=16 \
     --a_group_size=16 \
@@ -41,8 +45,7 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --kmeans_act_alpha 0 \
     --show_act_mse \
     --eval_perplexity \
-    # --eval_openllm \
-    # --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge \
-    # --lm_eval_tasks piqa winogrande \
-    # --lm_eval_tasks piqa arc_challenge winogrande \
-
+    --eval_openllm \
+    --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge \
+    # --lm_eval_tasks mmlu mbpp arc_easy lambada_openai \
+    

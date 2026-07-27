@@ -3,6 +3,10 @@ import json
 import argparse
 import warnings
 from functools import partial
+import logging
+
+logging.getLogger("lm_eval").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 import torch
 from safetensors.torch import save_file
@@ -26,6 +30,8 @@ except ImportError:
 from src.metrics.perplexity import compute_perplexity
 from src.transforms.transforms import TRANSFORMS
 from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE
+import os
+os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 from src.quantization.qconfig import prepare_quantization_config
 from src.quantization import rtn_quantization, gptq_quantization
 from src.utils.common_utils import fix_seed
@@ -356,7 +362,7 @@ def parse_args():
     parser.add_argument("--lock_global_scale", action="store_true", help="whether to lock the NVFP4 global scale to the original FP16 weights.")
     # Eval params
     parser.add_argument("--eval_perplexity", action="store_true", help="whether to eval perplexity after quantization.")
-    parser.add_argument("--eval_openllm", action="store_true", help="whether to eval OpenLLM v1 openllm after quantization.")
+    parser.add_argument('--eval_openllm', action='store_true', help='Evaluate using lm-eval on standard tasks')
     parser.add_argument(
         "--limit",
         type=int,
@@ -610,7 +616,7 @@ def main():
                 batch_size=batch_size,
                 max_length=2048,
             )
-            eval_kwargs = {"model": lm, "tasks": [task_name], "num_fewshot": num_fewshot}
+            eval_kwargs = {"model": lm, "tasks": [task_name], "num_fewshot": num_fewshot, "confirm_run_unsafe_code": True}
             if limit is not None:
                 eval_kwargs["limit"] = limit
             eval_kwargs.update(extra_kwargs)
@@ -625,6 +631,9 @@ def main():
         # Winogrande (5-shot) - Can handle larger batch
         if "winogrande" in args.lm_eval_tasks:
             _run_task("winogrande", num_fewshot=5, batch_size=64, limit=args.limit)
+        # SingleEq (Single-step arithmetic operations)
+        if "singleeq" in args.lm_eval_tasks:
+            _run_task("singleeq", num_fewshot=5, batch_size=16, limit=args.limit)
         # Hellaswag (10-shot) - Medium batch, limit=400 (four-over-six convention)
         if "hellaswag" in args.lm_eval_tasks:
             _run_task("hellaswag", num_fewshot=10, batch_size=8, limit=400)
@@ -637,12 +646,37 @@ def main():
         # BoolQ (0-shot) - Passages are long, use smaller batch
         if "boolq" in args.lm_eval_tasks:
             _run_task("boolq", num_fewshot=0, batch_size=8, limit=args.limit)
-        # GSM8K (requires chat template)
+        # GSM8K (requires chat template for llama specific version)
         if "gsm8k_llama" in args.lm_eval_tasks:
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
                 _run_task("gsm8k_llama", apply_chat_template=True, fewshot_as_multiturn=True, batch_size=8, limit=args.limit)
             else:
                 print("Skipping gsm8k_llama: no chat template.")
+        # Standard GSM8K (5-shot)
+        if "gsm8k" in args.lm_eval_tasks and "gsm8k_llama" not in args.lm_eval_tasks:
+            _run_task("gsm8k", num_fewshot=5, batch_size=16, limit=args.limit)
+        # MMLU (5-shot)
+        if "mmlu" in args.lm_eval_tasks:
+            _run_task("mmlu", num_fewshot=5, batch_size=4, limit=200)
+        # SQuAD V2 (1-shot is common)
+        if "squadv2" in args.lm_eval_tasks:
+            _run_task("squadv2", num_fewshot=1, batch_size=4, limit=args.limit)
+        # DROP (3-shot is common)
+        if "drop" in args.lm_eval_tasks:
+            _run_task("drop", num_fewshot=3, batch_size=4, limit=args.limit)
+        # MathQA (5-shot)
+        if "mathqa" in args.lm_eval_tasks:
+            _run_task("mathqa", num_fewshot=5, batch_size=4, limit=args.limit)        # ARC Easy (25-shot)
+        if "arc_easy" in args.lm_eval_tasks:
+            _run_task("arc_easy", num_fewshot=25, batch_size=8, limit=4000)
+        # MBPP (3-shot)
+        if "mbpp" in args.lm_eval_tasks:
+            _run_task("mbpp", num_fewshot=3, batch_size=16, limit=args.limit)
+        # Lambada (0-shot)
+        if "lambada_openai" in args.lm_eval_tasks or "lambada" in args.lm_eval_tasks:
+            task_name = "lambada_openai" if "lambada_openai" in args.lm_eval_tasks else "lambada"
+            _run_task(task_name, num_fewshot=0, batch_size=16, limit=args.limit)
+            
         # MMLU CoT (requires chat template)
         if "mmlu_cot_llama" in args.lm_eval_tasks:
             if hasattr(tokenizer, 'chat_template') and tokenizer.chat_template is not None:
@@ -659,23 +693,27 @@ def main():
 
         # [NEW] Robust summary for scripts
         def get_best_metric(res_dict):
-            # Try to find any key containing 'acc' (e.g., 'acc,none', 'acc_norm,none')
-            acc_keys = [k for k in res_dict.keys() if 'acc' in k]
-            if not acc_keys: return None
-            # Prioritize 'acc_norm' over 'acc'
-            norm_keys = [k for k in acc_keys if 'norm' in k]
-            target_key = norm_keys[0] if norm_keys else acc_keys[0]
-            return res_dict.get(target_key)
+            keys = list(res_dict.keys())
+            for target in ["pass@1", "exact_match", "acc_norm", "acc", "f1", "word_perplexity", "byte_perplexity"]:
+                matches = [k for k in keys if target in k]
+                if matches:
+                    return res_dict.get(matches[0])
+            return list(res_dict.values())[0] if res_dict else None
+
+        filtered_results = {}
+        for task, res in results.items():
+            if task.startswith("mmlu_") and task not in args.lm_eval_tasks:
+                continue
+            filtered_results[task] = get_best_metric(res)
 
         summary = {
             "model": args.model_name_or_path,
             "wikitext2_ppl": wikitext2_ppl,
             "c4_ppl": c4_ppl,
-            "results": {task: get_best_metric(res) for task, res in results.items()}
+            "results": filtered_results
         }
         import json
         print(f"\n[RESULT_SUMMARY] {json.dumps(summary)}")
-
 
 if __name__ == "__main__":
     main()
