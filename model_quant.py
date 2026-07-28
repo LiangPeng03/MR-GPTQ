@@ -211,7 +211,7 @@ def parse_args():
         "--w_observer",
         type=str,
         default="minmax",
-        choices=["minmax", "mse"],
+        choices=["minmax", "mse", "mse_n"],
         help="Weight observer.",
     )
     parser.add_argument(

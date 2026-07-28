@@ -115,6 +115,27 @@ class Quantizer:
             zeros = -(x_min / scales).round()
 
         if self.observer == QuantizationObserver.MSE:
+            # MSE observer: scale_shrink_factor searches from 1.0 to 0.2
+            init_scales = scales.clone() 
+            best_quantization_error = torch.full(x.shape[:-1], float("inf"), device=x.device, dtype=x.dtype)
+
+            for i in range(scale_search_iters):
+                scale_shrink_factor = 1.0 - i * 0.8 / scale_search_iters
+                candidate_scales = scale_shrink_factor * init_scales
+                candidate_zeros = torch.zeros_like(x_min) if self.symmetric else -(x_min / candidate_scales).round() 
+                q = self.quant_fn(x, candidate_scales, candidate_zeros, self.q_min, self.q_max)
+                x_reconstructed = self.dequant_fn(q, candidate_scales, candidate_zeros)
+                quantization_error = (x - x_reconstructed).abs_().pow_(error_norm).sum(dim=-1)
+
+                if (quantization_error < best_quantization_error).any():
+                    improved_ids = torch.where(quantization_error < best_quantization_error)
+                    best_quantization_error[improved_ids] = quantization_error[improved_ids]
+                    scales[improved_ids] = candidate_scales[improved_ids]
+                    if not self.symmetric:
+                        zeros[improved_ids] = candidate_zeros[improved_ids]
+
+        elif self.observer == QuantizationObserver.MSE_N:
+            # MSE_N observer: scale_shrink_factor searches from 1.1 to 0.5
             init_scales = scales.clone() 
             best_quantization_error = torch.full(x.shape[:-1], float("inf"), device=x.device, dtype=x.dtype)
 

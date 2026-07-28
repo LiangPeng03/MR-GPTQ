@@ -1,22 +1,21 @@
 #!/bin/bash
-# GPTQ (identity) vs MR-GPTQ (hadamard) comparison script
-# Matches four-over-six evaluation: W4A4 NVFP4, all 7 downstream tasks, all 5 models
-# Usage: bash compare.sh [GPU_IDS]
+# GPTQ (identity) vs MR-GPTQ (hadamard) comparison on MDS downstream tasks
+# Tasks: gsm8k, mmlu, arc_easy, mbpp, lambada_openai
+# Usage: bash compare_mds.sh [GPU_IDS]
 # Examples:
-#   bash compare.sh 0,1      # dual GPU (default)
-#   bash compare.sh 1,2      # dual GPU (other cards)
+#   bash compare_mds.sh 0,1      # dual GPU (default)
+#   bash compare_mds.sh 1,2      # dual GPU (other cards)
 
 # --- 配置区 ---
 GPU_IDS=${1:-0,1}
 IFS=',' read -ra GPUS <<< "$GPU_IDS"
 NUM_GPUS=${#GPUS[@]}
 
-LOG_FILE="compare_gptq_mr-gptq.log"
+LOG_FILE="compare_mds.log"
 PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
 MODELS=(
     "HuggingFaceTB/SmolLM2-135M"
-    # "meta-llama/Llama-2-7b-hf"
     "meta-llama/Meta-Llama-3-8B"
     "Qwen/Qwen3-0.6B"
     "Qwen/Qwen3-8B"
@@ -36,6 +35,8 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
 export TRANSFORMERS_VERBOSITY=error
 export TOKENIZERS_PARALLELISM=false
 export PYTHONWARNINGS="ignore"
+export HF_ALLOW_CODE_EVAL="1"
+export HF_DATASETS_TRUST_REMOTE_CODE="1"
 
 # --- Inline Python helper to parse [RESULT_SUMMARY] ---
 parse_results() {
@@ -55,24 +56,24 @@ def fmt(v, p):
         return 'N/A'
     return f'{v:.{p}f}'
 
-wiki = d.get('wikitext2_ppl')
-c4   = d.get('c4_ppl')
-piqa = get_metric('piqa')
-arc  = get_metric('arc_challenge')
-hella = get_metric('hellaswag')
-wino = get_metric('winogrande')
-boolq = get_metric('boolq')
+wiki  = d.get('wikitext2_ppl')
+c4    = d.get('c4_ppl')
+gsm8k = get_metric('gsm8k')
+mmlu  = get_metric('mmlu')
+arc_e = get_metric('arc_easy')
+mbpp  = get_metric('mbpp')
+lamb  = get_metric('lambada_openai')
 
-print(f'{fmt(wiki,3)} | {fmt(c4,3)} | {fmt(piqa,4)} | {fmt(arc,4)} | {fmt(hella,4)} | {fmt(wino,4)} | {fmt(boolq,4)}')
+print(f'{fmt(wiki,3)} | {fmt(c4,3)} | {fmt(gsm8k,5)} | {fmt(mmlu,5)} | {fmt(arc_e,5)} | {fmt(mbpp,5)} | {fmt(lamb,5)}')
 "
 }
 
 # --- Initialize log file ---
 echo "" >> $LOG_FILE
 echo "==========================================================" >> $LOG_FILE
-echo "GPTQ vs MR-GPTQ Comparison Started at: $(date) on GPUs: $GPU_IDS" >> $LOG_FILE
+echo "GPTQ vs MR-GPTQ (MDS Tasks) Started at: $(date) on GPUs: $GPU_IDS" >> $LOG_FILE
 printf "%-30s | %-12s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s\n" \
-    "Model" "Transform" "W-PPL" "C4-PPL" "PIQA" "ARC-C" "Hella" "WINO" "BoolQ" >> $LOG_FILE
+    "Model" "Transform" "W-PPL" "C4-PPL" "GSM8K" "MMLU" "ARC-E" "MBPP" "LAMBADA" >> $LOG_FILE
 echo "----------------------------------------------------------" >> $LOG_FILE
 
 # --- Build task list ---
@@ -97,11 +98,7 @@ for (( i=0; i<${#TASKS[@]}; i++ )); do
     (
         export CUDA_VISIBLE_DEVICES=$GPU_ID
 
-        # Safety: install required transformers for Qwen3 if not already present
-        # (uncomment if qwen3 models fail to load)
-        # pip install transformers>=4.51.0 -q
-
-        tmp="tmp_eval_${TRANSFORM}_${GPU_ID}_$$.out"
+        tmp="tmp_mds_eval_${TRANSFORM}_${GPU_ID}_$$.out"
         $PYTHON_BIN model_quant.py \
             --model_name_or_path="$MODEL" \
             --format=nvfp \
@@ -123,7 +120,7 @@ for (( i=0; i<${#TASKS[@]}; i++ )); do
             --fuse_global_scale \
             --eval_perplexity \
             --eval_openllm \
-            --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge \
+            --lm_eval_tasks gsm8k mmlu arc_easy mbpp lambada_openai \
             > "$tmp" 2>&1
 
         if [ $? -ne 0 ]; then
