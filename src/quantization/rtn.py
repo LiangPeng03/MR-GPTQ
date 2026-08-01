@@ -87,13 +87,15 @@ def rtn_quantization(
         # === 0. Resonance-Aware Channel Reordering & Global Scale Lock ===
         resort_perms = {}
         do_channel_resort = getattr(args, "channel_resort", "none") != "none"
+        do_channel_rescale = getattr(args, "channel_rescale", "none") != "none"
         do_lock_global_scale = args.scale_precision in ["e4m3", ScalePrecision.E4M3] and getattr(args, "lock_global_scale", False)
         
         if do_lock_global_scale:
             print(f"  [DEBUG] lock_global_scale is ACTIVE for block {block_idx}!")
             
         fp16_act_global_max = {}
-        if (do_channel_resort or do_lock_global_scale) and need_calibration:
+        need_act_stats = do_channel_resort or do_channel_rescale or do_lock_global_scale
+        if need_act_stats and need_calibration:
             act_caches = {}
             resort_hooks = []
             lock_hooks = []
@@ -112,9 +114,9 @@ def rtn_quantization(
                     if isinstance(layer, torch.nn.Linear) or type(layer).__name__ == "QLinear":
                         lock_hooks.append(layer.register_forward_hook(lock_hook_factory(layer_name)))
             
-            if do_channel_resort:
+            if do_channel_resort or do_channel_rescale:
                 import numpy as np
-                print(f"  Computing resonance-aware channel permutations (Strategy: {args.channel_resort})...")
+                print(f"  Computing channel resort/scale stats (Resort: {args.channel_resort}, Rescale: {args.channel_rescale})...")
                 def hook_factory(name):
                     def _hook(_, inp, out):
                         if name not in act_caches:
@@ -180,7 +182,16 @@ def rtn_quantization(
                     act_means[name] = {"mask": joint_profile, "freq": ch_freq}
                 elif args.channel_resort in ["P95", "minmax"]:
                     act_means[name] = torch.quantile(X.float(), 0.95, dim=0).to(device)
-                elif args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
+                elif args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
+                    max_samples = 4096
+                    if X.shape[0] > max_samples:
+                        subset_idx = torch.linspace(0, X.shape[0] - 1, max_samples, dtype=torch.long, device=X.device)
+                        X_sub = X[subset_idx].float().to(device)
+                    else:
+                        X_sub = X.float().to(device)
+                    act_means[name] = X_sub
+                elif do_channel_rescale and not do_channel_resort:
+                    # GICS-only mode: still need X_sub for GICS
                     max_samples = 4096
                     if X.shape[0] > max_samples:
                         subset_idx = torch.linspace(0, X.shape[0] - 1, max_samples, dtype=torch.long, device=X.device)
@@ -484,7 +495,7 @@ def rtn_quantization(
                     N = freq.shape[0]
                     if w_norm is None:
                         w_norm = torch.ones(N, device=freq.device)
-                elif args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
+                elif args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
                     N = mean_val.shape[1]
                     if w_norm is None:
                         w_norm = torch.ones(N, device=mean_val.device)
@@ -575,9 +586,9 @@ def rtn_quantization(
                             p[i : i + h_group_size] = block_perm + i
                     resort_perms[name] = p
                     print(f"    [{name:8}] Staggered Reordering (P93.75) completed.")
-                elif args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
+                elif args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
                     W = get_combined_weight(block, name).to(device)
-                    if args.channel_resort in ["kmeans_fp4", "kmeans_fp4_top3"]:
+                    if args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_top3"]:
                         target_mat = mean_val # X_sub
                     else:
                         target_mat = W
@@ -590,7 +601,7 @@ def rtn_quantization(
                     X_abs_T = target_mat.abs().T.float()
                     
                     alpha = getattr(args, "kmeans_alpha", 0.0)
-                    if args.channel_resort in ["kmeans_fp4", "kmeans_fp4_top3"] and alpha > 0.0:
+                    if args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_top3"] and alpha > 0.0:
                         W_norm = torch.norm(W, p=2, dim=0) # Shape: (In_Features,)
                         X_norm = torch.norm(mean_val, p=2, dim=0) # Act Norm
                         # Use W_norm * X_norm to align with true output contribution
@@ -647,20 +658,45 @@ def rtn_quantization(
                     R_vals = top2_vals[:, 1] / (top2_vals[:, 0] + 1e-9)
                     print(f"    [{name:8}] Mean R after resort: {R_vals.mean():.4f}")
                     
-                if args.channel_resort == "kmeans_fp4_top3":
+                if args.channel_rescale == "gics":
                     from .gics import optimize_channel_scales_coordinate_descent
                     target_mat = mean_val # X_sub
                     W = get_combined_weight(block, name).to(device)
-                    X_perm = target_mat[:, p]
-                    W_perm = W[:, p]
+                    # Use channel permutation if available, otherwise use identity order
+                    if name in resort_perms:
+                        p_gics = resort_perms[name]
+                        X_perm = target_mat[:, p_gics]
+                        W_perm = W[:, p_gics]
+                    else:
+                        X_perm = target_mat
+                        W_perm = W
                     
-                    print(f"    [{name:8}] Running Coordinate Descent Channel Scale Search...")
-                    # Pass weight_mse_ratio=3.0 as default, matching test_kmeans.py
-                    S_top3 = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=3.0, group_size=quant_group_size, top_k=5, num_rounds=3)
+                    top_k = getattr(args, "gics_top_k", 5)
+                    num_rounds = getattr(args, "gics_num_rounds", 3)
+                    print(f"    [{name:8}] Running Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
+                    S_top3 = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=3.0, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds)
                     
                     if not hasattr(block, "gics_scales"):
                         block.gics_scales = {}
                     block.gics_scales[name] = S_top3
+
+        # === 0.5 Run GICS independently when channel_resort is off ===
+        if do_channel_rescale and not do_channel_resort:
+            from .gics import optimize_channel_scales_coordinate_descent
+            quant_group_size = args.a_group_size if args.a_group_size else 16
+            for name, mean_val in act_means.items():
+                W = get_combined_weight(block, name).to(device)
+                X_perm = mean_val  # no permutation, identity order
+                W_perm = W
+                
+                top_k = getattr(args, "gics_top_k", 5)
+                num_rounds = getattr(args, "gics_num_rounds", 3)
+                print(f"    [{name:8}] Running GICS (standalone) Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
+                S_gics = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=3.0, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds)
+                
+                if not hasattr(block, "gics_scales"):
+                    block.gics_scales = {}
+                block.gics_scales[name] = S_gics
 
         # 1. Init transforms
         qkv_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
@@ -668,7 +704,8 @@ def rtn_quantization(
         gate_up_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
         down_in_transform = build_transform(args.transform_class, size=model.config.intermediate_size, **transform_kwargs)     
 
-        if resort_perms:
+        has_resort_or_rescale = resort_perms or (hasattr(block, "gics_scales") and block.gics_scales)
+        if has_resort_or_rescale:
             from ..transforms.transforms import CompositeTransform, PermutationTransform, DiagonalScaleTransform
             
             def build_composite_with_gics(name, base_transform):
@@ -680,9 +717,9 @@ def rtn_quantization(
                 transforms_list.append(base_transform)
                 return CompositeTransform(transforms_list) if len(transforms_list) > 1 else base_transform
 
-            if "qkv" in resort_perms:
+            if "qkv" in resort_perms or (hasattr(block, "gics_scales") and "qkv" in block.gics_scales):
                 qkv_in_transform = build_composite_with_gics("qkv", qkv_in_transform)
-            if "gate_up" in resort_perms:
+            if "gate_up" in resort_perms or (hasattr(block, "gics_scales") and "gate_up" in block.gics_scales):
                 gate_up_in_transform = build_composite_with_gics("gate_up", gate_up_in_transform)
             # O: in-place permutation only for MHA (skip GQA to avoid cross-head corruption)
             if "o" in resort_perms:

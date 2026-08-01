@@ -291,6 +291,7 @@ def gptq_quantization(
         # === 0. Evaluate FP16 Block Outputs & Channel Resort Stats ===
         resort_perms = {}
         do_channel_resort = getattr(args, "channel_resort", "none") != "none"
+        do_channel_rescale = getattr(args, "channel_rescale", "none") != "none"
         do_show_act_mse = getattr(args, "show_act_mse", False)
         
         do_lock_global_scale = args.scale_precision in ["e4m3", ScalePrecision.E4M3] and getattr(args, "lock_global_scale", False)
@@ -299,7 +300,9 @@ def gptq_quantization(
         
         orig_block_outputs = None
         fp16_act_global_max = {}
-        if do_channel_resort or do_show_act_mse or do_lock_global_scale:
+        # Need activation stats if: channel_resort, channel_rescale (GICS needs X_sub), show_act_mse, or lock_global_scale
+        need_act_stats = do_channel_resort or do_channel_rescale or do_show_act_mse or do_lock_global_scale
+        if need_act_stats:
             act_caches = {}
             resort_hooks = []
             lock_hooks = []
@@ -318,9 +321,9 @@ def gptq_quantization(
                     if isinstance(layer, torch.nn.Linear) or type(layer).__name__ == "QLinear":
                         lock_hooks.append(layer.register_forward_hook(lock_hook_factory(layer_name)))
             
-            if do_channel_resort:
+            if do_channel_resort or do_channel_rescale:
                 import numpy as np
-                print(f"  Computing resonance-aware channel permutations (Strategy: {args.channel_resort})...")
+                print(f"  Computing channel resort/scale stats (Resort: {args.channel_resort}, Rescale: {args.channel_rescale})...")
                 def hook_factory(name):
                     def _hook(_, inp, out):
                         if name not in act_caches:
@@ -361,7 +364,7 @@ def gptq_quantization(
             if do_lock_global_scale:
                 for h in lock_hooks: h.remove()
             
-        if do_channel_resort:
+        if do_channel_resort or do_channel_rescale:
             def get_combined_weight(block, name):
                 if name == "qkv":
                     w = torch.cat([block.self_attn.q_proj.weight, block.self_attn.k_proj.weight, block.self_attn.v_proj.weight], dim=0)
@@ -408,7 +411,16 @@ def gptq_quantization(
                     act_means[name] = {"mask": joint_profile, "freq": ch_freq}
                 elif args.channel_resort in ["P95", "minmax"]:
                     act_means[name] = torch.quantile(X.float(), 0.95, dim=0).to(device)
-                elif args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
+                elif args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
+                    max_samples = 4096
+                    if X.shape[0] > max_samples:
+                        subset_idx = torch.linspace(0, X.shape[0] - 1, max_samples, dtype=torch.long, device=X.device)
+                        X_sub = X[subset_idx].float().to(device)
+                    else:
+                        X_sub = X.float().to(device)
+                    act_means[name] = X_sub
+                elif do_channel_rescale and not do_channel_resort:
+                    # GICS-only mode: still need X_sub for GICS
                     max_samples = 4096
                     if X.shape[0] > max_samples:
                         subset_idx = torch.linspace(0, X.shape[0] - 1, max_samples, dtype=torch.long, device=X.device)
@@ -712,7 +724,7 @@ def gptq_quantization(
                     N = freq.shape[0]
                     if w_norm is None:
                         w_norm = torch.ones(N, device=freq.device)
-                elif args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
+                elif args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
                     N = mean_val.shape[1]
                     if w_norm is None:
                         w_norm = torch.ones(N, device=mean_val.device)
@@ -803,9 +815,9 @@ def gptq_quantization(
                             p[i : i + h_group_size] = block_perm + i
                     resort_perms[name] = p
                     print(f"    [{name:8}] Staggered Reordering (P93.75) completed.")
-                elif args.channel_resort in ["kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
+                elif args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
                     W = get_combined_weight(block, name).to(device)
-                    if args.channel_resort in ["kmeans_fp4", "kmeans_fp4_top3"]:
+                    if args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_top3"]:
                         target_mat = mean_val # X_sub
                     else:
                         target_mat = W
@@ -818,7 +830,7 @@ def gptq_quantization(
                     X_abs_T = target_mat.abs().T.float()
                     
                     alpha = getattr(args, "kmeans_alpha", 0.0)
-                    if args.channel_resort in ["kmeans_fp4", "kmeans_fp4_top3"] and alpha > 0.0:
+                    if args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_top3"] and alpha > 0.0:
                         W_norm = torch.norm(W, p=2, dim=0) # Shape: (In_Features,)
                         X_norm = torch.norm(mean_val, p=2, dim=0) # Act Norm
                         # Use W_norm * X_norm to align with true output contribution
@@ -875,20 +887,45 @@ def gptq_quantization(
                     R_vals = top2_vals[:, 1] / (top2_vals[:, 0] + 1e-9)
                     print(f"    [{name:8}] Mean R after resort: {R_vals.mean():.4f}")
 
-                if args.channel_resort == "kmeans_fp4_top3":
+                if args.channel_rescale == "gics":
                     from .gics import optimize_channel_scales_coordinate_descent
                     target_mat = mean_val # X_sub
                     W = get_combined_weight(block, name).to(device)
-                    X_perm = target_mat[:, p]
-                    W_perm = W[:, p]
+                    # Use channel permutation if available, otherwise use identity order
+                    if name in resort_perms:
+                        p_gics = resort_perms[name]
+                        X_perm = target_mat[:, p_gics]
+                        W_perm = W[:, p_gics]
+                    else:
+                        X_perm = target_mat
+                        W_perm = W
                     
-                    print(f"    [{name:8}] Running Coordinate Descent Channel Scale Search...")
-                    # Pass weight_mse_ratio=3.0 as default, matching test_kmeans.py
-                    S_top3 = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=1, group_size=quant_group_size, top_k=5, num_rounds=3)
+                    top_k = getattr(args, "gics_top_k", 5)
+                    num_rounds = getattr(args, "gics_num_rounds", 3)
+                    print(f"    [{name:8}] Running Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
+                    S_top3 = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=1, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds)
                     
                     if not hasattr(block, "gics_scales"):
                         block.gics_scales = {}
                     block.gics_scales[name] = S_top3
+
+        # === 0.5 Run GICS independently when channel_resort is off ===
+        if do_channel_rescale and not do_channel_resort:
+            from .gics import optimize_channel_scales_coordinate_descent
+            quant_group_size = args.a_group_size if args.a_group_size else 16
+            for name, mean_val in act_means.items():
+                W = get_combined_weight(block, name).to(device)
+                X_perm = mean_val  # no permutation, identity order
+                W_perm = W
+                
+                top_k = getattr(args, "gics_top_k", 5)
+                num_rounds = getattr(args, "gics_num_rounds", 3)
+                print(f"    [{name:8}] Running GICS (standalone) Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
+                S_gics = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=1, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds)
+                
+                if not hasattr(block, "gics_scales"):
+                    block.gics_scales = {}
+                block.gics_scales[name] = S_gics
 
         # 1. Init transforms
         qkv_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
@@ -896,7 +933,8 @@ def gptq_quantization(
         gate_up_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
         down_in_transform = build_transform(args.transform_class, size=model.config.intermediate_size, **transform_kwargs)     
 
-        if resort_perms:
+        has_resort_or_rescale = resort_perms or (hasattr(block, "gics_scales") and block.gics_scales)
+        if has_resort_or_rescale:
             from ..transforms.transforms import CompositeTransform, PermutationTransform, DiagonalScaleTransform
             
             def build_composite_with_gics(name, base_transform):
@@ -916,9 +954,9 @@ def gptq_quantization(
                     
                 return CompositeTransform(transforms_list) if len(transforms_list) > 1 else base_transform
 
-            if "qkv" in resort_perms:
+            if "qkv" in resort_perms or (hasattr(block, "gics_scales") and "qkv" in block.gics_scales):
                 qkv_in_transform = build_composite_with_gics("qkv", qkv_in_transform)
-            if "gate_up" in resort_perms:
+            if "gate_up" in resort_perms or (hasattr(block, "gics_scales") and "gate_up" in block.gics_scales):
                 gate_up_in_transform = build_composite_with_gics("gate_up", gate_up_in_transform)
             # O: in-place permutation only for MHA (skip GQA to avoid cross-head corruption)
             if "o" in resort_perms:
@@ -928,6 +966,8 @@ def gptq_quantization(
                 if block.self_attn.v_proj.weight.shape[0] == block.self_attn.o_proj.weight.shape[1]:
                     block.self_attn.o_proj.weight.data = block.self_attn.o_proj.weight.data[:, o_perm]
                     block.self_attn.v_proj.weight.data = block.self_attn.v_proj.weight.data[o_perm, :]
+            elif hasattr(block, "gics_scales") and "o" in block.gics_scales:
+                o_in_transform = build_composite_with_gics("o", o_in_transform)
             if "down" in resort_perms:
                 down_perm = resort_perms["down"]
                 if hasattr(block, "gics_scales") and "down" in block.gics_scales:
@@ -935,6 +975,8 @@ def gptq_quantization(
                 block.mlp.down_proj.weight.data = block.mlp.down_proj.weight.data[:, down_perm]
                 block.mlp.gate_proj.weight.data = block.mlp.gate_proj.weight.data[down_perm, :]
                 block.mlp.up_proj.weight.data = block.mlp.up_proj.weight.data[down_perm, :]
+            elif hasattr(block, "gics_scales") and "down" in block.gics_scales:
+                down_in_transform = build_composite_with_gics("down", down_in_transform)
 
         # 2. Replace blocks with quantized versions
         quantized_attn = get_attention_layer(model.config)(
@@ -1192,42 +1234,43 @@ def gptq_quantization(
                 if layer.act_quantizer:
                     layer.act_quantizer._track_global_scale = False
 
-        # 7. Run GPTQ quantization (Already aligned)
-        for layer_name, gptq_handle in gptq_handles.items():
-            dequantized_qweight, qweight, scales = gptq_handle.quantize()
-            orig_weight = gptq_handle.layer.weight
-            with torch.no_grad():
-                relative_mse_error = get_relative_mse_error(dequantized_qweight.float(), orig_weight.float(), gptq_handle.H)
-            print(f"[{layer_name:16}]: Relative MSE error: {relative_mse_error.item():.2e}")
-            if args.log_wandb:
-                wandb.log({f"gptq/{layer_name}_relative_mse": relative_mse_error.item()})
-            gptq_handle.layer.weight.data = dequantized_qweight
-            
-            # Update quantized state dict (if needed)
-            if args.export_quantized_model:
-                weight_global_scale = gptq_handle.quantizer.global_scale.to(scales.device)
-                act_global_scale = gptq_handle.layer.act_quantizer.global_scale
+        # 7. Run GPTQ quantization (Already aligned) — skip if weight is not quantized (w_bits >= 16)
+        if weight_quantizer_kwargs is not None:
+            for layer_name, gptq_handle in gptq_handles.items():
+                dequantized_qweight, qweight, scales = gptq_handle.quantize()
+                orig_weight = gptq_handle.layer.weight
+                with torch.no_grad():
+                    relative_mse_error = get_relative_mse_error(dequantized_qweight.float(), orig_weight.float(), gptq_handle.H)
+                print(f"[{layer_name:16}]: Relative MSE error: {relative_mse_error.item():.2e}")
+                if args.log_wandb:
+                    wandb.log({f"gptq/{layer_name}_relative_mse": relative_mse_error.item()})
+                gptq_handle.layer.weight.data = dequantized_qweight
+                
+                # Update quantized state dict (if needed)
+                if args.export_quantized_model:
+                    weight_global_scale = gptq_handle.quantizer.global_scale.to(scales.device)
+                    act_global_scale = gptq_handle.layer.act_quantizer.global_scale
 
-                transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
+                    transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
 
-                if args.export_quantized_model == "realquant":
-                    quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
-                        "qweight": pack_fp4_to_uint8(qweight).cpu(),
-                        "scales": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
-                        "forward_hadamard_matrix": transform_matrix,
-                        "backward_hadamard_matrix": transform_matrix.clone(),
-                        "weight_global_scale": weight_global_scale.clone(),
-                        "act_global_scale": act_global_scale.clone()
-                    }
-                # pseudoquant
-                else:
-                    quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
-                        "dqweight": dequantized_qweight.cpu(),
-                        "forward_hadamard_matrix": transform_matrix,
-                        "backward_hadamard_matrix": transform_matrix.clone(),
-                        "weight_global_scale": weight_global_scale.clone(),
-                        "act_global_scale": act_global_scale.clone()
-                    }
+                    if args.export_quantized_model == "realquant":
+                        quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
+                            "qweight": pack_fp4_to_uint8(qweight).cpu(),
+                            "scales": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
+                            "forward_hadamard_matrix": transform_matrix,
+                            "backward_hadamard_matrix": transform_matrix.clone(),
+                            "weight_global_scale": weight_global_scale.clone(),
+                            "act_global_scale": act_global_scale.clone()
+                        }
+                    # pseudoquant
+                    else:
+                        quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
+                            "dqweight": dequantized_qweight.cpu(),
+                            "forward_hadamard_matrix": transform_matrix,
+                            "backward_hadamard_matrix": transform_matrix.clone(),
+                            "weight_global_scale": weight_global_scale.clone(),
+                            "act_global_scale": act_global_scale.clone()
+                        }
 
         # Enable activation MSE tracking
         if args.show_act_mse:

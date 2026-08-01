@@ -29,7 +29,7 @@ echo "" >> $LOG_FILE
 echo "==========================================================" >> $LOG_FILE
 echo "Batch Run Started at: $(date)" >> $LOG_FILE
 printf "%-30s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s\n" "Model" "W-PPL" "C4-PPL" "PIQA" "ARC-C" "WINO" "BOOLQ" "HELLA" >> $LOG_FILE
-echo "----------------------------------------------------------" >> $LOG_FILE
+echo "----------------------------------------------------------------------------------------" >> $LOG_FILE
 
 # --- 循环运行 ---
 for MODEL in "${MODELS[@]}"; do
@@ -41,13 +41,13 @@ for MODEL in "${MODELS[@]}"; do
     CMD="$PYTHON_BIN model_quant.py \
         --model_name_or_path=$MODEL \
         --format=nvfp \
-        --w_bits=4 \
+        --w_bits=16 \
         --a_bits=4 \
         --seed=0 \
         --w_group_size=16 \
         --a_group_size=16 \
         --transform_class=identity \
-        --w_observer=mse \
+        --w_observer=mse_n \
         --a_observer=lss \
         --quantization_order=activation \
         --hadamard_group_size=16 \
@@ -58,13 +58,12 @@ for MODEL in "${MODELS[@]}"; do
         --dtype=bfloat16 \
         --show_act_mse \
         --gptq \
-        --channel_resort=kmeans_fp4_top3 \
+        --channel_resort=channel_cluster \
+        --channel_rescale=gics \
         --kmeans_block_size -1 \
         --kmeans_alpha 2 \
         --fuse_global_scale \
-        --eval_perplexity \
-        --eval_openllm \
-        --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge"
+        --eval_perplexity "
 
     # 运行并静默非核心输出
     tmp_out="tmp_eval.out"
@@ -78,22 +77,28 @@ for MODEL in "${MODELS[@]}"; do
         continue
     fi
 
-    # 从 JSON 摘要中提取数值
-    SUMMARY_LINE=$(grep "\[RESULT_SUMMARY\]" $tmp_out | sed 's/\[RESULT_SUMMARY\] //')
-    
-    # 使用 Python 快速解析 JSON 字段并格式化数值
-    WIKI_PPL=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; v=json.load(sys.stdin).get('wikitext2_ppl'); print(f'{v:.3f}' if isinstance(v, (int, float)) else 'N/A')")
-    C4_PPL=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; v=json.load(sys.stdin).get('c4_ppl'); print(f'{v:.3f}' if isinstance(v, (int, float)) else 'N/A')")
-    
-    PIQA=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; d=json.load(sys.stdin).get('results', {}); v=d.get('piqa'); print(f'{v:.5f}' if isinstance(v, (int, float)) else 'N/A')")
-    ARC=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; d=json.load(sys.stdin).get('results', {}); v=d.get('arc_challenge'); print(f'{v:.5f}' if isinstance(v, (int, float)) else 'N/A')")
-    WINO=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; d=json.load(sys.stdin).get('results', {}); v=d.get('winogrande'); print(f'{v:.5f}' if isinstance(v, (int, float)) else 'N/A')")
-    BOOLQ=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; d=json.load(sys.stdin).get('results', {}); v=d.get('boolq'); print(f'{v:.5f}' if isinstance(v, (int, float)) else 'N/A')")
-    HELLA=$(echo "$SUMMARY_LINE" | python3 -c "import sys, json; d=json.load(sys.stdin).get('results', {}); v=d.get('hellaswag'); print(f'{v:.5f}' if isinstance(v, (int, float)) else 'N/A')")
+    # PPL: 从 stdout 直接 grep
+    WIKI_PPL=$(grep -oP 'Wikitext-2 perplexity: \K[0-9.]+' $tmp_out)
+    C4_PPL=$(grep -oP 'C4 perplexity: \K[0-9.]+' $tmp_out)
+    [ -z "$WIKI_PPL" ] && WIKI_PPL="N/A"
+    [ -z "$C4_PPL" ] && C4_PPL="N/A"
 
-    # 打印到屏幕
-    echo "Result: Wiki-PPL: $WIKI_PPL, PIQA: $PIQA"
-    
+    # 下游任务: 有 SUMMARY 就解析，没有就 NA
+    SUMMARY_LINE=$(grep "\[RESULT_SUMMARY\]" $tmp_out | sed 's/\[RESULT_SUMMARY\] //')
+    if [ -n "$SUMMARY_LINE" ]; then
+        PARSE="$PYTHON_BIN -c \"import sys,json;d=json.load(sys.stdin)['results'];print(d.get('piqa','NA'),d.get('arc_challenge','NA'),d.get('winogrande','NA'),d.get('boolq','NA'),d.get('hellaswag','NA'))\""
+        read PIQA ARC WINO BOOLQ HELLA <<< "$(echo "$SUMMARY_LINE" | $PARSE)"
+    else
+        PIQA="NA"
+        ARC="NA"
+        WINO="NA"
+        BOOLQ="NA"
+        HELLA="NA"
+    fi
+
+    # 打印到屏幕 (只显示 PPL)
+    echo "Result: Wiki-PPL: $WIKI_PPL, C4-PPL: $C4_PPL"
+
     # 格式化写入日志
     printf "%-30s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s\n" "$MODEL" "$WIKI_PPL" "$C4_PPL" "$PIQA" "$ARC" "$WINO" "$BOOLQ" "$HELLA" >> $LOG_FILE
     

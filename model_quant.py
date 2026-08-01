@@ -283,8 +283,28 @@ def parse_args():
         "--channel_resort",
         type=str,
         default="none",
-        choices=["none", "mean", "P95", "minmax", "stagger", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"],
-        help="Apply grid-aware channel reordering based on channel 'mean' or 'P95', 'minmax', 'stagger' (Co-occurrence-aware), 'kmeans_fp4', 'kmeans_fp4_top3' or use 'none' to skip.",
+        choices=["none", "mean", "P95", "minmax", "stagger", "channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"],
+        help="Channel reordering strategy: 'none', 'mean', 'P95', 'minmax', 'stagger', 'channel_cluster' (K-Means FP4 clustering). "
+             "Legacy aliases 'kmeans_fp4', 'kmeans_fp4_w', 'kmeans_fp4_top3' are also accepted for backward compatibility.",
+    )
+    parser.add_argument(
+        "--channel_rescale",
+        type=str,
+        default="none",
+        choices=["none", "gics"],
+        help="Channel rescaling strategy: 'none' or 'gics' (GICS coordinate-descent channel scale search).",
+    )
+    parser.add_argument(
+        "--gics_top_k",
+        type=int,
+        default=5,
+        help="Number of top-sensitive channels to optimize per group in GICS coordinate descent.",
+    )
+    parser.add_argument(
+        "--gics_num_rounds",
+        type=int,
+        default=3,
+        help="Number of coordinate-descent rounds in GICS search.",
     )
     parser.add_argument(
         "--stagger_lambda",
@@ -295,7 +315,7 @@ def parse_args():
     parser.add_argument(
         "--kmeans_block_size",
         type=int,
-        default=0,
+        default=-1,
         help="Block size for K-means channel resorting applied to down_proj. If 0, uses head_dim. If -1, uses global K-means.",
     )
     parser.add_argument(
@@ -437,6 +457,18 @@ def parse_args():
         
     # Removed check that forces transform_class to identity. 
     # We now fully support combining MR and KMeans!
+
+    # --- Backward compatibility: map legacy channel_resort values to new split params ---
+    if args.channel_resort == "kmeans_fp4_top3":
+        args.channel_resort = "channel_cluster"
+        if args.channel_rescale == "none":
+            args.channel_rescale = "gics"
+        print("[Compat] Mapped legacy 'kmeans_fp4_top3' -> channel_resort='channel_cluster' + channel_rescale='gics'")
+    elif args.channel_resort in ("kmeans_fp4", "kmeans_fp4_w"):
+        old_val = args.channel_resort
+        args.channel_resort = "channel_cluster"
+        print(f"[Compat] Mapped legacy '{old_val}' -> channel_resort='channel_cluster'")
+
     return args
 
 

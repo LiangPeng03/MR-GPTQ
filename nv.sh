@@ -20,15 +20,15 @@ MODEL7="Qwen/Qwen3-1.7B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL5} \
+    --model_name_or_path=${MODEL1} \
     --format=nvfp \
-    --w_bits=16 \
-    --a_bits=16 \
+    --w_bits=4 \
+    --a_bits=4 \
     --seed=0 \
     --w_group_size=16 \
     --a_group_size=16 \
     --transform_class=identity \
-    --w_observer=mse \
+    --w_observer=mse_n \
     --a_observer=lss \
     --quantization_order=activation \
     --hadamard_group_size=16 \
@@ -39,7 +39,8 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --dtype=bfloat16 \
     --fuse_global_scale \
     --gptq \
-    --channel_resort=kmeans_fp4_top3 \
+    --channel_resort=channel_cluster \
+    --channel_rescale=gics \
     --kmeans_block_size -1 \
     --kmeans_alpha 2 \
     --kmeans_act_alpha 0 \
