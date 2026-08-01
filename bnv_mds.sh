@@ -7,8 +7,8 @@ PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
 # 待测试模型列表
 MODELS=(
-    "HuggingFaceTB/SmolLM2-135M"
-    "Qwen/Qwen3-0.6B"
+    # "HuggingFaceTB/SmolLM2-135M"
+    # "Qwen/Qwen3-0.6B"
     "Qwen/Qwen3-8B"
     "meta-llama/Meta-Llama-3-8B"
     # "meta-llama/Llama-2-7b-hf"
@@ -49,7 +49,8 @@ for MODEL in "${MODELS[@]}"; do
         --w_group_size=16 \
         --a_group_size=16 \
         --transform_class=identity \
-        --w_observer=mse \
+        --w_observer=mse_n \
+        --a_observer=lss \
         --quantization_order=activation \
         --hadamard_group_size=16 \
         --dataset_name_or_path=c4 \
@@ -58,12 +59,13 @@ for MODEL in "${MODELS[@]}"; do
         --sequence_length=2048 \
         --dtype=bfloat16 \
         --show_act_mse \
-        --channel_resort=none \
+        --gptq \
+        --channel_resort=kmeans_fp4_top3 \
         --kmeans_block_size -1 \
         --kmeans_alpha 2 \
         --fuse_global_scale \
         --eval_openllm \
-        --lm_eval_tasks gsm8k mmlu arc_easy mbpp lambada_openai "
+        --lm_eval_tasks mmlu arc_easy lambada_openai "
 
     # 运行并静默非核心输出
     tmp_out="tmp_eval_mds1.out"

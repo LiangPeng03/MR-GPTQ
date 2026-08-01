@@ -15,9 +15,9 @@ LOG_FILE="compare_mds.log"
 PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
 MODELS=(
-    "HuggingFaceTB/SmolLM2-135M"
-    "meta-llama/Meta-Llama-3-8B"
-    "Qwen/Qwen3-0.6B"
+    # "HuggingFaceTB/SmolLM2-135M"
+    # "meta-llama/Meta-Llama-3-8B"
+    # "Qwen/Qwen3-0.6B"
     "Qwen/Qwen3-8B"
     "meta-llama/Llama-3.2-1B"
     "Qwen/Qwen3-1.7B"
@@ -120,7 +120,7 @@ for (( i=0; i<${#TASKS[@]}; i++ )); do
             --fuse_global_scale \
             --eval_perplexity \
             --eval_openllm \
-            --lm_eval_tasks gsm8k mmlu arc_easy mbpp lambada_openai \
+            --lm_eval_tasks  mmlu arc_easy  lambada_openai \
             > "$tmp" 2>&1
 
         if [ $? -ne 0 ]; then
