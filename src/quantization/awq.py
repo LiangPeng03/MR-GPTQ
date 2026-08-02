@@ -1,12 +1,49 @@
 import torch
 from typing import List, Optional
 
+
+def run_channel_rescale(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    group_size: int = 16,
+    top_k: int = 5,
+    num_rounds: int = 3,
+    weight_mse_ratio: float = 1.0,
+) -> torch.Tensor:
+    """
+    Coordinate Descent Channel Scale Search (GICS).
+    
+    Finds optimal per-channel scale factors that minimize the combined
+    weight and activation quantization error.
+    
+    Args:
+        X: Activation tensor [n_tokens, in_features]
+        W: Weight tensor [out_features, in_features]
+        group_size: Quantization group size
+        top_k: Number of top-sensitive channels to optimize per group
+        num_rounds: Number of coordinate-descent rounds
+        weight_mse_ratio: Ratio of weight MSE to activation MSE in the loss
+    
+    Returns:
+        Channel scale tensor [in_features]
+    """
+    from .gics import optimize_channel_scales_coordinate_descent
+    return optimize_channel_scales_coordinate_descent(
+        X, W,
+        weight_mse_ratio=weight_mse_ratio,
+        group_size=group_size,
+        top_k=top_k,
+        num_rounds=num_rounds
+    )
+
+
 def run_awq_search(
     X: torch.Tensor,
     weights: List[torch.Tensor],
     weight_quantizer=None,
     act_quantizer=None,
     steps: int = 20,
+    rounds: int = 1,
     X_max: Optional[torch.Tensor] = None,
     use_gajs: bool = False,
 ) -> torch.Tensor:
@@ -16,6 +53,10 @@ def run_awq_search(
     
     If use_gajs is True, it uses the Grid-Aligned Joint Scaling (Adam) method.
     Otherwise, it uses the baseline 1D grid search.
+    
+    Args:
+        steps: Number of grid search points per round (20 -> 21 points, standard AWQ).
+        rounds: Number of refinement rounds (1 = standard single-pass AWQ, >1 = multi-round).
     """
     device = X.device
     in_features = X.shape[-1]
@@ -211,47 +252,65 @@ def run_awq_search(
         
     else:
         # ---------------------------------------------------------
-        # BASELINE: 1D Grid Search (Original AWQ)
+        # BASELINE: 1D Grid Search (Original AWQ) with Multi-Round
         # ---------------------------------------------------------
         if steps == 0:
             return torch.ones(in_features, device=device, dtype=X.dtype)
-            
-        best_error = float('inf')
-        best_scale = torch.ones_like(X_max)
+        
+        accumulated_scale = torch.ones(in_features, device=device, dtype=X.dtype)
         
         with torch.no_grad():
-            for i in range(steps + 1):
-                alpha = i / steps
-                s = X_max ** alpha
-                
-                s = s / s.mean()
-                s = torch.clamp(s, min=0.1, max=10.0)
-                
-                X_scaled = X_sub * s
-                
-                if act_quantizer is not None:
-                    q_scales, q_zeros = act_quantizer.get_quantization_params(X_scaled.unsqueeze(0))
-                    X_q = act_quantizer(X_scaled.unsqueeze(0), q_scales, q_zeros).squeeze(0)
+            for r in range(rounds):
+                # Compute round-specific X_max from already-scaled data
+                if r == 0:
+                    round_X_max = X_max
                 else:
-                    X_q = X_scaled
-                    
-                total_err = 0.0
+                    effective_X = X_sub * accumulated_scale
+                    round_X_max = effective_X.abs().max(dim=0).values.clamp(min=1e-4)
                 
-                for w, out_orig in zip(weights, out_origs):
-                    w_scaled = w / s.unsqueeze(0)
+                best_error = float('inf')
+                best_delta = torch.ones_like(round_X_max)
+                
+                for i in range(steps + 1):
+                    alpha = i / steps
+                    s = round_X_max ** alpha
                     
-                    if weight_quantizer is not None:
-                        w_q_scales, w_q_zeros = weight_quantizer.get_quantization_params(w_scaled)
-                        w_q = weight_quantizer(w_scaled, w_q_scales, w_q_zeros)
+                    s = s / s.mean()
+                    s = torch.clamp(s, min=0.1, max=10.0)
+                    
+                    s_combined = accumulated_scale * s
+                    
+                    X_scaled = X_sub * s_combined
+                    
+                    if act_quantizer is not None:
+                        q_scales, q_zeros = act_quantizer.get_quantization_params(X_scaled.unsqueeze(0))
+                        X_q = act_quantizer(X_scaled.unsqueeze(0), q_scales, q_zeros).squeeze(0)
                     else:
-                        w_q = w_scaled
+                        X_q = X_scaled
                         
-                    out_q = torch.matmul(X_q, w_q.t())
-                    err = (out_q - out_orig).pow(2).mean().item()
-                    total_err += err
+                    total_err = 0.0
                     
-                if total_err < best_error:
-                    best_error = total_err
-                    best_scale = s.clone()
-                    
-            return best_scale
+                    for w, out_orig in zip(weights, out_origs):
+                        w_scaled = w / s_combined.unsqueeze(0)
+                        
+                        if weight_quantizer is not None:
+                            w_q_scales, w_q_zeros = weight_quantizer.get_quantization_params(w_scaled)
+                            w_q = weight_quantizer(w_scaled, w_q_scales, w_q_zeros)
+                        else:
+                            w_q = w_scaled
+                            
+                        out_q = torch.matmul(X_q, w_q.t())
+                        err = (out_q - out_orig).pow(2).mean().item()
+                        total_err += err
+                        
+                    if total_err < best_error:
+                        best_error = total_err
+                        best_delta = s.clone()
+                
+                accumulated_scale = accumulated_scale * best_delta
+                
+                if rounds > 1:
+                    print(f"    AWQ Round {r + 1}/{rounds} complete, best_delta mean: {best_delta.mean().item():.4f}, "
+                          f"min: {best_delta.min().item():.4f}, max: {best_delta.max().item():.4f}")
+            
+        return accumulated_scale

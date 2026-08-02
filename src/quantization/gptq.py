@@ -715,50 +715,89 @@ def gptq_quantization(
                 for g in opt_groups: perm.extend(g)
                 return torch.tensor(perm, device=device, dtype=torch.long)
 
-            for name, mean_val in act_means.items():
-                w_norm = get_combined_weight_norm(block, name)
-                
-                if args.channel_resort == "stagger":
-                    mask = mean_val["mask"]
-                    freq = mean_val["freq"]
-                    N = freq.shape[0]
-                    if w_norm is None:
-                        w_norm = torch.ones(N, device=freq.device)
-                elif args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
-                    N = mean_val.shape[1]
-                    if w_norm is None:
-                        w_norm = torch.ones(N, device=mean_val.device)
-                else:
-                    abs_vals = mean_val.abs()
-                    N = abs_vals.shape[0]
-                    if w_norm is None:
-                        w_norm = torch.ones_like(abs_vals)
-                
-                quant_group_size = args.a_group_size if args.a_group_size else 16
-                
-                if args.channel_resort in ["mean", "P95"]:
-                    # GridSort Strategy
-                    if "o" in name:
-                        head_dim = model.config.hidden_size // model.config.num_attention_heads
-                        h_group_size = head_dim
+            if do_channel_resort:
+                for name, mean_val in act_means.items():
+                    w_norm = get_combined_weight_norm(block, name)
+                    
+                    if args.channel_resort == "stagger":
+                        mask = mean_val["mask"]
+                        freq = mean_val["freq"]
+                        N = freq.shape[0]
+                        if w_norm is None:
+                            w_norm = torch.ones(N, device=freq.device)
+                    elif args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
+                        N = mean_val.shape[1]
+                        if w_norm is None:
+                            w_norm = torch.ones(N, device=mean_val.device)
                     else:
-                        h_group_size = -1 # Global matrix for other projections
-                        
-                    if h_group_size <= 0:
-                        p = compute_gridsort_perm(abs_vals, group_size=quant_group_size)
-                    else:
-                        p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
-                        for i in range(0, N, h_group_size):
-                            block_vals = abs_vals[i : i + h_group_size]
-                            block_perm = compute_gridsort_perm(block_vals, group_size=quant_group_size)
-                            p[i : i + h_group_size] = block_perm + i
+                        abs_vals = mean_val.abs()
+                        N = abs_vals.shape[0]
+                        if w_norm is None:
+                            w_norm = torch.ones_like(abs_vals)
+                    
+                    quant_group_size = args.a_group_size if args.a_group_size else 16
+                    
+                    if args.channel_resort in ["mean", "P95"]:
+                        # GridSort Strategy
+                        if "o" in name:
+                            head_dim = model.config.hidden_size // model.config.num_attention_heads
+                            h_group_size = head_dim
+                        else:
+                            h_group_size = -1 # Global matrix for other projections
                             
-                    resort_perms[name] = p
-                    print(f"    [{name:8}] GridSort completed.")
-                elif args.channel_resort == "minmax":
-                    # Dual-Track Pairing Strategy for NVFP4 and MXFP4
-                    if args.format == "mxfp":
-                        gs = args.hadamard_group_size if args.hadamard_group_size > 0 else 128
+                        if h_group_size <= 0:
+                            p = compute_gridsort_perm(abs_vals, group_size=quant_group_size)
+                        else:
+                            p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
+                            for i in range(0, N, h_group_size):
+                                block_vals = abs_vals[i : i + h_group_size]
+                                block_perm = compute_gridsort_perm(block_vals, group_size=quant_group_size)
+                                p[i : i + h_group_size] = block_perm + i
+                                
+                        resort_perms[name] = p
+                        print(f"    [{name:8}] GridSort completed.")
+                    elif args.channel_resort == "minmax":
+                        # Dual-Track Pairing Strategy for NVFP4 and MXFP4
+                        if args.format == "mxfp":
+                            gs = args.hadamard_group_size if args.hadamard_group_size > 0 else 128
+                            if "o" in name:
+                                head_dim = model.config.hidden_size // model.config.num_attention_heads
+                                h_group_size = head_dim
+                            else:
+                                h_group_size = -1
+                                
+                            if h_group_size <= 0:
+                                p = compute_mxfp4_vip_l1_perm(abs_vals, w_norm, block_size=gs)
+                            else:
+                                p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
+                                for i in range(0, N, h_group_size):
+                                    block_vals = abs_vals[i : i + h_group_size]
+                                    block_w_norm = w_norm[i : i + h_group_size]
+                                    block_gs = min(gs, h_group_size)
+                                    block_perm = compute_mxfp4_vip_l1_perm(block_vals, block_w_norm, block_size=block_gs)
+                                    p[i : i + h_group_size] = block_perm + i
+                            print(f"    [{name:8}] VIP+L1 平滑 (gs={gs}) completed.")
+                        else:
+                            gs = quant_group_size
+                            if "o" in name:
+                                head_dim = model.config.hidden_size // model.config.num_attention_heads
+                                h_group_size = head_dim
+                            else:
+                                h_group_size = -1
+                                
+                            if h_group_size <= 0:
+                                p = compute_nvfp4_scale_first_perm(abs_vals, w_norm, group_size=gs)
+                            else:
+                                p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
+                                for i in range(0, N, h_group_size):
+                                    block_vals = abs_vals[i : i + h_group_size]
+                                    block_w_norm = w_norm[i : i + h_group_size]
+                                    block_gs = min(gs, h_group_size)
+                                    block_perm = compute_nvfp4_scale_first_perm(block_vals, block_w_norm, group_size=block_gs)
+                                    p[i : i + h_group_size] = block_perm + i
+                            print(f"    [{name:8}] Scale-First Greedy Fill (gs={gs}) completed.")
+                        resort_perms[name] = p
+                    elif args.channel_resort == "stagger":
                         if "o" in name:
                             head_dim = model.config.hidden_size // model.config.num_attention_heads
                             h_group_size = head_dim
@@ -766,152 +805,114 @@ def gptq_quantization(
                             h_group_size = -1
                             
                         if h_group_size <= 0:
-                            p = compute_mxfp4_vip_l1_perm(abs_vals, w_norm, block_size=gs)
+                            p = compute_co_occurrence_staggered_perm(mask, freq, group_size=quant_group_size)
                         else:
-                            p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
+                            p = torch.zeros(N, device=freq.device, dtype=torch.long)
                             for i in range(0, N, h_group_size):
-                                block_vals = abs_vals[i : i + h_group_size]
-                                block_w_norm = w_norm[i : i + h_group_size]
-                                block_gs = min(gs, h_group_size)
-                                block_perm = compute_mxfp4_vip_l1_perm(block_vals, block_w_norm, block_size=block_gs)
+                                block_mask = mask[:, i : i + h_group_size]
+                                block_freq = freq[i : i + h_group_size]
+                                block_gs = min(quant_group_size, h_group_size)
+                                block_perm = compute_co_occurrence_staggered_perm(block_mask, block_freq, group_size=block_gs)
                                 p[i : i + h_group_size] = block_perm + i
-                        print(f"    [{name:8}] VIP+L1 平滑 (gs={gs}) completed.")
-                    else:
-                        gs = quant_group_size
-                        if "o" in name:
+                        resort_perms[name] = p
+                        print(f"    [{name:8}] Staggered Reordering (P93.75) completed.")
+                    elif args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
+                        W = get_combined_weight(block, name).to(device)
+                        if args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_top3"]:
+                            target_mat = mean_val # X_sub
+                        else:
+                            target_mat = W
+                            # Subsample target_mat (W) if using kmeans_fp4_w
+                            max_samples = 4096
+                            if target_mat.shape[0] > max_samples:
+                                subset_idx = torch.linspace(0, target_mat.shape[0] - 1, max_samples, dtype=torch.long, device=target_mat.device)
+                                target_mat = target_mat[subset_idx]
+                                
+                        X_abs_T = target_mat.abs().T.float()
+                        
+                        alpha = getattr(args, "kmeans_alpha", 0.0)
+                        if args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_top3"] and alpha > 0.0:
+                            W_norm = torch.norm(W, p=2, dim=0) # Shape: (In_Features,)
+                            X_norm = torch.norm(mean_val, p=2, dim=0) # Act Norm
+                            # Use W_norm * X_norm to align with true output contribution
+                            # channel_weights = (W_norm * X_norm) ** alpha
+                            channel_weights = (W_norm) ** alpha
+                        else:
+                            channel_weights = None
+                            
+                        act_alpha = getattr(args, "kmeans_act_alpha", 0.0)
+                        
+                        if name == "down" and getattr(args, "kmeans_block_size", 0) != -1:
+                            if getattr(args, "kmeans_block_size", 0) > 0:
+                                h_group_size = args.kmeans_block_size
+                            else:
+                                h_group_size = model.config.hidden_size // model.config.num_attention_heads
+                        elif name == "o":
                             head_dim = model.config.hidden_size // model.config.num_attention_heads
                             h_group_size = head_dim
                         else:
                             h_group_size = -1
                             
                         if h_group_size <= 0:
-                            p = compute_nvfp4_scale_first_perm(abs_vals, w_norm, group_size=gs)
+                            p = compute_kmeans_fp4_perm(X_abs_T, group_size=quant_group_size, channel_weights=channel_weights, act_alpha=act_alpha)
+                        else:
+                            p = torch.zeros(N, device=X_abs_T.device, dtype=torch.long)
+                            for i in range(0, N, h_group_size):
+                                block_X_abs_T = X_abs_T[i : i + h_group_size]
+                                block_gs = min(quant_group_size, h_group_size)
+                                block_cw = channel_weights[i : i + h_group_size] if channel_weights is not None else None
+                                block_perm = compute_kmeans_fp4_perm(block_X_abs_T, group_size=block_gs, channel_weights=block_cw, act_alpha=act_alpha)
+                                p[i : i + h_group_size] = block_perm + i
+                        print(f"    [{name:8}] KMeans FP4 grouping (target={args.channel_resort}, gs={quant_group_size}, w_alpha={alpha}, act_alpha={act_alpha}) completed.")
+                        resort_perms[name] = p
+                    else:
+                        # Old Resonance R_val Strategy
+                        h_group_size = args.hadamard_group_size
+                        if "o" in name:
+                            head_dim = model.config.hidden_size // model.config.num_attention_heads
+                            if h_group_size <= 0 or h_group_size > head_dim:
+                                h_group_size = head_dim
+                                
+                        if h_group_size <= 0:
+                            p = compute_resonance_perm(abs_vals, group_size=16)
                         else:
                             p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
                             for i in range(0, N, h_group_size):
                                 block_vals = abs_vals[i : i + h_group_size]
-                                block_w_norm = w_norm[i : i + h_group_size]
-                                block_gs = min(gs, h_group_size)
-                                block_perm = compute_nvfp4_scale_first_perm(block_vals, block_w_norm, group_size=block_gs)
+                                block_perm = compute_resonance_perm(block_vals, group_size=16)
                                 p[i : i + h_group_size] = block_perm + i
-                        print(f"    [{name:8}] Scale-First Greedy Fill (gs={gs}) completed.")
-                    resort_perms[name] = p
-                elif args.channel_resort == "stagger":
-                    if "o" in name:
-                        head_dim = model.config.hidden_size // model.config.num_attention_heads
-                        h_group_size = head_dim
-                    else:
-                        h_group_size = -1
+                        resort_perms[name] = p
                         
-                    if h_group_size <= 0:
-                        p = compute_co_occurrence_staggered_perm(mask, freq, group_size=quant_group_size)
-                    else:
-                        p = torch.zeros(N, device=freq.device, dtype=torch.long)
-                        for i in range(0, N, h_group_size):
-                            block_mask = mask[:, i : i + h_group_size]
-                            block_freq = freq[i : i + h_group_size]
-                            block_gs = min(quant_group_size, h_group_size)
-                            block_perm = compute_co_occurrence_staggered_perm(block_mask, block_freq, group_size=block_gs)
-                            p[i : i + h_group_size] = block_perm + i
-                    resort_perms[name] = p
-                    print(f"    [{name:8}] Staggered Reordering (P93.75) completed.")
-                elif args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"]:
-                    W = get_combined_weight(block, name).to(device)
-                    if args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_top3"]:
-                        target_mat = mean_val # X_sub
-                    else:
-                        target_mat = W
-                        # Subsample target_mat (W) if using kmeans_fp4_w
-                        max_samples = 4096
-                        if target_mat.shape[0] > max_samples:
-                            subset_idx = torch.linspace(0, target_mat.shape[0] - 1, max_samples, dtype=torch.long, device=target_mat.device)
-                            target_mat = target_mat[subset_idx]
-                            
-                    X_abs_T = target_mat.abs().T.float()
-                    
-                    alpha = getattr(args, "kmeans_alpha", 0.0)
-                    if args.channel_resort in ["channel_cluster", "kmeans_fp4", "kmeans_fp4_top3"] and alpha > 0.0:
-                        W_norm = torch.norm(W, p=2, dim=0) # Shape: (In_Features,)
-                        X_norm = torch.norm(mean_val, p=2, dim=0) # Act Norm
-                        # Use W_norm * X_norm to align with true output contribution
-                        # channel_weights = (W_norm * X_norm) ** alpha
-                        channel_weights = (W_norm) ** alpha
-                    else:
-                        channel_weights = None
-                        
-                    act_alpha = getattr(args, "kmeans_act_alpha", 0.0)
-                    
-                    if name == "down" and getattr(args, "kmeans_block_size", 0) != -1:
-                        if getattr(args, "kmeans_block_size", 0) > 0:
-                            h_group_size = args.kmeans_block_size
-                        else:
-                            h_group_size = model.config.hidden_size // model.config.num_attention_heads
-                    elif name == "o":
-                        head_dim = model.config.hidden_size // model.config.num_attention_heads
-                        h_group_size = head_dim
-                    else:
-                        h_group_size = -1
-                        
-                    if h_group_size <= 0:
-                        p = compute_kmeans_fp4_perm(X_abs_T, group_size=quant_group_size, channel_weights=channel_weights, act_alpha=act_alpha)
-                    else:
-                        p = torch.zeros(N, device=X_abs_T.device, dtype=torch.long)
-                        for i in range(0, N, h_group_size):
-                            block_X_abs_T = X_abs_T[i : i + h_group_size]
-                            block_gs = min(quant_group_size, h_group_size)
-                            block_cw = channel_weights[i : i + h_group_size] if channel_weights is not None else None
-                            block_perm = compute_kmeans_fp4_perm(block_X_abs_T, group_size=block_gs, channel_weights=block_cw, act_alpha=act_alpha)
-                            p[i : i + h_group_size] = block_perm + i
-                    print(f"    [{name:8}] KMeans FP4 grouping (target={args.channel_resort}, gs={quant_group_size}, w_alpha={alpha}, act_alpha={act_alpha}) completed.")
-                    resort_perms[name] = p
-                else:
-                    # Old Resonance R_val Strategy
-                    h_group_size = args.hadamard_group_size
-                    if "o" in name:
-                        head_dim = model.config.hidden_size // model.config.num_attention_heads
-                        if h_group_size <= 0 or h_group_size > head_dim:
-                            h_group_size = head_dim
-                            
-                    if h_group_size <= 0:
-                        p = compute_resonance_perm(abs_vals, group_size=16)
-                    else:
-                        p = torch.zeros(N, device=abs_vals.device, dtype=torch.long)
-                        for i in range(0, N, h_group_size):
-                            block_vals = abs_vals[i : i + h_group_size]
-                            block_perm = compute_resonance_perm(block_vals, group_size=16)
-                            p[i : i + h_group_size] = block_perm + i
-                    resort_perms[name] = p
-                    
-                    grouped = abs_vals[p].view(-1, 16)
-                    top2_vals = torch.topk(grouped, k=2, dim=-1).values
-                    R_vals = top2_vals[:, 1] / (top2_vals[:, 0] + 1e-9)
-                    print(f"    [{name:8}] Mean R after resort: {R_vals.mean():.4f}")
+                        grouped = abs_vals[p].view(-1, 16)
+                        top2_vals = torch.topk(grouped, k=2, dim=-1).values
+                        R_vals = top2_vals[:, 1] / (top2_vals[:, 0] + 1e-9)
+                        print(f"    [{name:8}] Mean R after resort: {R_vals.mean():.4f}")
 
-                if args.channel_rescale == "gics":
-                    from .gics import optimize_channel_scales_coordinate_descent
-                    target_mat = mean_val # X_sub
-                    W = get_combined_weight(block, name).to(device)
-                    # Use channel permutation if available, otherwise use identity order
-                    if name in resort_perms:
-                        p_gics = resort_perms[name]
-                        X_perm = target_mat[:, p_gics]
-                        W_perm = W[:, p_gics]
-                    else:
-                        X_perm = target_mat
-                        W_perm = W
-                    
-                    top_k = getattr(args, "gics_top_k", 5)
-                    num_rounds = getattr(args, "gics_num_rounds", 3)
-                    print(f"    [{name:8}] Running Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
-                    S_top3 = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=1, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds)
-                    
-                    if not hasattr(block, "gics_scales"):
-                        block.gics_scales = {}
-                    block.gics_scales[name] = S_top3
+                    if args.channel_rescale == "gics":
+                        from .awq import run_channel_rescale
+                        target_mat = mean_val # X_sub
+                        W = get_combined_weight(block, name).to(device)
+                        # Use channel permutation if available, otherwise use identity order
+                        if name in resort_perms:
+                            p_gics = resort_perms[name]
+                            X_perm = target_mat[:, p_gics]
+                            W_perm = W[:, p_gics]
+                        else:
+                            X_perm = target_mat
+                            W_perm = W
+                        
+                        top_k = getattr(args, "gics_top_k", 5)
+                        num_rounds = getattr(args, "channel_rescale_rounds", 3)
+                        print(f"    [{name:8}] Running Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
+                        S_top3 = run_channel_rescale(X_perm, W_perm, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds, weight_mse_ratio=1)
+                        
+                        if not hasattr(block, "gics_scales"):
+                            block.gics_scales = {}
+                        block.gics_scales[name] = S_top3
 
         # === 0.5 Run GICS independently when channel_resort is off ===
         if do_channel_rescale and not do_channel_resort:
-            from .gics import optimize_channel_scales_coordinate_descent
+            from .awq import run_channel_rescale
             quant_group_size = args.a_group_size if args.a_group_size else 16
             for name, mean_val in act_means.items():
                 W = get_combined_weight(block, name).to(device)
@@ -919,9 +920,9 @@ def gptq_quantization(
                 W_perm = W
                 
                 top_k = getattr(args, "gics_top_k", 5)
-                num_rounds = getattr(args, "gics_num_rounds", 3)
-                print(f"    [{name:8}] Running GICS (standalone) Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
-                S_gics = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=1, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds)
+                num_rounds = getattr(args, "channel_rescale_rounds", 3)
+                print(f"    [{name:8}] Running Channel Rescale (standalone) Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
+                S_gics = run_channel_rescale(X_perm, W_perm, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds, weight_mse_ratio=1)
                 
                 if not hasattr(block, "gics_scales"):
                     block.gics_scales = {}
@@ -1160,7 +1161,8 @@ def gptq_quantization(
                 a_q = getattr(gptq_handles[valid_names[0]].layer, 'act_quantizer', None)
                 
                 # 3. Run awq search using the small X_sub and precomputed X_max
-                s = run_awq_search(X_sub, weights, weight_quantizer=w_qs[0], act_quantizer=a_q, steps=args.awq, X_max=X_max, use_gajs=args.gajs)
+                awq_rounds = getattr(args, "awq_rounds", 1)
+                s = run_awq_search(X_sub, weights, weight_quantizer=w_qs[0], act_quantizer=a_q, steps=args.awq, rounds=awq_rounds, X_max=X_max, use_gajs=args.gajs)
                 
                 scale_t = DiagonalScaleTransform(s).to(device)
                 if isinstance(in_transform, CompositeTransform):

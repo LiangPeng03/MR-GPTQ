@@ -231,8 +231,97 @@ def quantize_4o6_only(x_groups, global_scale, scale_rule='mse'):
     
     return x_q, scales
 
+# 方法4: LSS 3 轮迭代 - 量化+反量化
+def quantize_lss_3round(x_groups, global_scale):
+    abs_x = x_groups.abs()
+
+    # 1. 基础 MinMax 寻找初步格点
+    abs_max = abs_x.amax(dim=1, keepdim=True)
+    s_0 = abs_max / 6.0
+    s_0[s_0 == 0] = 1.0
+
+    # 2. 试投格点
+    x_norm = abs_x / s_0
+    g = cast_to_fp4(x_norm).abs()
+
+    # 3. 闭式解计算最佳 Scale (第1轮)
+    num = (abs_x * g).sum(dim=1, keepdim=True)
+    den = (g * g).sum(dim=1, keepdim=True)
+    den[den == 0] = 1.0
+    raw_scales = num / den
+    raw_scales[abs_max == 0] = 1.0
+
+    # 第2轮: 用第1轮的 scale 重新投格点
+    scales_r1 = scale_to_e4m3(raw_scales, global_scale)
+    x_norm_r2 = abs_x / scales_r1
+    g_r2 = cast_to_fp4(x_norm_r2).abs()
+    num_r2 = (abs_x * g_r2).sum(dim=1, keepdim=True)
+    den_r2 = (g_r2 * g_r2).sum(dim=1, keepdim=True)
+    den_r2[den_r2 == 0] = 1.0
+    raw_scales_r2 = num_r2 / den_r2
+    raw_scales_r2[abs_max == 0] = 1.0
+
+    # 第3轮: 用第2轮的 scale 重新投格点
+    scales_r2 = scale_to_e4m3(raw_scales_r2, global_scale)
+    x_norm_r3 = abs_x / scales_r2
+    g_r3 = cast_to_fp4(x_norm_r3).abs()
+    num_r3 = (abs_x * g_r3).sum(dim=1, keepdim=True)
+    den_r3 = (g_r3 * g_r3).sum(dim=1, keepdim=True)
+    den_r3[den_r3 == 0] = 1.0
+    raw_scales_r3 = num_r3 / den_r3
+    raw_scales_r3[abs_max == 0] = 1.0
+
+    # 最终量化
+    scales = scale_to_e4m3(raw_scales_r3, global_scale)
+    x_normalized = x_groups / scales
+    x_q = cast_to_fp4(x_normalized)
+    return x_q * scales
+
+
+# 方法4: LSS 3 轮迭代 - 仅量化
+def quantize_lss_3round_only(x_groups, global_scale):
+    abs_x = x_groups.abs()
+
+    abs_max = abs_x.amax(dim=1, keepdim=True)
+    s_0 = abs_max / 6.0
+    s_0[s_0 == 0] = 1.0
+
+    x_norm = abs_x / s_0
+    g = cast_to_fp4(x_norm).abs()
+
+    num = (abs_x * g).sum(dim=1, keepdim=True)
+    den = (g * g).sum(dim=1, keepdim=True)
+    den[den == 0] = 1.0
+    raw_scales = num / den
+    raw_scales[abs_max == 0] = 1.0
+
+    scales_r1 = scale_to_e4m3(raw_scales, global_scale)
+    x_norm_r2 = abs_x / scales_r1
+    g_r2 = cast_to_fp4(x_norm_r2).abs()
+    num_r2 = (abs_x * g_r2).sum(dim=1, keepdim=True)
+    den_r2 = (g_r2 * g_r2).sum(dim=1, keepdim=True)
+    den_r2[den_r2 == 0] = 1.0
+    raw_scales_r2 = num_r2 / den_r2
+    raw_scales_r2[abs_max == 0] = 1.0
+
+    scales_r2 = scale_to_e4m3(raw_scales_r2, global_scale)
+    x_norm_r3 = abs_x / scales_r2
+    g_r3 = cast_to_fp4(x_norm_r3).abs()
+    num_r3 = (abs_x * g_r3).sum(dim=1, keepdim=True)
+    den_r3 = (g_r3 * g_r3).sum(dim=1, keepdim=True)
+    den_r3[den_r3 == 0] = 1.0
+    raw_scales_r3 = num_r3 / den_r3
+    raw_scales_r3[abs_max == 0] = 1.0
+
+    scales = scale_to_e4m3(raw_scales_r3, global_scale)
+    x_normalized = x_groups / scales
+    x_q = cast_to_fp4(x_normalized)
+    return x_q, scales
+
+
 # 权重量化使用 MSE 搜索 (模拟真实 MR-GPTQ 行为)
-def quantize_weight_mse(w_groups, global_scale, scale_search_iters=100, max_scale_shrink_factor=0.80):
+# 搜索范围: init_raw_scales 的 0.5 ~ 1.1 倍
+def quantize_weight_mse(w_groups, global_scale, scale_search_iters=100, scale_min_factor=0.5, scale_max_factor=1.1):
     abs_max = w_groups.abs().amax(dim=1, keepdim=True)
     init_raw_scales = abs_max / 6.0
     init_raw_scales[init_raw_scales == 0] = 1.0
@@ -241,8 +330,8 @@ def quantize_weight_mse(w_groups, global_scale, scale_search_iters=100, max_scal
     best_scales = torch.zeros_like(init_raw_scales)
     
     for i in range(scale_search_iters + 1):
-        scale_shrink_factor = 1 - i * max_scale_shrink_factor / scale_search_iters
-        candidate_scales = scale_shrink_factor * init_raw_scales
+        scale_factor = scale_min_factor + i * (scale_max_factor - scale_min_factor) / scale_search_iters
+        candidate_scales = scale_factor * init_raw_scales
         
         x_normalized = w_groups / candidate_scales
         x_q = cast_to_fp4(x_normalized)
@@ -350,7 +439,11 @@ def main():
         "MinMax (baseline)": quantize_minmax,
         "LSS (Closed-form)": quantize_lss,
         "4/6 (MSE)": quantize_4o6,
+        "LSS-3R (3-round)": quantize_lss_3round,
     }
+    
+    # 汇总表数据结构: summary[matrix_name][strategy_name] = {"act_sum": ..., "out_sum": ..., "count": ...}
+    summary = {m: {s: {"act_sum": 0.0, "out_sum": 0.0, "count": 0} for s in strategies} for m in matrix_names}
     
     print("\n" + "=" * 110)
     print(f"{'Layer':<5} | {'Matrix':<8} | {'Strategy':<18} | {'Act Quant MSE':<20} | {'Output MSE(W4A4)':<20}")
@@ -419,6 +512,10 @@ def main():
                     act_pct = (act_mse - baseline_results["act"]) / (baseline_results["act"] + 1e-15) * 100
                     outwa_pct = (out_mse_wa - baseline_results["out_wa"]) / (baseline_results["out_wa"] + 1e-15) * 100
                     print(f"{'':5} | {'':8} | {strat_name:<18} | {act_mse:.6e} ({act_pct:+.1f}%) | {out_mse_wa:.6e} ({outwa_pct:+.1f}%)")
+                
+                summary[mat_name][strat_name]["act_sum"] += act_mse
+                summary[mat_name][strat_name]["out_sum"] += out_mse_wa
+                summary[mat_name][strat_name]["count"] += 1
             del W, act_list
             torch.cuda.empty_cache()
         # 清空 activation caches
@@ -441,6 +538,7 @@ def main():
         "MinMax (Q only)": quantize_minmax_only,
         "LSS (Q only)": quantize_lss_only,
         "4/6 (Q only)": quantize_4o6_only,
+        "LSS-3R (Q only)": quantize_lss_3round_only,
     }
     
     dummy_x = torch.randn(4096 * 4096, device=device, dtype=torch.bfloat16).view(-1, 16)
@@ -456,7 +554,7 @@ def main():
     print(f"{'Strategy':<18} | {'Exec Time (ms)':<15} | {'Peak Extra Mem (MB)':<20} | {'Throughput (GB/s)'}")
     print("-" * 110)
     
-    for strat_name in ["MinMax (Q only)", "LSS (Q only)", "4/6 (Q only)"]:
+    for strat_name in ["MinMax (Q only)", "LSS (Q only)", "4/6 (Q only)", "LSS-3R (Q only)"]:
         quant_fn = timing_strategies[strat_name]
         for _ in range(5):
             _ = quant_fn(dummy_x, dummy_global_scale)
@@ -480,6 +578,44 @@ def main():
         print(f"{strat_name:<18} | {time_ms:>13.3f}   | {peak_mem_mb:>17.2f}    | {throughput:>14.2f}")
         del res
         torch.cuda.empty_cache()
+
+    # ========== 汇总表: 全局平均 MSE（与前面表同宽 110 字符） ==========
+    strategy_order = ["MinMax (baseline)", "LSS (Closed-form)", "4/6 (MSE)", "LSS-3R (3-round)"]
+    print("\n" + "=" * 110)
+    print("Summary: Global Average MSE Across All Layers")
+    print("-" * 110)
+    print(f"{'Strategy':<18} | {'Avg Act Quant MSE':<20} | {'Avg Output MSE(W4A4)':<20}")
+    print("-" * 110)
+
+    # 先算 MinMax baseline 的全局平均
+    baseline_act = 0.0
+    baseline_out = 0.0
+    baseline_cnt = 0
+    for mat_name in matrix_names:
+        entry = summary[mat_name]["MinMax (baseline)"]
+        baseline_act += entry["act_sum"]
+        baseline_out += entry["out_sum"]
+        baseline_cnt += entry["count"]
+    baseline_act /= baseline_cnt if baseline_cnt > 0 else 1
+    baseline_out /= baseline_cnt if baseline_cnt > 0 else 1
+
+    for strat_name in strategy_order:
+        total_act, total_out, cnt = 0.0, 0.0, 0
+        for mat_name in matrix_names:
+            entry = summary[mat_name][strat_name]
+            total_act += entry["act_sum"]
+            total_out += entry["out_sum"]
+            cnt += entry["count"]
+        if cnt > 0:
+            avg_act = total_act / cnt
+            avg_out = total_out / cnt
+            if strat_name == "MinMax (baseline)":
+                print(f"{strat_name:<18} | {avg_act:<20.6e} | {avg_out:<20.6e}")
+            else:
+                act_pct = (avg_act - baseline_act) / (baseline_act + 1e-15) * 100
+                out_pct = (avg_out - baseline_out) / (baseline_out + 1e-15) * 100
+                print(f"{strat_name:<18} | {avg_act:.6e} ({act_pct:+.1f}%) | {avg_out:.6e} ({out_pct:+.1f}%)")
+    print("=" * 110)
 
 if __name__ == "__main__":
     main()

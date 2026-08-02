@@ -659,7 +659,7 @@ def rtn_quantization(
                     print(f"    [{name:8}] Mean R after resort: {R_vals.mean():.4f}")
                     
                 if args.channel_rescale == "gics":
-                    from .gics import optimize_channel_scales_coordinate_descent
+                    from .awq import run_channel_rescale
                     target_mat = mean_val # X_sub
                     W = get_combined_weight(block, name).to(device)
                     # Use channel permutation if available, otherwise use identity order
@@ -672,9 +672,9 @@ def rtn_quantization(
                         W_perm = W
                     
                     top_k = getattr(args, "gics_top_k", 5)
-                    num_rounds = getattr(args, "gics_num_rounds", 3)
+                    num_rounds = getattr(args, "channel_rescale_rounds", 3)
                     print(f"    [{name:8}] Running Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
-                    S_top3 = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=3.0, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds)
+                    S_top3 = run_channel_rescale(X_perm, W_perm, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds, weight_mse_ratio=3.0)
                     
                     if not hasattr(block, "gics_scales"):
                         block.gics_scales = {}
@@ -682,7 +682,7 @@ def rtn_quantization(
 
         # === 0.5 Run GICS independently when channel_resort is off ===
         if do_channel_rescale and not do_channel_resort:
-            from .gics import optimize_channel_scales_coordinate_descent
+            from .awq import run_channel_rescale
             quant_group_size = args.a_group_size if args.a_group_size else 16
             for name, mean_val in act_means.items():
                 W = get_combined_weight(block, name).to(device)
@@ -690,9 +690,9 @@ def rtn_quantization(
                 W_perm = W
                 
                 top_k = getattr(args, "gics_top_k", 5)
-                num_rounds = getattr(args, "gics_num_rounds", 3)
-                print(f"    [{name:8}] Running GICS (standalone) Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
-                S_gics = optimize_channel_scales_coordinate_descent(X_perm, W_perm, weight_mse_ratio=3.0, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds)
+                num_rounds = getattr(args, "channel_rescale_rounds", 3)
+                print(f"    [{name:8}] Running Channel Rescale (standalone) Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
+                S_gics = run_channel_rescale(X_perm, W_perm, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds, weight_mse_ratio=3.0)
                 
                 if not hasattr(block, "gics_scales"):
                     block.gics_scales = {}

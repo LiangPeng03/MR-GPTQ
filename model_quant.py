@@ -237,7 +237,7 @@ def parse_args():
         "--a_observer",
         type=str,
         default="minmax",
-        choices=["minmax","lss"],
+        choices=["minmax","lss","four_over_six","lss_3round"],
         help="Activation observer.",
     )
     parser.add_argument(
@@ -258,6 +258,13 @@ def parse_args():
         "--gajs",
         action="store_true",
         help="Use Grid-Aligned Joint Scaling (Adam) instead of grid search for AWQ.",
+    )
+    parser.add_argument(
+        "--awq_rounds",
+        type=int,
+        default=1,
+        help="Number of AWQ refinement rounds (1 = standard single-pass AWQ, >1 = multi-round). "
+             "Only applies to the baseline AWQ grid search, not GAJS.",
     )
     # GPTQ params
     parser.add_argument(
@@ -301,10 +308,10 @@ def parse_args():
         help="Number of top-sensitive channels to optimize per group in GICS coordinate descent.",
     )
     parser.add_argument(
-        "--gics_num_rounds",
+        "--channel_rescale_rounds",
         type=int,
         default=3,
-        help="Number of coordinate-descent rounds in GICS search.",
+        help="Number of coordinate-descent rounds in channel rescale search.",
     )
     parser.add_argument(
         "--stagger_lambda",

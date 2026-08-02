@@ -175,6 +175,68 @@ class Quantizer:
             lss_scales = num / den
             scales = torch.where(den_zero, scales, lss_scales)
 
+        elif self.observer == QuantizationObserver.FOUR_OVER_SIX:
+            if not self.symmetric:
+                raise NotImplementedError("Four-over-six observer only supports symmetric quantization.")
+            abs_max = x.abs().amax(dim=reduce_dim, keepdim=True)
+            # Scale candidate 1: /6 (standard)
+            s_6 = abs_max / (self.q_max - self.q_min) * 2
+            s_6[s_6 == 0] = 1.0
+            # Scale candidate 2: /4 (four over six)
+            s_4 = abs_max / 4.0
+            s_4[s_4 == 0] = 1.0
+
+            # Quantize-dequantize with both scales
+            q_6 = self.quant_fn(x, s_6, zeros, self.q_min, self.q_max)
+            x_recon_6 = self.dequant_fn(q_6, s_6, zeros)
+            q_4 = self.quant_fn(x, s_4, zeros, self.q_min, self.q_max)
+            x_recon_4 = self.dequant_fn(q_4, s_4, zeros)
+
+            # Per-group MSE comparison
+            err_6 = (x - x_recon_6).pow(2).sum(dim=-1)
+            err_4 = (x - x_recon_4).pow(2).sum(dim=-1)
+            select_4 = (err_4 < err_6).unsqueeze(-1)
+            scales = torch.where(select_4, s_4, s_6)
+
+        elif self.observer == QuantizationObserver.LSS_3ROUND:
+            if not self.symmetric:
+                raise NotImplementedError("LSS_3round observer only supports symmetric quantization.")
+            abs_x = x.abs()
+            s_0 = scales.clone()
+            s_0[s_0 == 0] = 1.0
+
+            # Round 1: initial LSS
+            g = self.quant_fn(abs_x, s_0, zeros, self.q_min, self.q_max)
+            g = g.abs()
+            num = (abs_x * g).sum(dim=reduce_dim, keepdim=True)
+            den = (g * g).sum(dim=reduce_dim, keepdim=True)
+            den_zero = (den == 0)
+            den[den_zero] = 1.0
+            s_1 = num / den
+            s_1[den_zero] = 1.0
+
+            # Round 2
+            g_2 = self.quant_fn(abs_x, s_1, zeros, self.q_min, self.q_max)
+            g_2 = g_2.abs()
+            num_2 = (abs_x * g_2).sum(dim=reduce_dim, keepdim=True)
+            den_2 = (g_2 * g_2).sum(dim=reduce_dim, keepdim=True)
+            den_2_zero = (den_2 == 0)
+            den_2[den_2_zero] = 1.0
+            s_2 = num_2 / den_2
+            s_2[den_2_zero] = 1.0
+
+            # Round 3
+            g_3 = self.quant_fn(abs_x, s_2, zeros, self.q_min, self.q_max)
+            g_3 = g_3.abs()
+            num_3 = (abs_x * g_3).sum(dim=reduce_dim, keepdim=True)
+            den_3 = (g_3 * g_3).sum(dim=reduce_dim, keepdim=True)
+            den_3_zero = (den_3 == 0)
+            den_3[den_3_zero] = 1.0
+            s_3 = num_3 / den_3
+            s_3[den_3_zero] = 1.0
+
+            scales = s_3
+
         # Reshape back
         if self.group_size:
             x = x.flatten(dim, dim + 1)

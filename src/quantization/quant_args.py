@@ -26,6 +26,8 @@ class QuantizationObserver(str, Enum):
     MSE = "mse"
     MSE_N = "mse_n"
     LSS = "lss"
+    FOUR_OVER_SIX = "four_over_six"
+    LSS_3ROUND = "lss_3round"
 
 class QuantizationOrder(str, Enum):
     """

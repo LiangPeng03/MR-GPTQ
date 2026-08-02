@@ -20,24 +20,27 @@ MODELS=(
     # "Qwen/Qwen3-0.6B"
     # "Qwen/Qwen3-8B"
     # "meta-llama/Meta-Llama-3-8B"
-    # "meta-llama/Llama-3.2-1B"
+    "meta-llama/Llama-3.2-1B"
     "Qwen/Qwen3-1.7B"
 )
 
 # ============================================================
 # Grid Search Parameter 1: kmeans_alpha (0 1 2 3 4)
 # ============================================================
-GRID_PARAM1_NAME="kmeans_alpha"
+GRID_PARAM1_NAME="a_obs"
 # GRID_PARAM1_VALUES=(0 1 2 2.4 3 4)
-GRID_PARAM1_VALUES=(0.5 1.5 2.5 3.5)
+# GRID_PARAM1_VALUES=(0.5 1.5 2.5 3.5)
+# GRID_PARAM1_VALUES=(four_over_six lss_3round)
+GRID_PARAM1_VALUES=(minmax)
+# GRID_PARAM1_VALUES=(3 5 10 16)
 GRID_PARAM1_FLAG=""   # empty: injected inline in command body (compare.sh style)
 
 # ============================================================
 # TODO: Grid Search Parameter 2 — replace placeholder arrays
 # ============================================================
-GRID_PARAM2_NAME="grid_param2"          # e.g. "gics_top_k"
-GRID_PARAM2_VALUES=()                   # e.g. (3 5 7)
-GRID_PARAM2_FLAG="--gics_top_k"         # CLI flag
+GRID_PARAM2_NAME="rounds"          # e.g. "gics_top_k"
+GRID_PARAM2_VALUES=(1)                   # e.g. (3 5 7)
+GRID_PARAM2_FLAG=""         # CLI flag
 # ============================================================
 
 # --- 环境变量 ---
@@ -83,9 +86,9 @@ echo "==========================================================" >> $LOG_FILE
 echo "BNV PPL Ablation Started at: $(date) on GPUs: $GPU_IDS" >> $LOG_FILE
 echo "Grid Param 1: $GRID_PARAM1_NAME = ${GRID_PARAM1_VALUES[*]}" >> $LOG_FILE
 echo "Grid Param 2: $GRID_PARAM2_NAME = ${GRID_PARAM2_VALUES[*]}" >> $LOG_FILE
-printf "%-30s | %-16s | %-16s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s\n" \
-    "Model" "$GRID_PARAM1_NAME" "$GRID_PARAM2_NAME" "W-PPL" "C4-PPL" "PIQA" "ARC-C" "Hella" "WINO" >> $LOG_FILE
-echo "----------------------------------------------------------------------------------------" >> $LOG_FILE
+printf "%-30s | %-16s | %-16s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-10s\n" \
+    "Model" "$GRID_PARAM1_NAME" "$GRID_PARAM2_NAME" "W-PPL" "C4-PPL" "PIQA" "ARC-C" "Hella" "WINO" "Time(s)" >> $LOG_FILE
+echo "-----------------------------------------------------------------------------------------------------" >> $LOG_FILE
 
 # --- Determine grid loop bounds ---
 NUM_PARAM1=${#GRID_PARAM1_VALUES[@]}
@@ -143,6 +146,7 @@ for (( i=0; i<${#TASKS[@]}; i++ )); do
         export CUDA_VISIBLE_DEVICES=$GPU_ID
 
         tmp="tmp_bnv_ppl_${i}_$$.out"
+        START_TIME=$(date +%s)
         $PYTHON_BIN model_quant.py \
             --model_name_or_path="$MODEL" \
             --format=nvfp \
@@ -153,7 +157,7 @@ for (( i=0; i<${#TASKS[@]}; i++ )); do
             --a_group_size=16 \
             --transform_class=identity \
             --w_observer=mse_n \
-            --a_observer=lss \
+            --a_observer="$VAL1" \
             --quantization_order=activation \
             --hadamard_group_size=16 \
             --dataset_name_or_path=c4 \
@@ -165,12 +169,27 @@ for (( i=0; i<${#TASKS[@]}; i++ )); do
             --gptq \
             --channel_resort=channel_cluster \
             --channel_rescale=gics \
-            --kmeans_alpha="$VAL1" \
+            --kmeans_alpha=2 \
             --fuse_global_scale \
             --eval_perplexity \
             $PARAM1_SUFFIX \
             $PARAM2_SUFFIX \
             > "$tmp" 2>&1
+        END_TIME=$(date +%s)
+        ELAPSED_SEC=$((END_TIME - START_TIME))
+        # Convert to human-readable: 0h 0m 0s style
+        ELAPSED_H=$((ELAPSED_SEC / 3600))
+        ELAPSED_M=$(((ELAPSED_SEC % 3600) / 60))
+        ELAPSED_S=$((ELAPSED_SEC % 60))
+        if [ $ELAPSED_H -gt 0 ]; then
+            ELAPSED=$(printf "%dh%02dm%02ds" $ELAPSED_H $ELAPSED_M $ELAPSED_S)
+        elif [ $ELAPSED_M -gt 0 ]; then
+            ELAPSED=$(printf "%dm%02ds" $ELAPSED_M $ELAPSED_S)
+        else
+            ELAPSED="${ELAPSED_S}s"
+        fi
+
+        #  --awq=20 \--awq_round="$VAL1" \
 
         if [ $? -ne 0 ]; then
             echo "$MODEL | $VAL1 | $VAL2 | FAILED (GPU $GPU_ID)"
@@ -191,12 +210,12 @@ for (( i=0; i<${#TASKS[@]}; i++ )); do
         else
             summary=$(echo "$SUMMARY_LINE" | parse_results)
         fi
-        echo "Result ($GRID_PARAM1_NAME=$VAL1 $GRID_PARAM2_NAME=$VAL2 on GPU $GPU_ID): $summary"
+        echo "Result ($GRID_PARAM1_NAME=$VAL1 $GRID_PARAM2_NAME=$VAL2 on GPU $GPU_ID): $summary | ${ELAPSED}s"
 
         # Write to log with flock to avoid concurrent conflicts
         (
             flock -x 200
-            printf "%-30s | %-16s | %-16s | %s\n" "$MODEL" "$VAL1" "$VAL2" "$summary" >> $LOG_FILE
+            printf "%-30s | %-16s | %-16s | %s | %-10s\n" "$MODEL" "$VAL1" "$VAL2" "$summary" "${ELAPSED}" >> $LOG_FILE
         ) 200> "${LOG_FILE}.lock"
 
         rm -f "$tmp"

@@ -3,7 +3,7 @@
 export HF_ALLOW_CODE_EVAL="1"
 export HF_DATASETS_TRUST_REMOTE_CODE="1"
 
-gpu_id=1
+gpu_id=0
 export CUDA_VISIBLE_DEVICES=$gpu_id
 
 export OMP_NUM_THREADS=8
@@ -20,7 +20,7 @@ MODEL7="Qwen/Qwen3-1.7B"
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL1} \
+    --model_name_or_path=${MODEL5} \
     --format=nvfp \
     --w_bits=4 \
     --a_bits=4 \
@@ -40,7 +40,7 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --fuse_global_scale \
     --gptq \
     --channel_resort=channel_cluster \
-    --channel_rescale=gics \
+    --channel_rescale=none \
     --kmeans_block_size -1 \
     --kmeans_alpha 2 \
     --kmeans_act_alpha 0 \
