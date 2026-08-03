@@ -59,6 +59,35 @@ def get_c4(
     return trainloader
 
 
+def get_wikitext2_calib(
+    tokenizer: AutoTokenizer, 
+    max_sequence_length: int,
+    num_calibration_samples: Optional[int] = None,
+    seed: int = 42
+):
+    """Load WikiText-2 train split for calibration."""
+    random.seed(seed)
+    train_dataset_raw = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    # Filter out empty texts (WikiText uses empty lines as paragraph separators)
+    train_dataset_raw = train_dataset_raw.filter(lambda x: len(x["text"].strip()) > 0)
+    
+    # Concatenate all texts into one long sequence (same approach as get_wikitext2 eval)
+    full_text = "\n\n".join(train_dataset_raw["text"])
+    full_enc = tokenizer(full_text, return_tensors="pt").input_ids
+    
+    # Ensure we have enough tokens
+    total_tokens = full_enc.shape[1]
+    if total_tokens < max_sequence_length:
+        raise ValueError(f"WikiText-2 train has only {total_tokens} tokens, less than max_sequence_length={max_sequence_length}")
+    
+    trainloader = []
+    for _ in range(num_calibration_samples):
+        i = random.randint(0, total_tokens - max_sequence_length)
+        tokenized_sample = full_enc[:, i:i + max_sequence_length]
+        trainloader.append(tokenized_sample)
+    return trainloader
+
+
 def get_open_thoughts(
     tokenizer: AutoTokenizer, 
     max_sequence_length: int,
@@ -230,6 +259,8 @@ def get_data(
         return get_fineweb_edu(tokenizer, max_sequence_length, num_calibration_samples, seed)
     if dataset_name == "c4":
         return get_c4(tokenizer, max_sequence_length, num_calibration_samples, seed)
+    if dataset_name == "wikitext2":
+        return get_wikitext2_calib(tokenizer, max_sequence_length, num_calibration_samples, seed)
     if dataset_name == "tulu":
         return get_tulu3_sft_mixture(tokenizer, max_sequence_length, num_calibration_samples, seed)
     else:

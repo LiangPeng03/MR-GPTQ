@@ -1,25 +1,31 @@
 #!/bin/bash
-# BNV PPL Ablation Experiment Script
+# BNV PPL Ablation Experiment Script (Instance 2)
 # Supports multi-GPU dispatch (like compare.sh) and two outer grid-search loops
-# Usage: bash bnv_ppl.sh [GPU_IDS]
+# Usage: bash bnv_ppl1.sh [GPU_IDS]
 # Examples:
-#   bash bnv_ppl.sh 0        # single GPU
-#   bash bnv_ppl.sh 0,1      # dual GPU
+#   bash bnv_ppl1.sh 0        # single GPU
+#   bash bnv_ppl1.sh 0,1      # dual GPU
+#
+# NOTE: This is a parallel instance of bnv_ppl.sh, intended to run on a second
+# server that shares the same storage. Key differences from bnv_ppl.sh:
+#   - Uses bnv_ppl1.log instead of bnv_ppl.log (avoids log conflict)
+#   - Uses tmp_bnv_ppl1_* instead of tmp_bnv_ppl_* for temp files
+#   - All other settings are identical to bnv_ppl.sh
 
 # --- 配置区 ---
 GPU_IDS=${1:-0,1}
 IFS=',' read -ra GPUS <<< "$GPU_IDS"
 NUM_GPUS=${#GPUS[@]}
 
-LOG_FILE="bnv_ppl.log"
+LOG_FILE="bnv_ppl1.log"
 PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
 # --- 模型列表 ---
 MODELS=(
     # "HuggingFaceTB/SmolLM2-135M"
     # "Qwen/Qwen3-0.6B"
-    # "meta-llama/Llama-3.2-1B"
-    # "Qwen/Qwen3-1.7B"
+    "meta-llama/Llama-3.2-1B"
+    "Qwen/Qwen3-1.7B"
     "Qwen/Qwen3-8B"
     "meta-llama/Meta-Llama-3-8B"
     
@@ -32,7 +38,7 @@ GRID_PARAM1_NAME="sample"
 # GRID_PARAM1_VALUES=(0 1 2 2.4 3 4)
 # GRID_PARAM1_VALUES=(0.5 1.5 2.5 3.5)
 # GRID_PARAM1_VALUES=(four_over_six lss_3round)
-GRID_PARAM1_VALUES=()
+GRID_PARAM1_VALUES=(128 256 64)
 # GRID_PARAM1_VALUES=(3 5 10 16)
 GRID_PARAM1_FLAG=""   # empty: injected inline in command body (compare.sh style)
 
@@ -40,7 +46,7 @@ GRID_PARAM1_FLAG=""   # empty: injected inline in command body (compare.sh style
 # TODO: Grid Search Parameter 2 — replace placeholder arrays
 # ============================================================
 GRID_PARAM2_NAME="lenth"          # e.g. "gics_top_k"
-GRID_PARAM2_VALUES=()                   # e.g. (3 5 7)
+GRID_PARAM2_VALUES=(2048 1024 )                   # e.g. (3 5 7)
 GRID_PARAM2_FLAG=""         # CLI flag
 # ============================================================
 
@@ -84,7 +90,7 @@ print(f'{fmt(wiki,3)} | {fmt(c4,3)} | {fmt(piqa,4)} | {fmt(arc,4)} | {fmt(hella,
 # --- Initialize log file ---
 echo "" >> $LOG_FILE
 echo "==========================================================" >> $LOG_FILE
-echo "BNV PPL Ablation Started at: $(date) on GPUs: $GPU_IDS" >> $LOG_FILE
+echo "BNV PPL Ablation (Instance 2) Started at: $(date) on GPUs: $GPU_IDS" >> $LOG_FILE
 echo "Grid Param 1: $GRID_PARAM1_NAME = ${GRID_PARAM1_VALUES[*]}" >> $LOG_FILE
 echo "Grid Param 2: $GRID_PARAM2_NAME = ${GRID_PARAM2_VALUES[*]}" >> $LOG_FILE
 printf "%-30s | %-16s | %-16s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-10s\n" \
@@ -146,7 +152,7 @@ for (( i=0; i<${#TASKS[@]}; i++ )); do
     (
         export CUDA_VISIBLE_DEVICES=$GPU_ID
 
-        tmp="tmp_bnv_ppl_${i}_$$.out"
+        tmp="tmp_bnv_ppl1_${i}_$$.out"
         START_TIME=$(date +%s)
         $PYTHON_BIN model_quant.py \
             --model_name_or_path="$MODEL" \
@@ -157,19 +163,19 @@ for (( i=0; i<${#TASKS[@]}; i++ )); do
             --w_group_size=16 \
             --a_group_size=16 \
             --transform_class=identity \
-            --w_observer=mse \
-            --a_observer=minmax \
+            --w_observer=mse_n \
+            --a_observer=lss \
             --quantization_order=activation \
             --hadamard_group_size=16 \
             --dataset_name_or_path=c4 \
-            --num_sequences=128 \
+            --num_sequences="$VAL1" \
             --rel_damp=0.01 \
-            --sequence_length=2048 \
+            --sequence_length="$VAL2" \
             --dtype=bfloat16 \
             --show_act_mse \
             --gptq \
             --channel_resort=channel_cluster \
-            --channel_rescale=none \
+            --channel_rescale=gics \
             --kmeans_alpha=2 \
             --fuse_global_scale \
             --eval_perplexity \
@@ -204,7 +210,7 @@ for (( i=0; i<${#TASKS[@]}; i++ )); do
             # Also record failure in main log
             (
                 flock -x 200
-                printf "%-30s | %-16s | %-16s | FAILED (exit=%d) | %s | %-10s\n" "$MODEL" "$VAL1" "$VAL2" "$EXIT_CODE" "see:$FAILED_LOG" "${ELAPSED}" >> $LOG_FILE
+                printf "%-30s | %-16s | %-16s | FAILED (exit=%d) | %s | %-10s\n" "$MODEL" "$VAL1" "$VAL2" "$EXIT_CODE" "see:$FAILED_LOG" "$ELAPSED" >> $LOG_FILE
             ) 200> "${LOG_FILE}.lock"
             rm -f "$tmp"
             exit 1

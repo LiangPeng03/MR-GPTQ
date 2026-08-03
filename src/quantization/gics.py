@@ -22,11 +22,12 @@ def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=3.0, group
     num_groups = in_features // group_size
     T = X.shape[0]
     OutDim = W.shape[0]
+    dtype = X.dtype
     
-    S_g = torch.ones((num_groups, group_size), device=device) # [num_groups, 16]
+    S_g = torch.ones((num_groups, group_size), device=device, dtype=dtype) # [num_groups, 16]
     
     # 21 个候选缩放值 (0.5 到 1.5 之间，步长 0.05，包含 1.0)
-    candidates = torch.linspace(0.5, 1.5, steps=21, device=device)
+    candidates = torch.linspace(0.5, 1.5, steps=21, device=device, dtype=dtype)
     num_cands = candidates.shape[0]
     
     X_g = X.view(T, num_groups, group_size)
@@ -40,11 +41,46 @@ def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=3.0, group
         scale = scale_to_e4m3(raw_scale, gs) if gs is not None else raw_scale
         
         mat_temp.div_(scale)
-        quantized = torch.where(mat_temp > 5.0, 6.0,
-                      torch.where(mat_temp >= 3.5, 4.0,
-                      torch.where(mat_temp >= 1.75, torch.round(mat_temp),
-                                             torch.round(mat_temp * 2.0) * 0.5)))
-        mat_temp.sub_(quantized).pow_(2).mul_(scale.pow(2))
+        
+        # 从低到高串行处理，每步只存 1 个 mask
+        # 数学保证：处理后值变为极小平方误差(≤1.0)，不会干扰后续区间判断
+        # 避免 .clone()，用临时变量 x 替代，减少峰值拷贝
+        
+        # 区间 1: [0, 1.75) → round(x*2)/2
+        mask = mat_temp < 1.75
+        if mask.any():
+            x = mat_temp[mask]
+            mat_temp[mask] = (x - (x * 2.0).round() * 0.5).pow_(2)
+            del x
+        del mask
+        
+        # 区间 2: [1.75, 3.5) → round(x)
+        mask_lo = mat_temp >= 1.75
+        mask_hi = mat_temp < 3.5
+        mask_lo.logical_and_(mask_hi)
+        del mask_hi
+        if mask_lo.any():
+            x = mat_temp[mask_lo]
+            mat_temp[mask_lo] = (x - x.round()).pow_(2)
+            del x
+        del mask_lo
+        
+        # 区间 3: [3.5, 5.0] → 4.0 (常量，无需拷贝)
+        mask_lo = mat_temp >= 3.5
+        mask_hi = mat_temp <= 5.0
+        mask_lo.logical_and_(mask_hi)
+        del mask_hi
+        if mask_lo.any():
+            mat_temp[mask_lo] = mat_temp[mask_lo].sub_(4.0).pow_(2)
+        del mask_lo
+        
+        # 区间 4: (5.0, 6.0] → 6.0 (常量，无需拷贝)
+        mask = mat_temp > 5.0
+        if mask.any():
+            mat_temp[mask] = mat_temp[mask].sub_(6.0).pow_(2)
+        del mask
+        
+        mat_temp.mul_(scale.pow(2))
         return mat_temp.sum(dim=(-3, -1))
         
     abs_X_g = X_g.abs()
@@ -63,11 +99,11 @@ def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=3.0, group
     sensitivity_c = norm2_X * norm2_W #* spikiness # [num_groups, 16]
     topk_vals, topk_idx = torch.topk(sensitivity_c, k=top_k, dim=-1) # [num_groups, top_k]
     
-    target_elements = 400_000_000 # 峰值显存控制
-    max_dim = max(T, OutDim)
-    chunk_G = max(1, target_elements // (max_dim * 16 * num_cands))
+    target_elements = 80_000_000 # 峰值显存控制，对抗碎片化
+    chunk_G = max(1, target_elements // ((T + OutDim) * 16 * num_cands))
     
     for g_start in range(0, num_groups, chunk_G):
+        torch.cuda.empty_cache()  # 每次迭代前释放碎片，降低 OOM 风险
         g_end = min(g_start + chunk_G, num_groups)
         G_curr = g_end - g_start
         
@@ -79,7 +115,7 @@ def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=3.0, group
         b_w = base_w_mse[g_start:g_end].unsqueeze(0) + 1e-12
         
         # 本地维护最优的 Scale 矩阵
-        local_S = torch.ones((G_curr, group_size), device=device)
+        local_S = torch.ones((G_curr, group_size), device=device, dtype=dtype)
         
         for r in range(num_rounds):
             for k in range(top_k):
@@ -96,6 +132,7 @@ def optimize_channel_scales_coordinate_descent(X, W, weight_mse_ratio=3.0, group
                 W_temp = W_g_chunk.unsqueeze(0) / temp_S.unsqueeze(1) # [21, OutDim, G_curr, 16]
                 
                 act_mse = calc_mse_positive_inplace(X_temp) # [21, G_curr]
+                del X_temp  # X_temp 不再需要，立即释放显存
                 w_mse = calc_mse_positive_inplace(W_temp, gs=gs_w) # [21, G_curr]
                 
                 score = (act_mse / b_act) + weight_mse_ratio * (w_mse / b_w) # [21, G_curr]

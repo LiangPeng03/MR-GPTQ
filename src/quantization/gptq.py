@@ -288,6 +288,12 @@ def gptq_quantization(
         if args.cpu_offload_modules:
             block.to(device)
 
+        # === -1. SmoothQuant Pre-processing (before channel resort/rescale) ===
+        smoothquant_scales = {}
+        if getattr(args, "smoothquant_alpha", None) is not None:
+            from .smoothq import apply_smoothquant
+            smoothquant_scales = apply_smoothquant(block, input_args, input_kwargs, args, device)
+
         # === 0. Evaluate FP16 Block Outputs & Channel Resort Stats ===
         resort_perms = {}
         do_channel_resort = getattr(args, "channel_resort", "none") != "none"
@@ -934,13 +940,17 @@ def gptq_quantization(
         gate_up_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
         down_in_transform = build_transform(args.transform_class, size=model.config.intermediate_size, **transform_kwargs)     
 
-        has_resort_or_rescale = resort_perms or (hasattr(block, "gics_scales") and block.gics_scales)
+        has_resort_or_rescale = resort_perms or (hasattr(block, "gics_scales") and block.gics_scales) or smoothquant_scales
         if has_resort_or_rescale:
             from ..transforms.transforms import CompositeTransform, PermutationTransform, DiagonalScaleTransform
             
             def build_composite_with_gics(name, base_transform):
                 transforms_list = []
                 order = getattr(args, "transform_order", "kmeans_mr")
+                
+                # SmoothQuant ALWAYS goes first (before permutation and transform_order)
+                if name in smoothquant_scales:
+                    transforms_list.append(DiagonalScaleTransform(smoothquant_scales[name]))
                 
                 if order == "mr_kmeans":
                     transforms_list.append(base_transform)
@@ -955,9 +965,9 @@ def gptq_quantization(
                     
                 return CompositeTransform(transforms_list) if len(transforms_list) > 1 else base_transform
 
-            if "qkv" in resort_perms or (hasattr(block, "gics_scales") and "qkv" in block.gics_scales):
+            if "qkv" in resort_perms or (hasattr(block, "gics_scales") and "qkv" in block.gics_scales) or "qkv" in smoothquant_scales:
                 qkv_in_transform = build_composite_with_gics("qkv", qkv_in_transform)
-            if "gate_up" in resort_perms or (hasattr(block, "gics_scales") and "gate_up" in block.gics_scales):
+            if "gate_up" in resort_perms or (hasattr(block, "gics_scales") and "gate_up" in block.gics_scales) or "gate_up" in smoothquant_scales:
                 gate_up_in_transform = build_composite_with_gics("gate_up", gate_up_in_transform)
             # O: in-place permutation only for MHA (skip GQA to avoid cross-head corruption)
             if "o" in resort_perms:
@@ -969,6 +979,9 @@ def gptq_quantization(
                     block.self_attn.v_proj.weight.data = block.self_attn.v_proj.weight.data[o_perm, :]
             elif hasattr(block, "gics_scales") and "o" in block.gics_scales:
                 o_in_transform = build_composite_with_gics("o", o_in_transform)
+            # SmoothQuant-only for o (no resort, no gics)
+            elif "o" in smoothquant_scales:
+                o_in_transform = build_composite_with_gics("o", o_in_transform)
             if "down" in resort_perms:
                 down_perm = resort_perms["down"]
                 if hasattr(block, "gics_scales") and "down" in block.gics_scales:
@@ -977,6 +990,9 @@ def gptq_quantization(
                 block.mlp.gate_proj.weight.data = block.mlp.gate_proj.weight.data[down_perm, :]
                 block.mlp.up_proj.weight.data = block.mlp.up_proj.weight.data[down_perm, :]
             elif hasattr(block, "gics_scales") and "down" in block.gics_scales:
+                down_in_transform = build_composite_with_gics("down", down_in_transform)
+            # SmoothQuant-only for down (no resort, no gics)
+            elif "down" in smoothquant_scales:
                 down_in_transform = build_composite_with_gics("down", down_in_transform)
 
         # 2. Replace blocks with quantized versions

@@ -84,6 +84,12 @@ def rtn_quantization(
         if args.cpu_offload_modules:
             block.to(device)
 
+        # === -1. SmoothQuant Pre-processing (before channel resort/rescale) ===
+        smoothquant_scales = {}
+        if getattr(args, "smoothquant_alpha", None) is not None and need_calibration:
+            from .smoothq import apply_smoothquant
+            smoothquant_scales = apply_smoothquant(block, input_args, input_kwargs, args, device)
+
         # === 0. Resonance-Aware Channel Reordering & Global Scale Lock ===
         resort_perms = {}
         do_channel_resort = getattr(args, "channel_resort", "none") != "none"
@@ -635,6 +641,8 @@ def rtn_quantization(
                             p[i : i + h_group_size] = block_perm + i
                     print(f"    [{name:8}] KMeans FP4 grouping (target={args.channel_resort}, gs={quant_group_size}) completed.")
                     resort_perms[name] = p
+                    del W
+                    torch.cuda.empty_cache()
                 else:
                     # Old Resonance R_val Strategy
                     h_group_size = args.hadamard_group_size
@@ -679,6 +687,12 @@ def rtn_quantization(
                     if not hasattr(block, "gics_scales"):
                         block.gics_scales = {}
                     block.gics_scales[name] = S_top3
+                    del W, X_perm, W_perm
+                    act_means[name] = None  # 立即释放，避免累积占满显存
+                    torch.cuda.empty_cache()
+
+            act_means.clear()
+            torch.cuda.empty_cache()
 
         # === 0.5 Run GICS independently when channel_resort is off ===
         if do_channel_rescale and not do_channel_resort:
@@ -697,6 +711,12 @@ def rtn_quantization(
                 if not hasattr(block, "gics_scales"):
                     block.gics_scales = {}
                 block.gics_scales[name] = S_gics
+                del W, X_perm, W_perm
+                act_means[name] = None  # 立即释放，避免累积占满显存
+                torch.cuda.empty_cache()
+
+            act_means.clear()
+            torch.cuda.empty_cache()
 
         # 1. Init transforms
         qkv_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
@@ -704,12 +724,15 @@ def rtn_quantization(
         gate_up_in_transform = build_transform(args.transform_class, size=model.config.hidden_size, **transform_kwargs)
         down_in_transform = build_transform(args.transform_class, size=model.config.intermediate_size, **transform_kwargs)     
 
-        has_resort_or_rescale = resort_perms or (hasattr(block, "gics_scales") and block.gics_scales)
+        has_resort_or_rescale = resort_perms or (hasattr(block, "gics_scales") and block.gics_scales) or smoothquant_scales
         if has_resort_or_rescale:
             from ..transforms.transforms import CompositeTransform, PermutationTransform, DiagonalScaleTransform
             
             def build_composite_with_gics(name, base_transform):
                 transforms_list = []
+                # SmoothQuant ALWAYS goes first (before permutation)
+                if name in smoothquant_scales:
+                    transforms_list.append(DiagonalScaleTransform(smoothquant_scales[name]))
                 if name in resort_perms:
                     transforms_list.append(PermutationTransform(resort_perms[name]))
                 if hasattr(block, "gics_scales") and name in block.gics_scales:
@@ -717,27 +740,20 @@ def rtn_quantization(
                 transforms_list.append(base_transform)
                 return CompositeTransform(transforms_list) if len(transforms_list) > 1 else base_transform
 
-            if "qkv" in resort_perms or (hasattr(block, "gics_scales") and "qkv" in block.gics_scales):
+            if "qkv" in resort_perms or (hasattr(block, "gics_scales") and "qkv" in block.gics_scales) or "qkv" in smoothquant_scales:
                 qkv_in_transform = build_composite_with_gics("qkv", qkv_in_transform)
-            if "gate_up" in resort_perms or (hasattr(block, "gics_scales") and "gate_up" in block.gics_scales):
+            if "gate_up" in resort_perms or (hasattr(block, "gics_scales") and "gate_up" in block.gics_scales) or "gate_up" in smoothquant_scales:
                 gate_up_in_transform = build_composite_with_gics("gate_up", gate_up_in_transform)
             # O: in-place permutation only for MHA (skip GQA to avoid cross-head corruption)
             if "o" in resort_perms:
                 o_perm = resort_perms["o"]
                 if hasattr(block, "gics_scales") and "o" in block.gics_scales:
-                    # In-place DiagonalScaleTransform applies to W via inverse, but wait:
-                    # DiagonalScaleTransform modifies activation as X * S, so it modifies Weight as W * S^-1
-                    # So we should apply this explicitly here if we do in-place for O.
-                    # But wait, o_in_transform is NOT fully in-place for activations! o_in_transform is PASSED to get_attention_layer
-                    # Actually, for "o" and "down", if we do in-place weight permutation, the transform is STILL passed to quantized_attn!
-                    # Wait! In original code, o_in_transform is untouched by PermutationTransform because we do in-place weight data moving.
-                    # But if we have gics_scales, it MUST be applied to activations dynamically!
-                    # So we MUST add DiagonalScaleTransform to o_in_transform!
                     o_in_transform = build_composite_with_gics("o", o_in_transform)
-                    # For weights, we only do the permutation in-place, the scale will be handled by o_in_transform mathematically via fix_parametrization
                 if block.self_attn.v_proj.weight.shape[0] == block.self_attn.o_proj.weight.shape[1]:
                     block.self_attn.o_proj.weight.data = block.self_attn.o_proj.weight.data[:, o_perm]
                     block.self_attn.v_proj.weight.data = block.self_attn.v_proj.weight.data[o_perm, :]
+            elif (hasattr(block, "gics_scales") and "o" in block.gics_scales) or "o" in smoothquant_scales:
+                o_in_transform = build_composite_with_gics("o", o_in_transform)
             # Down: in-place weight permutation
             if "down" in resort_perms:
                 down_perm = resort_perms["down"]
@@ -746,6 +762,8 @@ def rtn_quantization(
                 block.mlp.down_proj.weight.data = block.mlp.down_proj.weight.data[:, down_perm]
                 block.mlp.gate_proj.weight.data = block.mlp.gate_proj.weight.data[down_perm, :]
                 block.mlp.up_proj.weight.data = block.mlp.up_proj.weight.data[down_perm, :]
+            elif (hasattr(block, "gics_scales") and "down" in block.gics_scales) or "down" in smoothquant_scales:
+                down_in_transform = build_composite_with_gics("down", down_in_transform)
 
         # NOTE: Do NOT pre-rotate weights here. fix_parametrization() below handles it.
         # Pre-rotating would cause double rotation since H(H(W)) = W.

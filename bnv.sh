@@ -41,7 +41,7 @@ for MODEL in "${MODELS[@]}"; do
     CMD="$PYTHON_BIN model_quant.py \
         --model_name_or_path=$MODEL \
         --format=nvfp \
-        --w_bits=16 \
+        --w_bits=4 \
         --a_bits=4 \
         --seed=0 \
         --w_group_size=16 \
@@ -51,7 +51,7 @@ for MODEL in "${MODELS[@]}"; do
         --a_observer=lss \
         --quantization_order=activation \
         --hadamard_group_size=16 \
-        --dataset_name_or_path=c4 \
+        --dataset_name_or_path=wikitext2 \
         --num_sequences=128 \
         --rel_damp=0.01 \
         --sequence_length=2048 \
@@ -63,7 +63,9 @@ for MODEL in "${MODELS[@]}"; do
         --kmeans_block_size -1 \
         --kmeans_alpha 2 \
         --fuse_global_scale \
-        --eval_perplexity "
+        --eval_perplexity \
+        --eval_openllm \
+        --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge "
 
     # 运行并静默非核心输出
     tmp_out="tmp_eval.out"
@@ -86,8 +88,11 @@ for MODEL in "${MODELS[@]}"; do
     # 下游任务: 有 SUMMARY 就解析，没有就 NA
     SUMMARY_LINE=$(grep "\[RESULT_SUMMARY\]" $tmp_out | sed 's/\[RESULT_SUMMARY\] //')
     if [ -n "$SUMMARY_LINE" ]; then
-        PARSE="$PYTHON_BIN -c \"import sys,json;d=json.load(sys.stdin)['results'];print(d.get('piqa','NA'),d.get('arc_challenge','NA'),d.get('winogrande','NA'),d.get('boolq','NA'),d.get('hellaswag','NA'))\""
-        read PIQA ARC WINO BOOLQ HELLA <<< "$(echo "$SUMMARY_LINE" | $PARSE)"
+        read PIQA ARC WINO BOOLQ HELLA <<< "$(echo "$SUMMARY_LINE" | $PYTHON_BIN -c "
+import sys, json
+d = json.load(sys.stdin)['results']
+print(d.get('piqa','NA'), d.get('arc_challenge','NA'), d.get('winogrande','NA'), d.get('boolq','NA'), d.get('hellaswag','NA'))
+")"
     else
         PIQA="NA"
         ARC="NA"

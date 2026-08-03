@@ -357,6 +357,14 @@ def parse_args():
         default=128,
         help="Hadamard group size"
     )
+    parser.add_argument(
+        "--smoothquant_alpha",
+        type=float,
+        default=None,
+        help="SmoothQuant alpha for activation-weight smoothing. "
+             "0.0 = max migration to weights, 0.5 = balanced, 1.0 = max migration to activations. "
+             "None disables SmoothQuant. Executes before channel_resort/channel_rescale.",
+    )
     # Logging params
     parser.add_argument(
         "--log_wandb",
