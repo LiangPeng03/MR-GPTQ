@@ -222,6 +222,15 @@ class QuantizedLlamaAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # Transformers has used both ``past_key_value`` and
+        # ``past_key_values`` at the decoder-to-attention boundary across
+        # releases.  The latter can arrive through **kwargs because this
+        # wrapper keeps the former name in its explicit signature.  If it is
+        # not normalized here, generation silently skips the cache update and
+        # every decode step attends only to its newly generated token.
+        if past_key_value is None:
+            past_key_value = kwargs.pop("past_key_values", None)
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 

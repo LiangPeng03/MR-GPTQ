@@ -142,6 +142,13 @@ class QuantizedQwen3Attention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # Keep compatibility with Transformers versions that pass the cache
+        # as ``past_key_values``.  With the singular name in this wrapper's
+        # signature, the plural form otherwise lands in **kwargs and the
+        # cache update is silently skipped during autoregressive decoding.
+        if past_key_value is None:
+            past_key_value = kwargs.pop("past_key_values", None)
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 

@@ -511,6 +511,8 @@ def main():
     )
     if not args.cpu_offload_modules:
         model = model.to(device)
+    # Disable cache during calibration; generation tasks enable it after
+    # quantization once the repaired attention cache path is in place.
     model.config.use_cache = False
     model.requires_grad_(False)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -581,7 +583,8 @@ def main():
         
         # Now move model back to GPU - it should be the ONLY major thing on VRAM now
         model = model.to(device)
-        # Disable KV cache to prevent returning massive past_key_values (saves ~5.5GB VRAM for batch_size=64)
+        # Keep cache disabled for full-sequence/perplexity work by default.
+        # _run_task enables it only for autoregressive generation tasks.
         model.config.use_cache = False
 
         # === Memory Diagnostics ===
@@ -656,7 +659,12 @@ def main():
             import gc
             gc.collect()
             torch.cuda.empty_cache()
-            # Create fresh HFLM per task to prevent KV cache / logits accumulation
+            # Create fresh HFLM per task to prevent KV cache / logits accumulation.
+            # Generation tasks opt into the repaired KV-cache path below.
+            use_kv_cache = task_name in {"gsm8k", "gsm8k_llama", "mbpp"}
+            model.config.use_cache = use_kv_cache
+            if getattr(model, "generation_config", None) is not None:
+                model.generation_config.use_cache = use_kv_cache
             lm = HFLM(
                 pretrained=model,
                 tokenizer=tokenizer,

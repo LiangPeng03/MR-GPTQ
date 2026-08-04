@@ -32,7 +32,7 @@ $HOME/.conda/envs/awq/bin/python model_quant.py \
     --a_observer=lss \
     --quantization_order=activation \
     --hadamard_group_size=16 \
-    --dataset_name_or_path=wikitext2 \
+    --dataset_name_or_path=c4 \
     --num_sequences=128 \
     --rel_damp=0.01 \
     --sequence_length=2048 \
