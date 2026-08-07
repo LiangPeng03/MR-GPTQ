@@ -295,6 +295,13 @@ def parse_args():
              "Legacy aliases 'kmeans_fp4', 'kmeans_fp4_w', 'kmeans_fp4_top3' are also accepted for backward compatibility.",
     )
     parser.add_argument(
+        "--channel_seed_strategy",
+        type=str,
+        default="max_sum",
+        choices=["max_sum", "max_min"],
+        help="Seed selection for channel_cluster: cumulative-loss max-sum (default) or farthest-first max-min.",
+    )
+    parser.add_argument(
         "--channel_rescale",
         type=str,
         default="none",

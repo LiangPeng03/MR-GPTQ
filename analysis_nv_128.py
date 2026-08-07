@@ -173,6 +173,55 @@ def print_report(layer_idx, block_idx, token_idx, orig, rotated, results):
         locked_info = f"  Rot_Locked={rot_locked['total_mse']:.6f}" if rot_locked else ""
         print(f"  Total MSE:  NoRot={norot['total_mse']:.6f}  Rot={rot['total_mse']:.6f}{locked_info}  Ratio={ratio:.2f}× ({verdict})")
 
+def print_special_group_values(layer_idx, block_idx, token_idx, tag, group_idx,
+                               group_orig, group_rotated, results):
+    """Print the two 16-value groups used by the summary figure.
+
+    The diagnostic script selects the 16-channel group containing the largest
+    original activation.  Keeping the printout here (rather than in the plot
+    code) makes the exact floating-point values available for reproducing a
+    paper figure on the remote machine.
+    """
+    if os.environ.get("PRINT_SPECIAL_GROUPS", "1").lower() in {"0", "false", "no"}:
+        return
+
+    def fmt(values):
+        return np.array2string(
+            np.asarray(values, dtype=np.float64),
+            precision=10,
+            separator=", ",
+            max_line_width=240,
+        )
+
+    no = results["nvfp4_norot"]["groups"][group_idx]
+    rot = results["nvfp4_rot"]["groups"][group_idx]
+    locked = results["nvfp4_rot_locked"]["groups"][group_idx]
+
+    print("\n" + "=" * 108)
+    print(
+        f"[SPECIAL_GROUP] layer={layer_idx} tag={tag} block128={block_idx} "
+        f"token={token_idx} group16=G{group_idx}"
+    )
+    print(f"[SPECIAL_GROUP] before_rotation = {fmt(group_orig)}")
+    print(f"[SPECIAL_GROUP] after_rotation  = {fmt(group_rotated)}")
+    print(f"[SPECIAL_GROUP] q_norot         = {fmt(no['quantized'])}")
+    print(f"[SPECIAL_GROUP] q_rot_unlocked  = {fmt(rot['quantized'])}")
+    print(f"[SPECIAL_GROUP] q_rot_locked    = {fmt(locked['quantized'])}")
+    print(
+        f"[SPECIAL_GROUP] scale_norot={no['scale']:.10f} "
+        f"mse_norot={no['mse']:.10f}"
+    )
+    print(
+        f"[SPECIAL_GROUP] scale_rot_unlocked={rot['scale']:.10f} "
+        f"mse_rot_unlocked={rot['mse']:.10f}"
+    )
+    print(
+        f"[SPECIAL_GROUP] scale_rot_locked={locked['scale']:.10f} "
+        f"mse_rot_locked={locked['mse']:.10f}"
+    )
+    print("=" * 108)
+
+
 def plot_block(layer_idx, block_idx, token_idx, orig, rotated, results, output_path):
     """
     2×3 图：
@@ -294,6 +343,16 @@ def main():
             group_idx = np.abs(orig).argmax() // 16
             group_orig = orig[group_idx*16 : (group_idx+1)*16]
             group_rotated = rotated[group_idx*16 : (group_idx+1)*16]
+
+            # The summary figure's two representative cases are the outlier
+            # and median-token groups from the final inspected layer.  Print
+            # their exact values so the paper illustration can use the same
+            # data as this diagnostic run without dumping every layer/group.
+            if layer_idx == layers[-1]:
+                print_special_group_values(
+                    layer_idx, best_block, token_idx, tag, group_idx,
+                    group_orig, group_rotated, results
+                )
             
             # Compute group-level stats
             max_idx_grp = np.argmax(np.abs(group_orig))

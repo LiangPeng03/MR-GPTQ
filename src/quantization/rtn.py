@@ -443,21 +443,41 @@ def rtn_quantization(
                 
                 if channel_weights is not None:
                     ch_sums = ch_sums * channel_weights
-                accumulated_dist = torch.zeros(dim, device=device, dtype=torch.float32)
-                seed_order = []
                 first_seed = ch_sums.argmax().item()
-                seed_order.append(first_seed)
-                accumulated_dist[first_seed] = -float('inf')
-                dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed], c_weights=channel_weights)
-                accumulated_dist += dists
-                accumulated_dist[first_seed] = -float('inf')
-                
-                for k in range(1, n_groups):
-                    new_seed = accumulated_dist.argmax().item()
-                    seed_order.append(new_seed)
-                    accumulated_dist[new_seed] = -float('inf')
-                    dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed], c_weights=channel_weights)
+                seed_order = []
+                seed_strategy = getattr(args, "channel_seed_strategy", "max_sum")
+                if seed_strategy == "max_min":
+                    # Farthest-first (max-min): maximize the distance to the
+                    # closest already selected seed at each step.
+                    min_dist = torch.full((dim,), float("inf"), device=device, dtype=torch.float32)
+                    selected = torch.zeros(dim, dtype=torch.bool, device=device)
+                    for k in range(n_groups):
+                        if k == 0:
+                            new_seed = first_seed
+                        else:
+                            candidates = min_dist.masked_fill(selected, -float("inf"))
+                            new_seed = candidates.argmax().item()
+                        seed_order.append(new_seed)
+                        selected[new_seed] = True
+                        dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed], c_weights=channel_weights)
+                        min_dist = dists if k == 0 else torch.minimum(min_dist, dists)
+                elif seed_strategy == "max_sum":
+                    # Cumulative-loss max-sum dispersion (the production default).
+                    accumulated_dist = torch.zeros(dim, device=device, dtype=torch.float32)
+                    seed_order.append(first_seed)
+                    accumulated_dist[first_seed] = -float('inf')
+                    dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed], c_weights=channel_weights)
                     accumulated_dist += dists
+                    accumulated_dist[first_seed] = -float('inf')
+
+                    for k in range(1, n_groups):
+                        new_seed = accumulated_dist.argmax().item()
+                        seed_order.append(new_seed)
+                        accumulated_dist[new_seed] = -float('inf')
+                        dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed], c_weights=channel_weights)
+                        accumulated_dist += dists
+                else:
+                    raise ValueError(f"Unsupported channel_seed_strategy: {seed_strategy}")
 
                 opt_groups = [[s] for s in seed_order]
                 group_maxes = X_abs_T[seed_order].clone()
