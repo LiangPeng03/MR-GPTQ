@@ -1,0 +1,2 @@
+model_label,model,dtype,batch_size,input_tokens,requested_output_tokens,warmup,repeats,median_time_sec,median_generated_tokens,median_tokens_per_sec,mean_tokens_per_sec,std_tokens_per_sec,peak_memory_gb
+b968826d9c46dd6066d109eabc6255188de91218,/home/pengliang/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218,bfloat16,1,512,32,1,1,0.3852744922041893,32,83.05766576168898,83.05766576168898,0.0,28.73809814453125

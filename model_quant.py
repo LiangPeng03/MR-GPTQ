@@ -56,6 +56,59 @@ def auto_or_int(value):
         raise argparse.ArgumentTypeError(f"Must be 'auto' or an integer, got '{value}'")
 
 
+def enable_cpu_offload_ppl(model, device):
+    """Run PPL forwards one transformer block at a time on ``device``.
+
+    This is intentionally limited to cache-free perplexity evaluation.  The model
+    remains on CPU except for the embedding/output modules and the transformer
+    block currently executing.  It makes pseudo-quantized models larger than one
+    GPU evaluable, at the cost of substantial CPU-GPU transfer overhead.
+    """
+    backbone = getattr(model, "model", None)
+    layers = getattr(backbone, "layers", None)
+    if backbone is None or layers is None:
+        raise ValueError(
+            "--cpu_offload_eval currently supports causal-LM models with "
+            "model.layers (for example Llama and Qwen families)."
+        )
+
+    # These modules are used outside the individual transformer blocks, so they
+    # must stay with the hidden states on the evaluation GPU.
+    resident_modules = [
+        getattr(backbone, "embed_tokens", None),
+        getattr(backbone, "norm", None),
+        getattr(backbone, "rotary_emb", None),
+        model.get_output_embeddings(),
+    ]
+    for module in resident_modules:
+        if module is not None:
+            module.to(device)
+
+    def move_block_to_gpu(module, inputs):
+        module.to(device)
+        return inputs
+
+    def move_block_to_cpu(module, inputs, output):
+        module.cpu()
+        return output
+
+    # Keep hook handles alive for the duration of evaluation.  Registering hooks
+    # only on blocks avoids moving the whole model through the root module.
+    model._cpu_offload_ppl_hook_handles = []
+    for block in layers:
+        model._cpu_offload_ppl_hook_handles.append(
+            block.register_forward_pre_hook(move_block_to_gpu)
+        )
+        model._cpu_offload_ppl_hook_handles.append(
+            block.register_forward_hook(move_block_to_cpu)
+        )
+
+    print(
+        f"[CPU offload eval] Enabled cache-free block streaming for {len(layers)} "
+        f"transformer layers on {device}."
+    )
+
+
 def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args):
     config = model.config
     # Prepare directory to save model
@@ -247,6 +300,14 @@ def parse_args():
         choices=["", "realquant", "pseudoquant"],
         help="Whether export quantized model in realquant or pseudoquant format.",
     )
+    parser.add_argument(
+        "--validate_realquant_export",
+        action="store_true",
+        help=(
+            "Validate each saved NVFP4 layer by decoding its checkpoint "
+            "representation and comparing it with the in-memory export values."
+        ),
+    )
     # AWQ params
     parser.add_argument(
         "--awq",
@@ -398,6 +459,50 @@ def parse_args():
     parser.add_argument("--seed", default=42, type=int, help="random seed.")
     parser.add_argument("--cpu_offload_modules", action="store_true", help="whether to offload modules to CPU.")
     parser.add_argument("--cpu_offload_activations", action="store_true", help="whether to offload activations to CPU.")
+    parser.add_argument(
+        "--cpu_offload_eval",
+        action="store_true",
+        help=(
+            "Stream one transformer block at a time from CPU to GPU during "
+            "cache-free perplexity evaluation. Requires --cpu_offload_modules; "
+            "not supported for lm-eval or generation tasks."
+        ),
+    )
+    parser.add_argument(
+        "--hf_device_map",
+        choices=["none", "auto"],
+        default="none",
+        help=(
+            "Transformers device-map mode. 'auto' shards a full-precision model across "
+            "GPU and CPU using Accelerate; currently intended for w16/a16 baseline evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--hf_max_gpu_memory",
+        type=str,
+        default="82GiB",
+        help="Maximum GPU memory available to --hf_device_map auto (e.g. 82GiB).",
+    )
+    parser.add_argument(
+        "--hf_max_cpu_memory",
+        type=str,
+        default="460GiB",
+        help="Maximum CPU memory available to --hf_device_map auto (e.g. 460GiB).",
+    )
+    parser.add_argument(
+        "--hf_offload_folder",
+        type=str,
+        default=None,
+        help="Folder for optional disk offload used by Transformers/Accelerate.",
+    )
+    parser.add_argument(
+        "--hf_allow_legacy_accelerate",
+        action="store_true",
+        help=(
+            "Experimental compatibility bypass for Transformers 5 with an older installed "
+            "Accelerate. It affects only --hf_device_map auto."
+        ),
+    )
     parser.add_argument("--amp", action="store_true", help="whether to enable fp16 autocasting.")
     parser.add_argument("--compile", action="store_true", help="whether to use torch.compile.")
     parser.add_argument("--fuse_global_scale", action="store_true", help="whether to fuse global scale in qkv and gate_up.")
@@ -499,6 +604,14 @@ def main():
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     
     args = parse_args()
+    if args.cpu_offload_eval:
+        if not args.cpu_offload_modules:
+            raise ValueError("--cpu_offload_eval requires --cpu_offload_modules.")
+        if not args.eval_perplexity or args.eval_openllm:
+            raise ValueError(
+                "--cpu_offload_eval supports only --eval_perplexity. "
+                "Do not combine it with --eval_openllm."
+            )
     # Fix seed
     fix_seed(args.seed)
     # Set device
@@ -510,14 +623,73 @@ def main():
     if args.log_wandb:
         wandb.init(config=args)
     # Model
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path, 
-        dtype=args.dtype, 
+    if args.hf_device_map == "auto" and (args.w_bits < 16 or args.a_bits < 16):
+        raise ValueError(
+            "--hf_device_map auto currently supports only w16/a16 baseline evaluation. "
+            "Use the existing --cpu_offload_modules path for layer-wise quantization."
+        )
+    if args.hf_device_map == "auto" and args.cpu_offload_modules:
+        raise ValueError("Choose either --hf_device_map auto or --cpu_offload_modules, not both.")
+    if args.hf_device_map == "auto" and args.hf_allow_legacy_accelerate:
+        # Transformers 5 performs a version-gate before it calls Accelerate's device-map
+        # implementation.  Accelerate 0.34 already exposes the basic dispatch APIs used
+        # here, so allow an explicit, opt-in compatibility probe without changing the
+        # installed environment.  Any missing legacy API will still fail with its original
+        # traceback during loading; this flag never affects ordinary quantization runs.
+        try:
+            import importlib
+            import accelerate
+            from accelerate import dispatch_model, infer_auto_device_map  # noqa: F401
+            import transformers.integrations.accelerate as hf_accelerate
+        except ImportError as exc:
+            raise RuntimeError(
+                "--hf_allow_legacy_accelerate needs an installed Accelerate with "
+                "dispatch_model and infer_auto_device_map."
+            ) from exc
+
+        if not hf_accelerate.is_accelerate_available():
+            # `transformers.integrations.accelerate` conditionally imports helpers such
+            # as `accelerate_max_memory` at module-import time.  Patching only its final
+            # version check leaves those globals undefined, so patch the two exported
+            # availability predicates and reload the integration module once.
+            import transformers.utils as hf_utils
+            import transformers.utils.import_utils as hf_import_utils
+
+            _legacy_accelerate_available = lambda *unused_args, **unused_kwargs: True
+            hf_utils.is_accelerate_available = _legacy_accelerate_available
+            hf_import_utils.is_accelerate_available = _legacy_accelerate_available
+            hf_accelerate = importlib.reload(hf_accelerate)
+            print(
+                "[HF device map] Experimental legacy-Accelerate compatibility bypass "
+                f"enabled (installed accelerate={accelerate.__version__})."
+            )
+
+    model_load_kwargs = dict(
+        dtype=args.dtype,
         low_cpu_mem_usage=True,
         attn_implementation="sdpa",
     )
-    if not args.cpu_offload_modules:
+    if args.hf_device_map == "auto":
+        offload_folder = args.hf_offload_folder or os.path.join(os.getcwd(), "hf_offload")
+        os.makedirs(offload_folder, exist_ok=True)
+        model_load_kwargs.update(
+            device_map="auto",
+            max_memory={0: args.hf_max_gpu_memory, "cpu": args.hf_max_cpu_memory},
+            offload_folder=offload_folder,
+            offload_state_dict=True,
+        )
+        print(
+            "[HF device map] Loading with GPU+CPU dispatch "
+            f"(gpu={args.hf_max_gpu_memory}, cpu={args.hf_max_cpu_memory}, "
+            f"offload_folder={offload_folder})."
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_load_kwargs)
+    is_hf_dispatched = args.hf_device_map == "auto"
+    if not args.cpu_offload_modules and not is_hf_dispatched:
         model = model.to(device)
+    elif is_hf_dispatched:
+        print(f"[HF device map] {getattr(model, 'hf_device_map', {})}")
     # Disable cache during calibration; generation tasks enable it after
     # quantization once the repaired attention cache path is in place.
     model.config.use_cache = False
@@ -565,12 +737,16 @@ def main():
         for _ in range(3): gc.collect()
         torch.cuda.empty_cache()
 
+    if args.compile and is_hf_dispatched:
+        raise ValueError("--compile is not supported with --hf_device_map auto.")
     if args.compile:
         model = torch.compile(model)
 
     if args.eval_perplexity or args.eval_openllm:
-        # Move model to CPU briefly to ensure NO hidden quantization tensors are kept on GPU
-        model = model.to('cpu')
+        # A dispatched model must stay in place: Accelerate owns its GPU/CPU hooks.
+        if not is_hf_dispatched:
+            # Move model to CPU briefly to ensure NO hidden quantization tensors are kept on GPU
+            model = model.to('cpu')
         if 'calibration_data' in locals():
             del calibration_data
         import gc
@@ -578,7 +754,8 @@ def main():
         torch.cuda.empty_cache()
         
         # DIAGNOSTIC: Check GPU after cleanup
-        print(f"\n[MEM DIAG] After model.to('cpu') + empty_cache:")
+        location = "after dispatched-model cleanup" if is_hf_dispatched else "after model.to('cpu') + empty_cache"
+        print(f"\n[MEM DIAG] {location}:")
         print(f"[MEM DIAG]   PyTorch allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         print(f"[MEM DIAG]   PyTorch reserved:  {torch.cuda.memory_reserved() / 1e9:.2f} GB")
         
@@ -588,8 +765,12 @@ def main():
             if isinstance(module, _QLinear):
                 module.weight_quantizer = None
         
-        # Now move model back to GPU - it should be the ONLY major thing on VRAM now
-        model = model.to(device)
+        # Do not collapse a dispatched 70B model back onto one GPU.  The PPL-only
+        # CPU offload mode instead installs per-block transfer hooks below.
+        if args.cpu_offload_eval:
+            enable_cpu_offload_ppl(model, device)
+        elif not is_hf_dispatched:
+            model = model.to(device)
         # Keep cache disabled for full-sequence/perplexity work by default.
         # _run_task enables it only for autoregressive generation tasks.
         model.config.use_cache = False
@@ -672,10 +853,13 @@ def main():
             model.config.use_cache = use_kv_cache
             if getattr(model, "generation_config", None) is not None:
                 model.generation_config.use_cache = use_kv_cache
+            effective_batch_size = batch_size
+            if isinstance(args.lm_eval_batch_size, int):
+                effective_batch_size = min(batch_size, args.lm_eval_batch_size)
             lm = HFLM(
                 pretrained=model,
                 tokenizer=tokenizer,
-                batch_size=batch_size,
+                batch_size=effective_batch_size,
                 max_length=2048,
             )
             eval_kwargs = {"model": lm, "tasks": [task_name], "num_fewshot": num_fewshot, "confirm_run_unsafe_code": True}
