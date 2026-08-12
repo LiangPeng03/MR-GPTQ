@@ -2,18 +2,18 @@
 
 # --- 配置区 ---
 GPU_ID=0
-LOG_FILE="eval_summary_4000.log"
+LOG_FILE="eval_summary_gptq_4000.log"
 PYTHON_BIN="$HOME/.conda/envs/awq/bin/python"
 
 # 待测试模型列表
 MODELS=(
-    "HuggingFaceTB/SmolLM2-135M"
-    "Qwen/Qwen3-0.6B"
+    # "HuggingFaceTB/SmolLM2-135M"
+    # "Qwen/Qwen3-0.6B"
     "Qwen/Qwen3-8B"
     "meta-llama/Meta-Llama-3-8B"
     # "meta-llama/Llama-2-7b-hf"
-    "meta-llama/Llama-3.2-1B"
-    "Qwen/Qwen3-1.7B"
+    # "meta-llama/Llama-3.2-1B"
+    # "Qwen/Qwen3-1.7B"
 )
 
 # 屏蔽冗余 Warning 和日志
@@ -47,8 +47,8 @@ for MODEL in "${MODELS[@]}"; do
         --w_group_size=16 \
         --a_group_size=16 \
         --transform_class=identity \
-        --w_observer=mse_n \
-        --a_observer=lss \
+        --w_observer=mse \
+        --a_observer=minmax \
         --quantization_order=activation \
         --hadamard_group_size=16 \
         --dataset_name_or_path=c4 \
@@ -58,17 +58,16 @@ for MODEL in "${MODELS[@]}"; do
         --dtype=bfloat16 \
         --show_act_mse \
         --gptq \
-        --channel_resort=channel_cluster \
-        --channel_rescale=gics \
+        --channel_resort=none \
+        --channel_rescale=none \
         --kmeans_block_size -1 \
         --kmeans_alpha 2 \
         --fuse_global_scale \
-        --eval_perplexity \
         --eval_openllm \
-        --lm_eval_tasks piqa winogrande boolq hellaswag arc_challenge "
+        --lm_eval_tasks hellaswag arc_challenge "
 
     # 运行并静默非核心输出
-    tmp_out="tmp_eval0.out"
+    tmp_out="tmp_eval2.out"
     echo "Launch Command: $CMD" >> $LOG_FILE
     $CMD > $tmp_out 2>&1
 

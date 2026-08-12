@@ -882,13 +882,13 @@ def main():
             _run_task("singleeq", num_fewshot=5, batch_size=16, limit=args.limit)
         # Hellaswag (10-shot) - Medium batch, limit=400 (four-over-six convention)
         if "hellaswag" in args.lm_eval_tasks:
-            _run_task("hellaswag", num_fewshot=10, batch_size=8, limit=400)
+            _run_task("hellaswag", num_fewshot=10, batch_size=8, limit=4000)
         # PIQA (0-shot) - Can handle very large batch
         if "piqa" in args.lm_eval_tasks:
             _run_task("piqa", num_fewshot=0, batch_size=64, limit=args.limit)
         # ARC Challenge (25-shot) - Must keep batch_size=1, limit=400 (four-over-six convention)
         if "arc_challenge" in args.lm_eval_tasks:
-            _run_task("arc_challenge", num_fewshot=25, batch_size=8, limit=400)
+            _run_task("arc_challenge", num_fewshot=25, batch_size=8, limit=args.limit)
         # BoolQ (0-shot) - Passages are long, use smaller batch
         if "boolq" in args.lm_eval_tasks:
             _run_task("boolq", num_fewshot=0, batch_size=8, limit=args.limit)
