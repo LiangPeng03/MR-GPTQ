@@ -173,6 +173,68 @@ def print_report(layer_idx, block_idx, token_idx, orig, rotated, results):
         locked_info = f"  Rot_Locked={rot_locked['total_mse']:.6f}" if rot_locked else ""
         print(f"  Total MSE:  NoRot={norot['total_mse']:.6f}  Rot={rot['total_mse']:.6f}{locked_info}  Ratio={ratio:.2f}× ({verdict})")
 
+def compute_loss_zone_mse(values, quantized, scale):
+    """Return per-zone squared-error contributions for the Figure 2b zones.
+
+    Zones are defined on the normalized magnitude ``abs(x) / scale``:
+      * medium: [2.25, 2.75], [3.25, 3.75], [4.25, 4.50], [5.50, 5.75]
+      * high:   (4.50, 5.50)
+      * low:    all remaining values
+
+    ``total_mse`` is the mean over the complete 16-value group.  Zone values
+    are sums of squared error so their percentages add up to 100%.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    quantized = np.asarray(quantized, dtype=np.float64)
+    squared_error = (quantized - values) ** 2
+
+    if scale > 0:
+        normalized = np.abs(values) / float(scale)
+    else:
+        normalized = np.zeros_like(values)
+
+    medium = (
+        ((normalized >= 2.25) & (normalized <= 2.75))
+        | ((normalized >= 3.25) & (normalized <= 3.75))
+        | ((normalized >= 4.25) & (normalized <= 4.50))
+        | ((normalized >= 5.50) & (normalized <= 5.75))
+    )
+    high = (normalized > 4.50) & (normalized < 5.50)
+    low = ~(medium | high)
+
+    contributions = {
+        "low": float(squared_error[low].sum()),
+        "medium": float(squared_error[medium].sum()),
+        "high": float(squared_error[high].sum()),
+    }
+    total_sse = float(squared_error.sum())
+    if total_sse > 0:
+        percentages = {
+            name: 100.0 * contribution / total_sse
+            for name, contribution in contributions.items()
+        }
+    else:
+        percentages = {name: 0.0 for name in contributions}
+
+    return contributions, percentages, total_sse, float(squared_error.mean())
+
+
+def print_loss_zone_mse(tag, condition, values, quantized, scale):
+    contributions, percentages, total_sse, total_mse = compute_loss_zone_mse(
+        values, quantized, scale
+    )
+    print(
+        f"[SPECIAL_GROUP_ZONE_MSE] tag={tag} condition={condition} "
+        f"group_mse={total_mse:.10f} total_sse={total_sse:.10f}"
+    )
+    print(
+        "[SPECIAL_GROUP_ZONE_MSE] "
+        f"low={percentages['low']:.4f}% (sse={contributions['low']:.10f}) | "
+        f"medium={percentages['medium']:.4f}% (sse={contributions['medium']:.10f}) | "
+        f"high={percentages['high']:.4f}% (sse={contributions['high']:.10f})"
+    )
+
+
 def print_special_group_values(layer_idx, block_idx, token_idx, tag, group_idx,
                                group_orig, group_rotated, results):
     """Print the two 16-value groups used by the summary figure.
@@ -218,6 +280,12 @@ def print_special_group_values(layer_idx, block_idx, token_idx, tag, group_idx,
     print(
         f"[SPECIAL_GROUP] scale_rot_locked={locked['scale']:.10f} "
         f"mse_rot_locked={locked['mse']:.10f}"
+    )
+    print_loss_zone_mse(
+        tag, "before_rotation", group_orig, no["quantized"], no["scale"]
+    )
+    print_loss_zone_mse(
+        tag, "after_rotation", group_rotated, rot["quantized"], rot["scale"]
     )
     print("=" * 108)
 

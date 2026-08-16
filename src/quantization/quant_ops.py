@@ -111,7 +111,15 @@ def get_quantization_fns(format: QuantizationFormat, bits: int) -> Tuple[Callabl
 def cast_scales_to_eXmY(scales: torch.Tensor, scale_precision: str) -> torch.Tensor:
     scale_precision = ScalePrecision(scale_precision)
     if scale_precision == ScalePrecision.E4M3:
-        return scales.to(torch.float8_e4m3fn).view(torch.uint8)
+        # float8_e4m3fn has no Inf encoding: values above its largest finite
+        # number (448) are encoded as NaN. Quantizer.get_quantization_params
+        # already applies this clamp before its in-memory FP8 round-trip, but
+        # an exported BF16 scale can round slightly above 448 after multiplying
+        # by the global scale. Clamp again at the serialization boundary so
+        # realquant checkpoints cannot contain NaN scale bytes.
+        return scales.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(
+            torch.float8_e4m3fn
+        ).view(torch.uint8)
     elif scale_precision == ScalePrecision.E8M0:
         # 2 is EMAX
         scales = scales.to(torch.float8_e8m0fnu).view(torch.uint8)

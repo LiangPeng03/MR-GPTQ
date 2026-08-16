@@ -7,12 +7,92 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from .qlinear import QLinear
-from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision, FP8_E4M3_MAX, FP4_E2M1_MAX
+from .quant_ops import (
+    FP4_BITPACKING_PERM,
+    FP4_GRID,
+    FP4_E2M1_MAX,
+    FP8_E4M3_MAX,
+    ScalePrecision,
+    cast_scales_to_eXmY,
+    pack_fp4_to_uint8,
+)
 from .quantizer import get_reciprocal
 
 from ..utils.common_utils import clear_device_cache, to, maybe_first_element
 from ..utils.model_utils import InputCollector, ForwardInterrupt, get_attention_layer, get_mlp_layer
 from ..transforms.transforms import build_transform, get_transform_matrix
+
+
+def _validate_saved_nvfp4_layer(
+    layer_key: str,
+    saved: dict[str, torch.Tensor],
+    expected_weight: torch.Tensor,
+    group_size: int,
+) -> tuple[float, float]:
+    """Compare the checkpoint bytes with the post-fix pseudoquant weight.
+
+    `fix_parametrization` is the source of truth for the tensor used by the
+    in-process PPL evaluation.  A realquant export is valid only if decoding
+    its qweight/E4M3-scales/global-scale representation recreates that tensor.
+    """
+    qweight = saved["qweight"].to(expected_weight.device)
+    encoded_scales = saved["scales"].to(expected_weight.device)
+    global_scale = saved["weight_global_scale"].to(
+        expected_weight.device, dtype=torch.float32
+    )
+    if encoded_scales.dtype is not torch.uint8:
+        raise RuntimeError(
+            f"[REALQUANT EXPORT FAIL] {layer_key}: expected uint8 E4M3 scales, "
+            f"got {encoded_scales.dtype}."
+        )
+
+    # Checkpoint packing convention: even input columns occupy the low nibble,
+    # odd columns occupy the high nibble. Invert the exporter mapping so this
+    # test detects both a nibble-order error and a wrong FP4 codebook mapping.
+    codebook = torch.empty(16, dtype=torch.float32, device=expected_weight.device)
+    codebook[
+        torch.tensor(FP4_BITPACKING_PERM, device=expected_weight.device)
+    ] = torch.tensor(FP4_GRID, dtype=torch.float32, device=expected_weight.device)
+    fp4 = codebook[
+        torch.stack((qweight & 0xF, qweight >> 4), dim=-1)
+        .reshape(expected_weight.shape)
+        .long()
+    ]
+    scales = (
+        encoded_scales.view(torch.float8_e4m3fn).to(torch.float32) / global_scale
+    )
+    decoded = fp4 * scales.repeat_interleave(group_size, dim=1)
+    expected = expected_weight.to(torch.float32)
+    decoded_nonfinite = int((~torch.isfinite(decoded)).sum().item())
+    expected_nonfinite = int((~torch.isfinite(expected)).sum().item())
+    scale_nonfinite = int((~torch.isfinite(scales)).sum().item())
+    if decoded_nonfinite or expected_nonfinite or scale_nonfinite:
+        finite_scales = scales[torch.isfinite(scales)]
+        scale_range = (
+            "empty"
+            if finite_scales.numel() == 0
+            else f"[{finite_scales.min().item():.8g}, {finite_scales.max().item():.8g}]"
+        )
+        raise RuntimeError(
+            f"[REALQUANT EXPORT FAIL] {layer_key}: non-finite values after "
+            f"round-trip (decoded={decoded_nonfinite}, "
+            f"expected={expected_nonfinite}, scale={scale_nonfinite}; "
+            f"global_scale={global_scale.item():.8g}, "
+            f"finite_scale_range={scale_range})."
+        )
+    error = (decoded - expected).abs()
+    max_abs = float(error.max().item())
+    mean_abs = float(error.mean().item())
+    # The scale was already E4M3-rounded before fix_parametrization.  This is
+    # expected to be very close; a large discrepancy identifies a mismatch
+    # between pre-fix export tensors and post-fix pseudoquant tensors.
+    if not torch.allclose(decoded, expected, rtol=2e-2, atol=2e-4):
+        raise RuntimeError(
+            f"[REALQUANT EXPORT FAIL] {layer_key}: serialized checkpoint does "
+            f"not reproduce the post-fix pseudoquant weight "
+            f"(max_abs={max_abs:.8g}, mean_abs={mean_abs:.8g})."
+        )
+    return max_abs, mean_abs
 
 
 def rtn_quantization(
@@ -876,7 +956,11 @@ def rtn_quantization(
                 layer._train_mode = False
 
         
-        if args.export_quantized_model:
+        exported_layers_for_validation = {}
+        # Validation needs the exact realquant tensors but does not need to
+        # write a checkpoint.  Keeping it block-local avoids recreating a
+        # multi-gigabyte model solely for this diagnostic.
+        if args.export_quantized_model or args.validate_realquant_export:
             for layer_name, layer in block.named_modules():
                 if isinstance(layer, QLinear):
                     with torch.no_grad():
@@ -894,8 +978,12 @@ def rtn_quantization(
 
                     transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
 
-                    if args.export_quantized_model == "realquant":
-                        quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
+                    if (
+                        args.export_quantized_model == "realquant"
+                        or args.validate_realquant_export
+                    ):
+                        layer_key = f"model.layers.{block_idx}.{layer_name}"
+                        saved_layer = {
                             "qweight": pack_fp4_to_uint8(qweight).cpu(),
                             "scales": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
                             "forward_hadamard_matrix": transform_matrix,
@@ -903,6 +991,13 @@ def rtn_quantization(
                             "weight_global_scale": weight_global_scale.clone(),
                             "act_global_scale": act_global_scale.clone()
                         }
+                        if args.export_quantized_model == "realquant":
+                            quantized_state_dict[layer_key] = saved_layer
+                        if args.validate_realquant_export:
+                            exported_layers_for_validation[layer_name] = (
+                                layer_key,
+                                saved_layer,
+                            )
                     # pseudoquant
                     else:
                         # Get dequantized weight
@@ -929,6 +1024,30 @@ def rtn_quantization(
         # 3. Fix model parametrization
         quantized_attn.fix_parametrization()
         quantized_mlp.fix_parametrization()
+
+        if args.validate_realquant_export:
+            if args.format != "nvfp" or args.scale_precision != ScalePrecision.E4M3:
+                raise ValueError(
+                    "--validate_realquant_export currently supports only "
+                    "NVFP4 with E4M3 scales."
+                )
+            block_max_abs = 0.0
+            block_max_mean_abs = 0.0
+            for layer_name, (layer_key, saved_layer) in exported_layers_for_validation.items():
+                max_abs, mean_abs = _validate_saved_nvfp4_layer(
+                    layer_key,
+                    saved_layer,
+                    dict(block.named_modules())[layer_name].weight,
+                    args.w_group_size,
+                )
+                block_max_abs = max(block_max_abs, max_abs)
+                block_max_mean_abs = max(block_max_mean_abs, mean_abs)
+            print(
+                f"[REALQUANT EXPORT CHECK] block={block_idx} "
+                f"layers={len(exported_layers_for_validation)} "
+                f"max_abs={block_max_abs:.8g} "
+                f"max_mean_abs={block_max_mean_abs:.8g}"
+            )
         # 4. Fix transforms and remove parametrizations
         qkv_in_transform.remove_parametrizations()
         o_in_transform.remove_parametrizations()

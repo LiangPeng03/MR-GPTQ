@@ -108,7 +108,6 @@ def enable_cpu_offload_ppl(model, device):
         f"transformer layers on {device}."
     )
 
-
 def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args):
     config = model.config
     # Prepare directory to save model
@@ -118,10 +117,52 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
 
     # State dict to save
     model_state_dict = {}
+    # Channel-resort and GICS are runtime input transforms: GPTQ quantizes the
+    # corresponding weights in transformed coordinates.  Store their compact
+    # permutation/scale representation under the linear layer so vLLM can load
+    # and apply it before activation quantization.  Do not save the training
+    # wrapper's transform-module buffers; native vLLM models do not have those
+    # modules.
+    quantization_only_state_prefixes = (
+        "self_attn.qkv_in_transform.",
+        "self_attn.o_in_transform.",
+        "mlp.gate_up_in_transform.",
+        "mlp.down_in_transform.",
+    )
+    input_transform_targets = (
+        ("self_attn.qkv_in_transform", "self_attn.q_proj"),
+        ("self_attn.o_in_transform", "self_attn.o_proj"),
+        ("mlp.gate_up_in_transform", "mlp.gate_proj"),
+        ("mlp.down_in_transform", "mlp.down_proj"),
+    )
 
     for block_idx, block in enumerate(blocks):
         prefix = f"model.layers.{block_idx}."
+        for transform_name, layer_name in input_transform_targets:
+            transform = block.get_submodule(transform_name)
+            transform_state = transform.state_dict()
+            perm_keys = [k for k in transform_state if k.endswith("perm_idx")]
+            scale_keys = [k for k in transform_state if k.endswith(".scale")]
+            allowed_keys = set(perm_keys + scale_keys)
+            allowed_keys.update(k for k in transform_state if k.endswith("inv_scale"))
+            unsupported_keys = set(transform_state) - allowed_keys
+            if unsupported_keys or len(perm_keys) > 1 or len(scale_keys) > 1:
+                raise ValueError(
+                    "Realquant export supports at most one permutation and one "
+                    f"diagonal input scale per layer, but {prefix}{transform_name} "
+                    f"contains {sorted(transform_state)}."
+                )
+            if perm_keys:
+                model_state_dict[f"{prefix}{layer_name}.input_perm"] = (
+                    transform_state[perm_keys[0]].cpu()
+                )
+            if scale_keys:
+                model_state_dict[f"{prefix}{layer_name}.input_rescale"] = (
+                    transform_state[scale_keys[0]].cpu()
+                )
         for k, v in block.state_dict().items():
+            if k.startswith(quantization_only_state_prefixes):
+                continue
             layer_name, param_name = k.rsplit(".", 1)
             if f"{prefix}{layer_name}" in quantized_state_dict and param_name == "weight":
                 for k_compr, v_compr in quantized_state_dict[f"{prefix}{layer_name}"].items():
@@ -140,6 +181,17 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
     for k, v in model.state_dict().items():
         if not (k.startswith("model.layers") or (k == "lm_head.weight" and tie_word_embeddings)):
             model_state_dict[k] = v.cpu()
+
+    invalid_keys = [
+        key
+        for key in model_state_dict
+        if any(f".{state_prefix}" in key for state_prefix in quantization_only_state_prefixes)
+    ]
+    if invalid_keys:
+        raise RuntimeError(
+            "Refusing to export quantization-only transform state: "
+            f"{invalid_keys[:3]}"
+        )
 
     # Split checkpoint into shards
     current_shard_size = 0
@@ -304,8 +356,9 @@ def parse_args():
         "--validate_realquant_export",
         action="store_true",
         help=(
-            "Validate each saved NVFP4 layer by decoding its checkpoint "
-            "representation and comparing it with the in-memory export values."
+            "Validate each NVFP4 realquant representation by decoding it and "
+            "comparing it with the post-fix pseudoquant weight; does not require "
+            "writing a checkpoint."
         ),
     )
     # AWQ params

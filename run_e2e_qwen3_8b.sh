@@ -1,114 +1,123 @@
 #!/usr/bin/env bash
-# Generic end-to-end benchmark launcher for locally exported Hugging Face models.
+# Reproducible Qwen3-8B end-to-end benchmark launcher.
 #
-# Usage:
-#   bash run_e2e_qwen3_8b.sh /path/to/model_a /path/to/model_b
-#
-# Or scan every immediate child model directory under MODEL_ROOT:
-#   MODEL_ROOT=/path/to/exported_models bash run_e2e_qwen3_8b.sh
-#
-# A valid model directory must contain config.json and at least one
-# *.safetensors file. All models are measured in fresh Python processes and
-# appended to one result CSV.
+# Default methods: RTN, GPTQ, MR-GPTQ, and Ours. Optional NAME=PATH arguments
+# replace the defaults, which also makes Four-over-Six/ArcQuant easy to add:
+#   bash run_e2e_qwen3_8b.sh \
+#     four_over_six=/path/to/model \
+#     arcquant=/path/to/model
 
-set -euo pipefail
+set -eo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-$HOME/.conda/envs/vptq/bin/python}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCHMARK_PY="${BENCHMARK_PY:-$SCRIPT_DIR/benchmark_e2e.py}"
 MODEL_ROOT="${MODEL_ROOT:-$SCRIPT_DIR/e2e_models/Qwen3-8B}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218}"
 GPU_ID="${GPU_ID:-0}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-RESULT_CSV="${RESULT_CSV:-$SCRIPT_DIR/e2e_results_${RUN_TAG}.csv}"
+OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/benchmark_results/$RUN_TAG}"
 
-BATCH_SIZES="${BATCH_SIZES:-1,2,4,8,16}"
 INPUT_TOKENS="${INPUT_TOKENS:-512}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-128}"
-WARMUP="${WARMUP:-2}"
+WARMUPS="${WARMUPS:-2}"
 REPEATS="${REPEATS:-5}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.30}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+NVML_INTERVAL_MS="${NVML_INTERVAL_MS:-20}"
 DTYPE="${DTYPE:-bfloat16}"
-TOKENIZER_MODEL="${TOKENIZER_MODEL:-}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+ENABLE_CUDAGRAPH="${ENABLE_CUDAGRAPH:-0}"
 
-export CUDA_VISIBLE_DEVICES="$GPU_ID"
-export TOKENIZERS_PARALLELISM=false
-
-is_model_dir() {
-    local directory="$1"
-    [[ -f "$directory/config.json" ]] || return 1
-    # Hugging Face cache snapshots commonly store both config and weights as
-    # symlinks into the blobs directory; -L is required to recognize them.
-    find -L "$directory" -maxdepth 1 -type f -name '*.safetensors' \
-        -print -quit 2>/dev/null | grep -q .
-}
-
-model_paths=()
 if (( $# > 0 )); then
-    for model in "$@"; do
-        model_paths+=("$(cd "$model" 2>/dev/null && pwd || printf '%s' "$model")")
-    done
+    model_specs=("$@")
 else
-    if [[ ! -d "$MODEL_ROOT" ]]; then
-        echo "ERROR: MODEL_ROOT does not exist: $MODEL_ROOT" >&2
-        exit 1
-    fi
-
-    while IFS= read -r -d '' directory; do
-        if is_model_dir "$directory"; then
-            model_paths+=("$directory")
-        fi
-    done < <(find "$MODEL_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
-
-    # MODEL_ROOT itself may also be a single exported model.
-    if (( ${#model_paths[@]} == 0 )) && is_model_dir "$MODEL_ROOT"; then
-        model_paths+=("$MODEL_ROOT")
-    fi
+    model_specs=(
+        "rtn=$MODEL_ROOT/rtn_fixed"
+        "gptq=$MODEL_ROOT/gptq"
+        "mr_gptq=$MODEL_ROOT/mr_gptq"
+        "ours=$MODEL_ROOT/ours"
+    )
 fi
 
-if (( ${#model_paths[@]} == 0 )); then
-    echo "ERROR: no model directories were found." >&2
-    echo "Expected config.json and one or more *.safetensors files in each directory." >&2
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "ERROR: Python is not executable: $PYTHON_BIN" >&2
+    exit 1
+fi
+if [[ ! -f "$BENCHMARK_PY" ]]; then
+    echo "ERROR: benchmark program is missing: $BENCHMARK_PY" >&2
+    exit 1
+fi
+if [[ ! -f "$TOKENIZER_MODEL/tokenizer_config.json" ]]; then
+    echo "ERROR: tokenizer directory is invalid: $TOKENIZER_MODEL" >&2
     exit 1
 fi
 
-for model in "${model_paths[@]}"; do
-    if ! is_model_dir "$model"; then
-        echo "ERROR: invalid model directory: $model" >&2
-        echo "It must contain config.json and at least one *.safetensors file." >&2
+model_args=()
+for spec in "${model_specs[@]}"; do
+    if [[ "$spec" != *=* ]]; then
+        echo "ERROR: model must use NAME=PATH syntax: $spec" >&2
         exit 1
     fi
-done
-
-echo "GPU_ID=$GPU_ID"
-echo "RESULT_CSV=$RESULT_CSV"
-echo "MODEL_COUNT=${#model_paths[@]}"
-printf 'MODEL=%s\n' "${model_paths[@]}"
-
-for model in "${model_paths[@]}"; do
-    label="$(basename "$model")"
-    echo "===== $label: $model ====="
-
-    tokenizer_args=()
-    if [[ -n "$TOKENIZER_MODEL" ]]; then
-        tokenizer_args+=(--tokenizer "$TOKENIZER_MODEL")
+    method="${spec%%=*}"
+    model_path="${spec#*=}"
+    if [[ ! -f "$model_path/config.json" ]]; then
+        echo "ERROR: missing model config for $method: $model_path/config.json" >&2
+        exit 1
     fi
-
-    "$PYTHON_BIN" "$BENCHMARK_PY" \
-        --model "$model" \
-        --model_label "$label" \
-        "${tokenizer_args[@]}" \
-        --batch_sizes "$BATCH_SIZES" \
-        --input_tokens "$INPUT_TOKENS" \
-        --output_tokens "$OUTPUT_TOKENS" \
-        --warmup "$WARMUP" \
-        --repeats "$REPEATS" \
-        --max_model_len "$MAX_MODEL_LEN" \
-        --gpu_memory_utilization "$GPU_MEMORY_UTILIZATION" \
-        --dtype "$DTYPE" \
-        --gpu_index "$GPU_ID" \
-        --output_csv "$RESULT_CSV" \
-        --append_csv
+    if ! find -L "$model_path" -maxdepth 1 -type f -name '*.safetensors' \
+        -print -quit 2>/dev/null | grep -q .; then
+        echo "ERROR: no safetensors weights found for $method: $model_path" >&2
+        exit 1
+    fi
+    model_args+=(--model "$method=$model_path")
 done
 
-echo "All benchmarks completed: $RESULT_CSV"
+export TOKENIZERS_PARALLELISM=false
+export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARNING}"
+
+echo "PYTHON_BIN=$PYTHON_BIN"
+echo "GPU_ID=$GPU_ID"
+echo "TOKENIZER_MODEL=$TOKENIZER_MODEL"
+echo "OUTPUT_DIR=$OUTPUT_DIR"
+printf 'MODEL_SPEC=%s\n' "${model_specs[@]}"
+
+"$PYTHON_BIN" -m py_compile "$BENCHMARK_PY"
+CUDA_VISIBLE_DEVICES="$GPU_ID" "$PYTHON_BIN" - <<'PY'
+import torch
+import vllm
+import pynvml
+
+print("torch:", torch.__version__)
+print("vllm:", vllm.__version__)
+print("cuda:", torch.version.cuda)
+print("visible_gpu_count:", torch.cuda.device_count())
+PY
+
+if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
+    echo "E2E_BENCHMARK_PREFLIGHT_OK"
+    exit 0
+fi
+
+cudagraph_args=()
+if [[ "$ENABLE_CUDAGRAPH" == "1" ]]; then
+    cudagraph_args+=(--enable-cudagraph)
+fi
+
+"$PYTHON_BIN" "$BENCHMARK_PY" \
+    "${model_args[@]}" \
+    --tokenizer "$TOKENIZER_MODEL" \
+    --gpu "$GPU_ID" \
+    --dtype "$DTYPE" \
+    --input-tokens "$INPUT_TOKENS" \
+    --output-tokens "$OUTPUT_TOKENS" \
+    --batch-sizes 1 2 4 8 16 \
+    --warmups "$WARMUPS" \
+    --repeats "$REPEATS" \
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
+    --nvml-interval-ms "$NVML_INTERVAL_MS" \
+    "${cudagraph_args[@]}" \
+    --output-dir "$OUTPUT_DIR"
+
+echo "BENCHMARK_COMPLETE=$OUTPUT_DIR"
