@@ -236,7 +236,7 @@ def print_loss_zone_mse(tag, condition, values, quantized, scale):
 
 
 def print_special_group_values(layer_idx, block_idx, token_idx, tag, group_idx,
-                               group_orig, group_rotated, results):
+                               group_orig, group_rotated, results, force=False):
     """Print the two 16-value groups used by the summary figure.
 
     The diagnostic script selects the 16-channel group containing the largest
@@ -244,7 +244,8 @@ def print_special_group_values(layer_idx, block_idx, token_idx, tag, group_idx,
     code) makes the exact floating-point values available for reproducing a
     paper figure on the remote machine.
     """
-    if os.environ.get("PRINT_SPECIAL_GROUPS", "1").lower() in {"0", "false", "no"}:
+    if (not force and os.environ.get("PRINT_SPECIAL_GROUPS", "1").lower()
+            in {"0", "false", "no"}):
         return
 
     def fmt(values):
@@ -288,6 +289,279 @@ def print_special_group_values(layer_idx, block_idx, token_idx, tag, group_idx,
         tag, "after_rotation", group_rotated, rot["quantized"], rot["scale"]
     )
     print("=" * 108)
+
+
+def find_compressed_three_zone_worse_group(layer_idx, x_blocks,
+                                           quantizer_nv, quantizer_mx,
+                                           transform, device, max_block_tokens=8,
+                                           min_zone_percent=3.0):
+    """Find a range-compressed, post-MR-worse group with all three zones.
+
+    We inspect only the top ``max_block_tokens`` (token, 128-channel-block)
+    pairs by absolute activation.  Each pair has eight FP4 groups, so the
+    search is bounded to 64 groups by default.  A valid illustration must:
+    (1) shrink its 16-value range after MR, (2) increase group MSE, and
+    (3) have visible low/medium/high post-MR error contributions.
+    """
+    pair_scores = x_blocks.abs().amax(dim=-1).flatten()
+    top_pairs = torch.topk(pair_scores, k=min(max_block_tokens, pair_scores.numel())).indices.tolist()
+    n_blocks = x_blocks.shape[1]
+    scanned = 0
+    eligible = []
+
+    for pair_idx in top_pairs:
+        token_idx = pair_idx // n_blocks
+        block_idx = pair_idx % n_blocks
+        results, orig, rotated = analyze_block(
+            x_blocks[token_idx, block_idx, :], quantizer_nv, quantizer_mx,
+            transform, device
+        )
+        for group_idx, (no, rot) in enumerate(zip(
+                results["nvfp4_norot"]["groups"],
+                results["nvfp4_rot"]["groups"],
+        )):
+            scanned += 1
+            _, percentages, _, _ = compute_loss_zone_mse(
+                rotated[group_idx * 16:(group_idx + 1) * 16],
+                rot["quantized"],
+                rot["scale"],
+            )
+            zone_floor = min(percentages.values())
+            mse_increase = rot["mse"] - no["mse"]
+            range_shrink = no["max_abs"] / max(rot["max_abs"], 1e-15)
+            if (mse_increase <= 0 or zone_floor < min_zone_percent
+                    or range_shrink <= 1.0):
+                continue
+
+            # Prefer a substantial MSE increase and clear three-zone bar,
+            # while favouring a visibly compressed input range.  The cap keeps
+            # one extreme range ratio from dominating all other evidence.
+            score = mse_increase * (zone_floor / 100.0) * min(range_shrink, 10.0)
+            eligible.append({
+                "score": score,
+                "token_idx": token_idx,
+                "block_idx": block_idx,
+                "group_idx": group_idx,
+                "orig": orig,
+                "rotated": rotated,
+                "results": results,
+                "mse_increase": mse_increase,
+                "ratio": rot["mse"] / max(no["mse"], 1e-15),
+                "range_shrink": range_shrink,
+                "percentages": percentages,
+            })
+
+    print(
+        f"[COMPRESSED_THREE_ZONE_SCAN] layer={layer_idx} "
+        f"token_block_pairs={len(top_pairs)} groups_scanned={scanned} "
+        f"min_zone_percent={min_zone_percent:.1f} eligible={len(eligible)}"
+    )
+    if not eligible:
+        print("[COMPRESSED_THREE_ZONE_SCAN] No eligible group found; expand max_block_tokens or lower min_zone_percent.")
+        return None
+
+    best = max(eligible, key=lambda item: item["score"])
+    print(
+        f"[COMPRESSED_THREE_ZONE_CANDIDATE] token={best['token_idx']} "
+        f"block128={best['block_idx']} group16=G{best['group_idx']} "
+        f"range_shrink={best['range_shrink']:.4f}x "
+        f"mse_increase={best['mse_increase']:.10f} "
+        f"mse_ratio={best['ratio']:.4f} score={best['score']:.10f} "
+        f"after_low={best['percentages']['low']:.2f}% "
+        f"after_medium={best['percentages']['medium']:.2f}% "
+        f"after_high={best['percentages']['high']:.2f}%"
+    )
+    return best
+
+
+def find_stronger_figure_c_candidate(layer_idx, x_blocks, quantizer_nv,
+                                     quantizer_mx, transform, device,
+                                     max_block_tokens=12):
+    """Find a more illustrative Figure-C counterexample in a bounded scan.
+
+    The candidate must retain a *moderate* pre-MR outlier (rather than a
+    single overwhelmingly dominant value), achieve visibly stronger range
+    compression, become worse after rotation, and move most post-MR error
+    into the medium/high-loss zones while retaining all three zones.
+    """
+    pair_scores = x_blocks.abs().amax(dim=-1).flatten()
+    top_pairs = torch.topk(
+        pair_scores, k=min(max_block_tokens, pair_scores.numel())
+    ).indices.tolist()
+    n_blocks = x_blocks.shape[1]
+    scanned, eligible = 0, []
+
+    for pair_idx in top_pairs:
+        token_idx = pair_idx // n_blocks
+        block_idx = pair_idx % n_blocks
+        results, orig, rotated = analyze_block(
+            x_blocks[token_idx, block_idx, :], quantizer_nv, quantizer_mx,
+            transform, device
+        )
+        for group_idx, (no, rot) in enumerate(zip(
+                results["nvfp4_norot"]["groups"],
+                results["nvfp4_rot"]["groups"],
+        )):
+            scanned += 1
+            start, end = group_idx * 16, (group_idx + 1) * 16
+            orig_group = orig[start:end]
+            rot_group = rotated[start:end]
+            _, before_pct, _, _ = compute_loss_zone_mse(
+                orig_group, no["quantized"], no["scale"]
+            )
+            _, after_pct, _, _ = compute_loss_zone_mse(
+                rot_group, rot["quantized"], rot["scale"]
+            )
+
+            sorted_abs = np.sort(np.abs(orig_group))[::-1]
+            outlier_ratio = float(sorted_abs[0] / max(sorted_abs[1], 1e-15))
+            rot_abs = np.abs(rot_group)
+            rot_max = float(rot_abs.max())
+            small_fraction = float(np.mean(rot_abs <= 0.30 * rot_max))
+            large_fraction = float(np.mean(rot_abs >= 0.65 * rot_max))
+            mse_increase = rot["mse"] - no["mse"]
+            range_shrink = no["max_abs"] / max(rot["max_abs"], 1e-15)
+            medium_high = after_pct["medium"] + after_pct["high"]
+
+            valid = (
+                mse_increase > 0
+                and range_shrink >= 2.0
+                and 1.25 <= outlier_ratio <= 4.0
+                and before_pct["low"] >= 70.0
+                and min(after_pct.values()) >= 5.0
+                and after_pct["medium"] >= 15.0
+                and after_pct["high"] >= 20.0
+                and medium_high >= 70.0
+                and small_fraction >= 0.125
+                and large_fraction >= 0.20
+            )
+            if not valid:
+                continue
+
+            score = (
+                mse_increase * min(range_shrink, 8.0)
+                * (medium_high / 100.0)
+                * min(outlier_ratio, 2.5)
+            )
+            eligible.append({
+                "score": score,
+                "token_idx": token_idx,
+                "block_idx": block_idx,
+                "group_idx": group_idx,
+                "orig": orig,
+                "rotated": rotated,
+                "results": results,
+                "mse_increase": mse_increase,
+                "ratio": rot["mse"] / max(no["mse"], 1e-15),
+                "range_shrink": range_shrink,
+                "outlier_ratio": outlier_ratio,
+                "before_pct": before_pct,
+                "after_pct": after_pct,
+                "small_fraction": small_fraction,
+                "large_fraction": large_fraction,
+            })
+
+    print(
+        f"[STRONGER_FIGURE_C_SCAN] layer={layer_idx} "
+        f"token_block_pairs={len(top_pairs)} groups_scanned={scanned} "
+        f"eligible={len(eligible)}"
+    )
+    if not eligible:
+        print(
+            "[STRONGER_FIGURE_C_SCAN] No strict candidate found; "
+            "the existing G2 remains the recommended counterexample."
+        )
+        return None
+
+    ranked = sorted(eligible, key=lambda item: item["score"], reverse=True)
+    for rank, item in enumerate(ranked[:5], start=1):
+        pct = item["after_pct"]
+        print(
+            f"[STRONGER_FIGURE_C_TOP{rank}] token={item['token_idx']} "
+            f"block128={item['block_idx']} group16=G{item['group_idx']} "
+            f"shrink={item['range_shrink']:.3f}x "
+            f"outlier_ratio={item['outlier_ratio']:.3f} "
+            f"mse_ratio={item['ratio']:.3f} "
+            f"after_low={pct['low']:.1f}% after_medium={pct['medium']:.1f}% "
+            f"after_high={pct['high']:.1f}%"
+        )
+    return ranked[0]
+
+
+def find_compressed_mse_better_group(layer_idx, x_blocks, quantizer_nv,
+                                     quantizer_mx, transform, device):
+    """Find a true-H16 group whose range and quantization MSE both decrease.
+
+    Twelve representative token/block pairs are inspected (the four strongest
+    plus eight amplitude quantiles), i.e. at most 96 FP4 groups.  This avoids
+    an exhaustive activation sweep while looking beyond only extreme outliers.
+    """
+    pair_scores = x_blocks.abs().amax(dim=-1).flatten()
+    ordered_pairs = torch.argsort(pair_scores, descending=True).tolist()
+    n_pairs = len(ordered_pairs)
+    ranks = list(range(min(4, n_pairs)))
+    ranks.extend(round((n_pairs - 1) * fraction)
+                 for fraction in (0.08, 0.20, 0.35, 0.50, 0.65, 0.80, 0.92, 0.98))
+    pair_indices = [ordered_pairs[rank] for rank in dict.fromkeys(ranks)]
+    n_blocks = x_blocks.shape[1]
+    scanned, eligible = 0, []
+
+    for pair_idx in pair_indices:
+        token_idx, block_idx = divmod(pair_idx, n_blocks)
+        results, orig, rotated = analyze_block(
+            x_blocks[token_idx, block_idx, :], quantizer_nv, quantizer_mx,
+            transform, device
+        )
+        for group_idx, (no, rot) in enumerate(zip(
+                results["nvfp4_norot"]["groups"],
+                results["nvfp4_rot"]["groups"],
+        )):
+            scanned += 1
+            mse_reduction = no["mse"] - rot["mse"]
+            range_shrink = no["max_abs"] / max(rot["max_abs"], 1e-15)
+            if mse_reduction <= 0 or range_shrink <= 1.0 or no["mse"] < 1e-6:
+                continue
+
+            _, percentages, _, _ = compute_loss_zone_mse(
+                rotated[group_idx * 16:(group_idx + 1) * 16],
+                rot["quantized"], rot["scale"],
+            )
+            score = mse_reduction * min(range_shrink, 10.0)
+            eligible.append({
+                "score": score,
+                "token_idx": token_idx,
+                "block_idx": block_idx,
+                "group_idx": group_idx,
+                "orig": orig,
+                "rotated": rotated,
+                "results": results,
+                "mse_reduction": mse_reduction,
+                "ratio": rot["mse"] / max(no["mse"], 1e-15),
+                "range_shrink": range_shrink,
+                "percentages": percentages,
+            })
+
+    print(
+        f"[COMPRESSED_MSE_BETTER_SCAN] layer={layer_idx} "
+        f"token_block_pairs={len(pair_indices)} groups_scanned={scanned} "
+        f"eligible={len(eligible)}"
+    )
+    if not eligible:
+        print("[COMPRESSED_MSE_BETTER_SCAN] No eligible group found.")
+        return None
+
+    best = max(eligible, key=lambda item: item["score"])
+    print(
+        f"[COMPRESSED_MSE_BETTER_CANDIDATE] token={best['token_idx']} "
+        f"block128={best['block_idx']} group16=G{best['group_idx']} "
+        f"range_shrink={best['range_shrink']:.4f}x "
+        f"mse_reduction={best['mse_reduction']:.10f} "
+        f"mse_ratio={best['ratio']:.4f} "
+        f"after_low={best['percentages']['low']:.2f}% "
+        f"after_medium={best['percentages']['medium']:.2f}% "
+        f"after_high={best['percentages']['high']:.2f}%"
+    )
+    return best
 
 
 def plot_block(layer_idx, block_idx, token_idx, orig, rotated, results, output_path):
@@ -376,7 +650,11 @@ def main():
     # 量化�?
     nv_q = Quantizer(bits=4, format="nvfp", granularity="group", group_size=16, symmetric=True, scale_precision="e4m3")
     mx_q = Quantizer(bits=4, format="mxfp", granularity="group", group_size=32, symmetric=True, scale_precision="e8m0")
+    # Keep the established H128 path for micro-block and macro diagnostics.
     transform = build_transform("hadamard", size=128, group_size=128).to(device)
+    # The all-summary figure is intentionally a true intra-group H16 example:
+    # every FP4 quantization group is transformed independently by H16/sqrt(16).
+    transform_summary_16 = build_transform("hadamard", size=16, group_size=16).to(device)
     
     # For Summary Plot
     all_nv_results = []
@@ -400,17 +678,25 @@ def main():
         
         for token_idx in [best_token, median_token]:
             block_vals = X_blocks[token_idx, best_block, :]  # (128,)
+            # Existing block figures remain H128 diagnostics.
             results, orig, rotated = analyze_block(block_vals, nv_q, mx_q, transform, device)
             # print_report(layer_idx, best_block, token_idx, orig, rotated, results)
             
             tag = "outlier" if token_idx == best_token else "normal"
-            plot_block(layer_idx, best_block, token_idx, orig, rotated, results,
-                       f"micro_block_L{layer_idx}_{tag}.png")
+            if os.environ.get("SKIP_MICRO_PLOTS", "0").lower() not in {"1", "true", "yes"}:
+                plot_block(layer_idx, best_block, token_idx, orig, rotated, results,
+                           f"micro_block_L{layer_idx}_{tag}.png")
+
+            # Only the all-summary figure and its printed representative-group
+            # values use true independent H16 rotations.
+            summary_results, summary_orig, summary_rotated = analyze_block(
+                block_vals, nv_q, mx_q, transform_summary_16, device
+            )
             
             # Find the group (16-size) that contains the max outlier
-            group_idx = np.abs(orig).argmax() // 16
-            group_orig = orig[group_idx*16 : (group_idx+1)*16]
-            group_rotated = rotated[group_idx*16 : (group_idx+1)*16]
+            group_idx = np.abs(summary_orig).argmax() // 16
+            group_orig = summary_orig[group_idx*16 : (group_idx+1)*16]
+            group_rotated = summary_rotated[group_idx*16 : (group_idx+1)*16]
 
             # The summary figure's two representative cases are the outlier
             # and median-token groups from the final inspected layer.  Print
@@ -419,46 +705,127 @@ def main():
             if layer_idx == layers[-1]:
                 print_special_group_values(
                     layer_idx, best_block, token_idx, tag, group_idx,
-                    group_orig, group_rotated, results
+                    group_orig, group_rotated, summary_results
                 )
             
             # Compute group-level stats
             max_idx_grp = np.argmax(np.abs(group_orig))
             
-            q_norot = results['nvfp4_norot']['groups'][group_idx]['quantized']
+            q_norot = summary_results['nvfp4_norot']['groups'][group_idx]['quantized']
             err2_norot = (q_norot - group_orig)**2
             norot_mse_max = err2_norot[max_idx_grp]
             norot_mse_other = (np.sum(err2_norot) - norot_mse_max) / 15.0
             
-            q_rot = results['nvfp4_rot']['groups'][group_idx]['quantized']
+            q_rot = summary_results['nvfp4_rot']['groups'][group_idx]['quantized']
             err2_rot = (q_rot - group_rotated)**2
             rot_mse_max = err2_rot[max_idx_grp]
             rot_mse_other = (np.sum(err2_rot) - rot_mse_max) / 15.0
             
-            q_rot_l = results['nvfp4_rot_locked']['groups'][group_idx]['quantized']
+            q_rot_l = summary_results['nvfp4_rot_locked']['groups'][group_idx]['quantized']
             err2_rot_l = (q_rot_l - group_rotated)**2
             rot_l_mse_max = err2_rot_l[max_idx_grp]
             rot_l_mse_other = (np.sum(err2_rot_l) - rot_l_mse_max) / 15.0
+
+            _, norot_zone_pct, _, _ = compute_loss_zone_mse(
+                group_orig, q_norot,
+                summary_results['nvfp4_norot']['groups'][group_idx]['scale'],
+            )
+            _, rot_zone_pct, _, _ = compute_loss_zone_mse(
+                group_rotated, q_rot,
+                summary_results['nvfp4_rot']['groups'][group_idx]['scale'],
+            )
             
             # Save for summary plot (only the specific 16-channel group)
             all_nv_results.append({
                 'layer': layer_idx,
                 'tag': tag,
                 'group_id': group_idx,
-                'norot_mse': results['nvfp4_norot']['groups'][group_idx]['mse'],
+                'norot_mse': summary_results['nvfp4_norot']['groups'][group_idx]['mse'],
                 'norot_mse_max': norot_mse_max,
                 'norot_mse_other': norot_mse_other,
-                'rot_mse': results['nvfp4_rot']['groups'][group_idx]['mse'],
+                'rot_mse': summary_results['nvfp4_rot']['groups'][group_idx]['mse'],
                 'rot_mse_max': rot_mse_max,
                 'rot_mse_other': rot_mse_other,
-                'rot_locked_mse': results['nvfp4_rot_locked']['groups'][group_idx]['mse'],
+                'rot_locked_mse': summary_results['nvfp4_rot_locked']['groups'][group_idx]['mse'],
                 'rot_locked_mse_max': rot_l_mse_max,
                 'rot_locked_mse_other': rot_l_mse_other,
                 'orig': group_orig,
-                'rotated': group_rotated
+                'rotated': group_rotated,
+                'norot_quantized': q_norot,
+                'norot_scale': summary_results['nvfp4_norot']['groups'][group_idx]['scale'],
+                'rot_quantized': q_rot,
+                'rot_scale': summary_results['nvfp4_rot']['groups'][group_idx]['scale'],
+                'norot_zone_pct': norot_zone_pct,
+                'rot_zone_pct': rot_zone_pct,
             })
 
-    plot_summary_comparison(all_nv_results, "nvfp4_all_layers_summary.png")
+    # A bounded, paper-figure-oriented search over the final layer's strongest
+    # token/block pairs. It prints one replacement candidate but deliberately
+    # leaves the existing summary figure unchanged until the candidate is
+    # reviewed.
+    if os.environ.get("SKIP_THREE_ZONE_SCAN", "0").lower() not in {"1", "true", "yes"}:
+        three_zone_candidate = find_compressed_three_zone_worse_group(
+            layer_idx, X_blocks, nv_q, mx_q, transform_summary_16, device
+        )
+        if three_zone_candidate is not None:
+            candidate_group = three_zone_candidate["group_idx"]
+            candidate_orig = three_zone_candidate["orig"][candidate_group * 16:(candidate_group + 1) * 16]
+            candidate_rotated = three_zone_candidate["rotated"][candidate_group * 16:(candidate_group + 1) * 16]
+            print_special_group_values(
+                layer_idx, three_zone_candidate["block_idx"], three_zone_candidate["token_idx"],
+                "compressed_three_zone_worse", candidate_group, candidate_orig,
+                candidate_rotated, three_zone_candidate["results"],
+            )
+    else:
+        print("[COMPRESSED_THREE_ZONE_SCAN] Skipped by request.")
+
+    # Stricter Figure-C replacement search.  This is deliberately independent
+    # of the original scan above, so it can be run by itself with
+    # SKIP_THREE_ZONE_SCAN=1 and does not change any figure files.
+    if os.environ.get("FIND_STRONGER_FIGURE_C_GROUP", "0").lower() in {"1", "true", "yes"}:
+        max_pairs = max(1, int(os.environ.get("STRONGER_FIGURE_C_SCAN_PAIRS", "12")))
+        stronger_candidate = find_stronger_figure_c_candidate(
+            layer_idx, X_blocks, nv_q, mx_q, transform_summary_16, device,
+            max_block_tokens=max_pairs,
+        )
+        if stronger_candidate is not None:
+            candidate_group = stronger_candidate["group_idx"]
+            candidate_orig = stronger_candidate["orig"][candidate_group * 16:(candidate_group + 1) * 16]
+            candidate_rotated = stronger_candidate["rotated"][candidate_group * 16:(candidate_group + 1) * 16]
+            print_special_group_values(
+                layer_idx, stronger_candidate["block_idx"], stronger_candidate["token_idx"],
+                "stronger_figure_c_worse", candidate_group, candidate_orig,
+                candidate_rotated, stronger_candidate["results"], force=True,
+            )
+
+    if os.environ.get("FIND_MSE_BETTER_GROUP", "0").lower() in {"1", "true", "yes"}:
+        better_candidate = find_compressed_mse_better_group(
+            layer_idx, X_blocks, nv_q, mx_q, transform_summary_16, device
+        )
+        if better_candidate is not None:
+            candidate_group = better_candidate["group_idx"]
+            candidate_orig = better_candidate["orig"][candidate_group * 16:(candidate_group + 1) * 16]
+            candidate_rotated = better_candidate["rotated"][candidate_group * 16:(candidate_group + 1) * 16]
+            print_special_group_values(
+                layer_idx, better_candidate["block_idx"], better_candidate["token_idx"],
+                "compressed_mse_better", candidate_group, candidate_orig,
+                candidate_rotated, better_candidate["results"], force=True,
+            )
+
+    if os.environ.get("STOP_AFTER_THREE_ZONE_SCAN", "0").lower() in {"1", "true", "yes"}:
+        print("[COMPRESSED_THREE_ZONE_SCAN] Stopping after candidate scan by request.")
+        return
+
+    print_last_three_h16_groups(all_nv_results)
+
+    if os.environ.get("SKIP_SUMMARY_PLOT", "0").lower() not in {"1", "true", "yes"}:
+        plot_summary_comparison(all_nv_results, "nvfp4_all_layers_summary.png")
+    else:
+        print("[SUMMARY] Summary image generation skipped by request.")
+
+    if os.environ.get("STOP_AFTER_SUMMARY", "0").lower() in {"1", "true", "yes"}:
+        print("[SUMMARY] Stopping after nvfp4_all_layers_summary.png by request.")
+        return
     
     # 宏观块级特征分析与散点图 (Phase 3 定量验证)
     analyze_macro_block_features(activations, nv_q, mx_q, transform, device)
@@ -639,6 +1006,101 @@ def analyze_macro_block_features(activations, quantizer_nv, quantizer_mx, transf
         del X_q_nv, X_q_nv_rot128, X_q_nv_rot16
         torch.cuda.empty_cache()
 
+def print_last_three_h16_groups(all_results):
+    """Print exact H16 values and loss-zone ratios for the final three rows."""
+    def fmt(values):
+        return np.array2string(np.asarray(values, dtype=np.float64), precision=10,
+                               separator=", ", max_line_width=240)
+
+    print("\n" + "=" * 108)
+    print("[LAST_THREE_H16_GROUPS] Exact values and loss-zone MSE ratios")
+    for group in all_results[-3:]:
+        identity = f"layer={group['layer']} tag={group['tag']} group16=G{group['group_id']}"
+        print(f"[LAST_THREE_H16_GROUP] {identity}")
+        print(f"[LAST_THREE_H16_GROUP] before_rotation = {fmt(group['orig'])}")
+        print(f"[LAST_THREE_H16_GROUP] q_before        = {fmt(group['norot_quantized'])}")
+        print(
+            f"[LAST_THREE_H16_GROUP] before_scale={group['norot_scale']:.10f} "
+            f"before_mse={group['norot_mse']:.10f} | "
+            f"low={group['norot_zone_pct']['low']:.4f}% "
+            f"medium={group['norot_zone_pct']['medium']:.4f}% "
+            f"high={group['norot_zone_pct']['high']:.4f}%"
+        )
+        print(f"[LAST_THREE_H16_GROUP] after_rotation  = {fmt(group['rotated'])}")
+        print(f"[LAST_THREE_H16_GROUP] q_after         = {fmt(group['rot_quantized'])}")
+        print(
+            f"[LAST_THREE_H16_GROUP] after_scale={group['rot_scale']:.10f} "
+            f"after_mse={group['rot_mse']:.10f} | "
+            f"low={group['rot_zone_pct']['low']:.4f}% "
+            f"medium={group['rot_zone_pct']['medium']:.4f}% "
+            f"high={group['rot_zone_pct']['high']:.4f}%"
+        )
+        print("-" * 108)
+    print("=" * 108)
+    return
+
+    # Retained below temporarily for source compatibility; unreachable.
+    selected = all_results[-3:]
+    zone_names = ["low", "medium", "high"]
+    zone_labels = ["Low / safe", "Medium loss", "High loss"]
+    zone_colors = ["#66b3ff", "#ffcc99", "#ff9999"]
+
+    fig, ax = plt.subplots(figsize=(14, 6.5))
+    y_positions, labels, mse_values, pct_rows = [], [], [], []
+    for group in selected:
+        group_label = f"L{group['layer']} {group['tag']} G{group['group_id']}"
+        for condition, mse_key, pct_key in [
+            ("before MR", "norot_mse", "norot_zone_pct"),
+            ("after MR", "rot_mse", "rot_zone_pct"),
+        ]:
+            labels.append(f"{group_label} — {condition}")
+            mse_values.append(group[mse_key])
+            pct_rows.append([group[pct_key][zone] for zone in zone_names])
+
+    y_positions = np.arange(len(labels))[::-1]
+    for row_idx, (y, percentages) in enumerate(zip(y_positions, pct_rows)):
+        left = 0.0
+        for percentage, color, label in zip(percentages, zone_colors, zone_labels):
+            if percentage > 0:
+                ax.barh(y, percentage, left=left, height=0.66,
+                        color=color, edgecolor="white", linewidth=1.5,
+                        label=None)
+                if percentage >= 8:
+                    ax.text(left + percentage / 2, y, f"{percentage:.1f}%",
+                            ha="center", va="center", fontsize=10)
+            left += percentage
+
+        ax.text(102, y, f"MSE={mse_values[row_idx]:.5g}",
+                va="center", fontsize=10)
+
+    ax.set_xlim(0, 124)
+    ax.set_xticks([0, 25, 50, 75, 100])
+    ax.set_xticklabels(["0%", "25%", "50%", "75%", "100%"])
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("Contribution to total squared error within the 16-value group")
+    ax.set_title("H16 loss-zone MSE contribution: last three representative groups",
+                 fontweight="bold")
+    ax.grid(axis="x", alpha=0.25)
+    ax.set_axisbelow(True)
+    legend_handles = [plt.Rectangle((0, 0), 1, 1, color=color)
+                      for color in zone_colors]
+    ax.legend(legend_handles, zone_labels, loc="lower center",
+              bbox_to_anchor=(0.5, 1.01), ncol=3, frameon=False)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close()
+
+    print("\n[LAST_THREE_ZONE_BARS] Exact H16 loss-zone MSE contribution percentages")
+    for label, mse, percentages in zip(labels, mse_values, pct_rows):
+        print(
+            f"[LAST_THREE_ZONE_BARS] {label} mse={mse:.10f} | "
+            f"low={percentages[0]:.4f}% medium={percentages[1]:.4f}% "
+            f"high={percentages[2]:.4f}%"
+        )
+    print(f"[LAST_THREE_ZONE_BARS] Figure saved to {output_path}")
+
+
 def plot_summary_comparison(all_results, output_path):
     """
     汇总图片：对比所有层的 NVFP4 NoRot vs Rot (Unlocked) vs Rot (Locked)
@@ -653,15 +1115,15 @@ def plot_summary_comparison(all_results, output_path):
         
         # NoRot Plot
         axes[i, 0].bar(range(16), res['orig'], color='skyblue', alpha=0.7)
-        axes[i, 0].set_title(f"L{layer} ({tag}) G{gid} - NoRot\nGrp MSE: {res['norot_mse']:.4f} | Max: {res['norot_mse_max']:.4f} | Oth: {res['norot_mse_other']:.4f}", fontsize=10)
+        axes[i, 0].set_title(f"L{layer} ({tag}) G{gid} - H16 NoRot\nGrp MSE: {res['norot_mse']:.4f} | Max: {res['norot_mse_max']:.4f} | Oth: {res['norot_mse_other']:.4f}", fontsize=10)
         
         # Rot Plot (Unlocked)
         axes[i, 1].bar(range(16), res['rotated'], color='salmon', alpha=0.7)
-        axes[i, 1].set_title(f"L{layer} ({tag}) G{gid} - Rot (Unlck)\nGrp MSE: {res['rot_mse']:.4f} | Max: {res['rot_mse_max']:.4f} | Oth: {res['rot_mse_other']:.4f}", fontsize=10)
+        axes[i, 1].set_title(f"L{layer} ({tag}) G{gid} - H16 Rot (Unlck)\nGrp MSE: {res['rot_mse']:.4f} | Max: {res['rot_mse_max']:.4f} | Oth: {res['rot_mse_other']:.4f}", fontsize=10)
         
         # Rot Plot (Locked)
         axes[i, 2].bar(range(16), res['rotated'], color='mediumpurple', alpha=0.7)
-        axes[i, 2].set_title(f"L{layer} ({tag}) G{gid} - Rot (Lck)\nGrp MSE: {res['rot_locked_mse']:.4f} | Max: {res['rot_locked_mse_max']:.4f} | Oth: {res['rot_locked_mse_other']:.4f}", fontsize=10)
+        axes[i, 2].set_title(f"L{layer} ({tag}) G{gid} - H16 Rot (Lck)\nGrp MSE: {res['rot_locked_mse']:.4f} | Max: {res['rot_locked_mse_max']:.4f} | Oth: {res['rot_locked_mse_other']:.4f}", fontsize=10)
         
         for j in range(3):
             axes[i, j].axhline(0, color='black', linewidth=0.5)

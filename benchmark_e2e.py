@@ -153,6 +153,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.30)
+    parser.add_argument("--fp16-gpu-memory-utilization", type=float, default=None,
+                        help="Optional GPU memory utilization used only for fp16.")
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--nvml-interval-ms", type=float, default=20.0)
     parser.add_argument("--cooldown-seconds", type=float, default=5.0)
@@ -190,6 +192,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("batch sizes must be positive")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("gpu-memory-utilization must be in (0, 1]")
+    if (
+        args.fp16_gpu_memory_utilization is not None
+        and not 0 < args.fp16_gpu_memory_utilization <= 1
+    ):
+        raise ValueError("fp16-gpu-memory-utilization must be in (0, 1]")
     if args.max_num_batched_tokens < args.input_tokens:
         raise ValueError("max-num-batched-tokens must be >= input-tokens")
 
@@ -201,6 +208,11 @@ def child_command(
     tokenizer: str,
     result_path: Path,
 ) -> list[str]:
+    gpu_memory_utilization = (
+        args.fp16_gpu_memory_utilization
+        if method == "fp16" and args.fp16_gpu_memory_utilization is not None
+        else args.gpu_memory_utilization
+    )
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -228,7 +240,7 @@ def child_command(
         "--repeats",
         str(args.repeats),
         "--gpu-memory-utilization",
-        str(args.gpu_memory_utilization),
+        str(gpu_memory_utilization),
         "--max-num-batched-tokens",
         str(args.max_num_batched_tokens),
         "--nvml-interval-ms",

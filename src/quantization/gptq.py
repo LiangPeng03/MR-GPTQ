@@ -13,7 +13,6 @@ from .qlinear import QLinear
 from .quantizer import Quantizer, get_reciprocal
 from .quant_args import QuantizationOrder
 from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision, FP8_E4M3_MAX, FP4_E2M1_MAX
-from .rtn import _validate_saved_nvfp4_layer
 from .accumulate_hessian import accumulate_hessian
 from ..transforms.transforms import build_transform, get_transform_matrix
 from ..utils.linalg_utils import inv_sym
@@ -990,22 +989,26 @@ def gptq_quantization(
                 qkv_in_transform = build_composite_with_gics("qkv", qkv_in_transform)
             if "gate_up" in resort_perms or (hasattr(block, "gics_scales") and "gate_up" in block.gics_scales) or "gate_up" in smoothquant_scales:
                 gate_up_in_transform = build_composite_with_gics("gate_up", gate_up_in_transform)
-            # O and down use the runtime input transform below.  Do not also
-            # permute connected weights in-place: the later folded inverse
-            # transform would then apply the same non-involutory permutation
-            # twice.  This was hidden by identity/Hadamard transforms but
-            # corrupts channel-cluster permutations.
+            # O: in-place permutation only for MHA (skip GQA to avoid cross-head corruption)
             if "o" in resort_perms:
+                o_perm = resort_perms["o"]
                 if hasattr(block, "gics_scales") and "o" in block.gics_scales:
                     o_in_transform = build_composite_with_gics("o", o_in_transform)
+                if block.self_attn.v_proj.weight.shape[0] == block.self_attn.o_proj.weight.shape[1]:
+                    block.self_attn.o_proj.weight.data = block.self_attn.o_proj.weight.data[:, o_perm]
+                    block.self_attn.v_proj.weight.data = block.self_attn.v_proj.weight.data[o_perm, :]
             elif hasattr(block, "gics_scales") and "o" in block.gics_scales:
                 o_in_transform = build_composite_with_gics("o", o_in_transform)
             # SmoothQuant-only for o (no resort, no gics)
             elif "o" in smoothquant_scales:
                 o_in_transform = build_composite_with_gics("o", o_in_transform)
             if "down" in resort_perms:
+                down_perm = resort_perms["down"]
                 if hasattr(block, "gics_scales") and "down" in block.gics_scales:
                     down_in_transform = build_composite_with_gics("down", down_in_transform)
+                block.mlp.down_proj.weight.data = block.mlp.down_proj.weight.data[:, down_perm]
+                block.mlp.gate_proj.weight.data = block.mlp.gate_proj.weight.data[down_perm, :]
+                block.mlp.up_proj.weight.data = block.mlp.up_proj.weight.data[down_perm, :]
             elif hasattr(block, "gics_scales") and "down" in block.gics_scales:
                 down_in_transform = build_composite_with_gics("down", down_in_transform)
             # SmoothQuant-only for down (no resort, no gics)
@@ -1062,13 +1065,6 @@ def gptq_quantization(
         block.mlp.gate_proj.weight.data = gate_up_in_transform(block.mlp.gate_proj.weight, inv_t=True)
         block.mlp.up_proj.weight.data = gate_up_in_transform(block.mlp.up_proj.weight, inv_t=True)
         block.mlp.down_proj.weight.data = down_in_transform(block.mlp.down_proj.weight, inv_t=True)
-
-        # The inverse input transforms above are already folded into each
-        # weight. QLinear must therefore not transform the weight again during
-        # calibration / GPTQ activation collection.
-        for layer in block.modules():
-            if isinstance(layer, QLinear):
-                layer._train_mode = False
 
         # 4. Create GPTQ handles and hooks
         gptq_handles = {}
@@ -1261,16 +1257,9 @@ def gptq_quantization(
                 down_in_transform = process_awq_group(["mlp.down_proj"], down_in_transform)
                 block.mlp.down_in_transform = down_in_transform
 
-            # The weights were transformed before GPTQ handles were created
-            # (above), so they already live in the same input coordinates as
-            # the transformed activations. Calling fix_parametrization() here
-            # would apply the inverse transform a second time. That is benign
-            # for identity/Hadamard but corrupts non-involutory channel
-            # permutations and GICS scales. Freeze QLinear instead so its
-            # forward path uses the already-folded GPTQ weights directly.
-            for layer in block.modules():
-                if isinstance(layer, QLinear):
-                    layer._train_mode = False
+            # Propagate updated transforms to QLinear modules
+            block.self_attn.fix_parametrization()
+            block.mlp.fix_parametrization()
             
             del block._layer_inputs
         
@@ -1303,7 +1292,7 @@ def gptq_quantization(
                     transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
 
                     if args.export_quantized_model == "realquant":
-                        saved_layer = {
+                        quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
                             "qweight": pack_fp4_to_uint8(qweight).cpu(),
                             "scales": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
                             "forward_hadamard_matrix": transform_matrix,
@@ -1311,19 +1300,6 @@ def gptq_quantization(
                             "weight_global_scale": weight_global_scale.clone(),
                             "act_global_scale": act_global_scale.clone()
                         }
-                        quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = saved_layer
-                        if args.validate_realquant_export:
-                            max_abs, mean_abs = _validate_saved_nvfp4_layer(
-                                f"model.layers.{block_idx}.{layer_name}",
-                                saved_layer,
-                                dequantized_qweight,
-                                args.w_group_size,
-                            )
-                            print(
-                                f"[GPTQ REALQUANT EXPORT CHECK] "
-                                f"block={block_idx} layer={layer_name} "
-                                f"max_abs={max_abs:.8g} mean_abs={mean_abs:.8g}"
-                            )
                     # pseudoquant
                     else:
                         quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {

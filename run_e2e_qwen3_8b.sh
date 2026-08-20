@@ -115,6 +115,7 @@ fi
     --warmups "$WARMUPS" \
     --repeats "$REPEATS" \
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+    --fp16-gpu-memory-utilization "${FP16_GPU_MEMORY_UTILIZATION:-0.80}" \
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
     --nvml-interval-ms "$NVML_INTERVAL_MS" \
     "${cudagraph_args[@]}" \
