@@ -13,6 +13,7 @@ from .qlinear import QLinear
 from .quantizer import Quantizer, get_reciprocal
 from .quant_args import QuantizationOrder
 from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision, FP8_E4M3_MAX, FP4_E2M1_MAX
+from .rtn import _validate_saved_nvfp4_layer
 from .accumulate_hessian import accumulate_hessian
 from ..transforms.transforms import build_transform, get_transform_matrix
 from ..utils.linalg_utils import inv_sym
@@ -1274,6 +1275,19 @@ def gptq_quantization(
 
         # 7. Run GPTQ quantization (Already aligned) — skip if weight is not quantized (w_bits >= 16)
         if weight_quantizer_kwargs is not None:
+            if args.validate_realquant_export:
+                if (
+                    args.export_quantized_model != "realquant"
+                    or args.format != "nvfp"
+                    or args.scale_precision != ScalePrecision.E4M3
+                ):
+                    raise ValueError(
+                        "GPTQ --validate_realquant_export requires "
+                        "--export_quantized_model realquant with NVFP4/E4M3."
+                    )
+                block_export_max_abs = 0.0
+                block_export_max_mean_abs = 0.0
+
             for layer_name, gptq_handle in gptq_handles.items():
                 dequantized_qweight, qweight, scales = gptq_handle.quantize()
                 orig_weight = gptq_handle.layer.weight
@@ -1292,7 +1306,8 @@ def gptq_quantization(
                     transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
 
                     if args.export_quantized_model == "realquant":
-                        quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
+                        layer_key = f"model.layers.{block_idx}.{layer_name}"
+                        saved_layer = {
                             "qweight": pack_fp4_to_uint8(qweight).cpu(),
                             "scales": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
                             "forward_hadamard_matrix": transform_matrix,
@@ -1300,6 +1315,20 @@ def gptq_quantization(
                             "weight_global_scale": weight_global_scale.clone(),
                             "act_global_scale": act_global_scale.clone()
                         }
+                        quantized_state_dict[layer_key] = saved_layer
+                        if args.validate_realquant_export:
+                            max_abs, mean_abs = _validate_saved_nvfp4_layer(
+                                layer_key,
+                                saved_layer,
+                                dequantized_qweight,
+                                args.w_group_size,
+                            )
+                            block_export_max_abs = max(
+                                block_export_max_abs, max_abs
+                            )
+                            block_export_max_mean_abs = max(
+                                block_export_max_mean_abs, mean_abs
+                            )
                     # pseudoquant
                     else:
                         quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
@@ -1309,6 +1338,14 @@ def gptq_quantization(
                             "weight_global_scale": weight_global_scale.clone(),
                             "act_global_scale": act_global_scale.clone()
                         }
+
+            if args.validate_realquant_export:
+                print(
+                    f"[GPTQ REALQUANT EXPORT CHECK] block={block_idx} "
+                    f"layers={len(gptq_handles)} "
+                    f"max_abs={block_export_max_abs:.8g} "
+                    f"max_mean_abs={block_export_max_mean_abs:.8g}"
+                )
 
         # Enable activation MSE tracking
         if args.show_act_mse:

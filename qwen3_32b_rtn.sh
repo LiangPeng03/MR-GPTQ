@@ -23,7 +23,7 @@ MODEL5="Qwen/Qwen3-8B"
 MODEL6="meta-llama/Llama-3.2-1B"
 MODEL7="Qwen/Qwen3-1.7B"
 
-MODEL8="/home/pengliang/models/Qwen3-32B"
+MODEL8="/data/pengliang/Qwen3-32B"
 MODEL9="/home/pengliang/models/Meta-Llama-3-70B"
 
 

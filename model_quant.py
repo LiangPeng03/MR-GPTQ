@@ -233,13 +233,32 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
 
     # Add quantization metadata
     config.quantization_config = prepare_quantization_config(
-        args.hadamard_group_size, 
+        args.hadamard_group_size,
         args.format,
-        pseudoquantization=(args.export_quantized_model == "pseudoquant")
+        pseudoquantization=(args.export_quantized_model == "pseudoquant"),
+        activation_observer=args.a_observer,
+        identity_transform=(args.transform_class == "identity"),
     )
     # Save configs
     config.save_pretrained(args.save_path)
     model.generation_config.save_pretrained(args.save_path)
+
+    # Transformers 5.x may migrate RoPE settings into ``rope_parameters`` and
+    # omit the legacy top-level ``rope_theta`` field.  The custom deployment
+    # backend (and older Transformers/vLLM versions) still reads rope_theta.
+    # Preserve both representations so exported checkpoints retain the base
+    # model's positional encoding across backend versions.
+    config_path = os.path.join(args.save_path, "config.json")
+    with open(config_path, "r", encoding="utf-8") as f:
+        exported_config = json.load(f)
+    rope_parameters = exported_config.get("rope_parameters")
+    if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+        exported_config["rope_theta"] = rope_parameters["rope_theta"]
+    elif "rope_theta" not in exported_config and hasattr(config, "rope_theta"):
+        exported_config["rope_theta"] = config.rope_theta
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(exported_config, f, indent=2, ensure_ascii=False)
+        f.write("\n")
 
     
 def parse_args():

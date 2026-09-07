@@ -1,430 +1,585 @@
-"""
-test_lss_synergy.py - 验证 KMeans + LSS 协同效应 (包含对抗性验证)
+"""Mechanism analysis for DACC and BITR.
 
-实验2: 组内值分布可视化 - KMeans 如何让组内值更均匀，使 LSS 前提更可靠
-实验3+4: LSS 迭代收敛性与反驳性实验 - 证明"多次 LSS"无法替代 KMeans
+The script compares the original layout, simple controls, production DACC,
+and DACC followed by production BITR on calibration activations from layers
+0, 15, and 31.  It reports activation MSE, MDR/HDR occupancy, and both the
+relative and absolute MDR/HDR contributions.  The absolute regional MSE is
+normalized by the number of all elements, so it is directly comparable with
+the global MSE and is additive across regions.  It does not quantize the model
+or run perplexity evaluation.
 """
-import torch
-import gc
-import copy
+
 import argparse
+import copy
+import gc
+import json
+import math
+from pathlib import Path
+
 import numpy as np
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.utils.data_utils import get_data
+
+from src.quantization.gics import optimize_channel_scales_coordinate_descent
+from src.quantization.quant_ops import FP4_E2M1_MAX, FP8_E4M3_MAX, cast_to_fp4
 from src.quantization.quantizer import get_reciprocal
-from src.quantization.quant_ops import FP8_E4M3_MAX, FP4_E2M1_MAX
+from src.utils.data_utils import get_data
 
 
-# ================================================================
-# 基础工具
-# ================================================================
-class ForwardInterrupt(Exception): pass
+class ForwardInterrupt(Exception):
+    pass
+
 
 class InputCollector(torch.nn.Module):
-    def __init__(self, module, cpu_offload=False):
+    def __init__(self, module):
         super().__init__()
         self.module = module
-        self.cpu_offload = cpu_offload
         self.input_args = []
         self.input_kwargs = []
+
     def forward(self, *input_args, **input_kwargs):
-        if self.cpu_offload:
-            def to_cpu(v):
-                if isinstance(v, torch.Tensor): return v.cpu()
-                if isinstance(v, tuple): return tuple(to_cpu(x) for x in v)
-                if isinstance(v, list): return [to_cpu(x) for x in v]
-                if isinstance(v, dict): return {k: to_cpu(val) for k, val in v.items()}
-                return v
-            input_args = to_cpu(input_args)
-            input_kwargs = to_cpu(input_kwargs)
         self.input_args.append(input_args)
         self.input_kwargs.append(input_kwargs)
         raise ForwardInterrupt
 
-def to_device(v, device):
-    if isinstance(v, torch.Tensor): return v.to(device)
-    if isinstance(v, tuple): return tuple(to_device(x, device) for x in v)
-    if isinstance(v, list): return [to_device(x, device) for x in v]
-    if isinstance(v, dict): return {k: to_device(val, device) for k, val in v.items()}
-    return v
 
-def maybe_first(obj):
-    if isinstance(obj, tuple): return obj[0]
-    return obj
+def to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(to_device(x, device) for x in value)
+    if isinstance(value, list):
+        return [to_device(x, device) for x in value]
+    if isinstance(value, dict):
+        return {k: to_device(v, device) for k, v in value.items()}
+    return value
+
+
+def maybe_first(value):
+    return value[0] if isinstance(value, tuple) else value
+
 
 def get_combined_weight(block, name):
-    if name == "qkv": w = torch.cat([block.self_attn.q_proj.weight, block.self_attn.k_proj.weight, block.self_attn.v_proj.weight], dim=0)
-    elif name == "o": w = block.self_attn.o_proj.weight
-    elif name == "gate_up": w = torch.cat([block.mlp.gate_proj.weight, block.mlp.up_proj.weight], dim=0)
-    elif name == "down": w = block.mlp.down_proj.weight
-    else: return None
-    return w.float()
+    if name == "qkv":
+        weight = torch.cat([block.self_attn.q_proj.weight,
+                            block.self_attn.k_proj.weight,
+                            block.self_attn.v_proj.weight], dim=0)
+    elif name == "o":
+        weight = block.self_attn.o_proj.weight
+    elif name == "gate_up":
+        weight = torch.cat([block.mlp.gate_proj.weight,
+                            block.mlp.up_proj.weight], dim=0)
+    elif name == "down":
+        weight = block.mlp.down_proj.weight
+    else:
+        raise ValueError(name)
+    return weight.detach().float()
 
-def cast_to_fp4(x):
-    sign = torch.sign(x)
-    x = torch.abs(x)
-    out = torch.where(x > 5.0, 6.0,
-          torch.where(x >= 3.5, 4.0,
-          torch.where(x >= 1.75, torch.round(x),
-                                 torch.round(x * 2.0) * 0.5)))
-    return out * sign
 
 def compute_global_scale(x):
-    act_max = x.abs().max().to(torch.float32).view(1)
-    return (FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(act_max)).to(x.device)
+    tensor_max = x.abs().max().to(torch.float32).view(1)
+    return (FP8_E4M3_MAX * FP4_E2M1_MAX *
+            get_reciprocal(tensor_max)).to(x.device)
+
 
 def scale_to_e4m3(raw_scale, global_scale):
-    return (raw_scale * global_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX) \
-        .to(torch.float8_e4m3fn) \
-        .to(torch.float32) \
-        .mul(get_reciprocal(global_scale))
-
-def compute_kmeans_fp4_perm(X_abs_T, group_size=16):
-    dim = X_abs_T.shape[0]
-    n_groups = dim // group_size
-    device = X_abs_T.device
-    grid_mults = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device, dtype=torch.float32)
-    def compute_loss_distances(all_ch_abs, ref_ch_abs, chunk_size=256):
-        ref = ref_ch_abs.unsqueeze(0)
-        n_ch = all_ch_abs.shape[0]
-        losses = torch.zeros(n_ch, device=device, dtype=torch.float32)
-        for i in range(0, n_ch, chunk_size):
-            chunk = all_ch_abs[i:i+chunk_size]
-            p_max = torch.maximum(chunk, ref)
-            p_min = torch.minimum(chunk, ref)
-            scale = (p_max / 6.0).clamp(min=1e-10)
-            grid = scale.unsqueeze(-1) * grid_mults
-            diff = (p_min.unsqueeze(-1) - grid).abs()
-            min_q = grid.gather(-1, diff.argmin(-1, keepdim=True)).squeeze(-1)
-            losses[i:i+chunk_size] = ((p_min - min_q) ** 2).sum(dim=1)
-        return losses
-    ch_sums = X_abs_T.sum(dim=1)
-    accumulated_dist = torch.zeros(dim, device=device, dtype=torch.float32)
-    seed_order = []
-    first_seed = ch_sums.argmax().item()
-    seed_order.append(first_seed)
-    accumulated_dist[first_seed] = -float('inf')
-    dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed])
-    accumulated_dist += dists
-    accumulated_dist[first_seed] = -float('inf')
-    for k in range(1, n_groups):
-        new_seed = accumulated_dist.argmax().item()
-        seed_order.append(new_seed)
-        accumulated_dist[new_seed] = -float('inf')
-        dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed])
-        accumulated_dist += dists
-    opt_groups = [[s] for s in seed_order]
-    group_maxes = X_abs_T[seed_order].clone()
-    group_sizes = torch.ones(n_groups, device=device, dtype=torch.long)
-    seed_set = set(seed_order)
-    remaining = [c for c in range(dim) if c not in seed_set]
-    remaining_sums = ch_sums[remaining]
-    sorted_order = torch.argsort(remaining_sums, descending=True)
-    remaining_sorted = [remaining[i] for i in sorted_order.tolist()]
-    for c in remaining_sorted:
-        c_abs = X_abs_T[c]
-        losses = torch.zeros(n_groups, device=device, dtype=torch.float32)
-        ref = c_abs.unsqueeze(0)
-        for i in range(0, n_groups, 256):
-            g_chunk = group_maxes[i:i+256]
-            p_max = torch.maximum(ref, g_chunk)
-            p_min = torch.minimum(ref, g_chunk)
-            scale = (p_max / 6.0).clamp(min=1e-10)
-            grid = scale.unsqueeze(-1) * grid_mults
-            diff = (p_min.unsqueeze(-1) - grid).abs()
-            min_q = grid.gather(-1, diff.argmin(-1, keepdim=True)).squeeze(-1)
-            losses[i:i+256] = ((p_min - min_q) ** 2).sum(dim=1)
-        losses[group_sizes >= group_size] = float('inf')
-        best_g = losses.argmin().item()
-        opt_groups[best_g].append(c)
-        group_maxes[best_g] = torch.maximum(group_maxes[best_g], c_abs)
-        group_sizes[best_g] += 1
-    perm = []
-    for g in opt_groups: perm.extend(g)
-    return torch.tensor(perm, device=device, dtype=torch.long)
+    return ((raw_scale * global_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+            .to(torch.float8_e4m3fn).to(torch.float32)
+            .mul(get_reciprocal(global_scale)))
 
 
-# ================================================================
-# 实验函数 (仅返回统计结果)
-# ================================================================
-def run_experiment2(X, perm_identity, perm_kmeans, group_size=16):
-    """实验2: 分组结构改善"""
-    e2m1_grid_ratios = [0, 0.5/6, 1/6, 1.5/6, 2/6, 3/6, 4/6, 6/6]
-    results = {}
-    for label, perm in [("Original", perm_identity), ("KMeans", perm_kmeans)]:
-        X_perm = X[:, perm]
-        X_groups = X_perm.abs().contiguous().view(-1, group_size)
-        group_max = X_groups.amax(dim=1, keepdim=True).clamp(min=1e-10)
-        ratios = X_groups / group_max
-        deadly_pct = ((ratios > 0.7) & (ratios < 0.95)).float().mean().item() * 100
-        dist_to_nearest_grid = torch.full_like(ratios, float('inf'))
-        for g_val in e2m1_grid_ratios:
-            dist_to_nearest_grid = torch.minimum(dist_to_nearest_grid, (ratios - g_val).abs())
-        avg_grid_dist = dist_to_nearest_grid.mean().item()
-        results[label] = {"deadly_pct": deadly_pct, "avg_grid_dist": avg_grid_dist}
-    return results
-
-def run_experiment34(X, perm_identity, perm_kmeans, group_size=16, max_iters=3):
-    """实验3+4: 跑 3 轮 LSS 以验证收敛性和多次迭代的极限"""
-    results = {}
-    for label, perm in [("Original", perm_identity), ("KMeans", perm_kmeans)]:
-        X_perm = X[:, perm]
-        X_groups = X_perm.abs().contiguous().view(-1, group_size)
-        gs = compute_global_scale(X_perm)
-        abs_max = X_groups.amax(dim=1, keepdim=True)
-        s_current = abs_max / 6.0
-        s_current[s_current == 0] = 1.0
-        g_prev = cast_to_fp4(X_groups / s_current).abs()
-        
-        # MinMax MSE
-        x_dequant_0 = g_prev * scale_to_e4m3(s_current, gs)
-        mse_0 = ((X_groups - x_dequant_0) ** 2).mean().item()
-        
-        res = {"MinMax_MSE": mse_0}
-        
-        # 3 轮 LSS
-        for iteration in range(1, max_iters + 1):
-            num = (X_groups * g_prev).sum(dim=1, keepdim=True)
-            den = (g_prev * g_prev).sum(dim=1, keepdim=True)
-            den[den == 0] = 1.0
-            raw_scales_new = num / den
-            raw_scales_new[abs_max == 0] = 1.0
-            s_new = scale_to_e4m3(raw_scales_new, gs)
-            g_new = cast_to_fp4(X_groups / s_new).abs()
-            
-            flips = (g_new != g_prev)
-            flip_rate = flips.float().mean().item() * 100
-            x_dequant = g_new * s_new
-            mse = ((X_groups - x_dequant) ** 2).mean().item()
-            
-            res[f"LSS{iteration}_MSE"] = mse
-            res[f"LSS{iteration}_Flip"] = flip_rate
-            
-            g_prev = g_new
-            s_current = raw_scales_new
-        results[label] = res
-    return results
+def proxy_distances(all_channels, reference, channel_weights=None,
+                    chunk_size=256):
+    """Pairwise proxy used by the production cumulative-distance DACC."""
+    grid = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6],
+                        device=all_channels.device, dtype=torch.float32)
+    result = torch.zeros(all_channels.shape[0], device=all_channels.device)
+    reference = reference.unsqueeze(0)
+    for start in range(0, all_channels.shape[0], chunk_size):
+        chunk = all_channels[start:start + chunk_size]
+        p_max = torch.maximum(chunk, reference)
+        p_min = torch.minimum(chunk, reference)
+        scale = (p_max / 6.0).clamp(min=1e-10)
+        candidates = scale.unsqueeze(-1) * grid
+        nearest = candidates.gather(
+            -1, (p_min.unsqueeze(-1) - candidates).abs().argmin(
+                -1, keepdim=True)).squeeze(-1)
+        distance = ((p_min - nearest) ** 2).sum(dim=1)
+        if channel_weights is not None:
+            distance = distance * channel_weights[start:start + chunk.size(0)]
+        result[start:start + chunk.size(0)] = distance
+    return result
 
 
-# ================================================================
-# 主函数
-# ================================================================
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name_or_path", type=str, default="meta-llama/Meta-Llama-3-8B")
-    parser.add_argument("--dataset_name_or_path", type=str, default="fineweb-edu")
-    parser.add_argument("--sequence_length", type=int, default=2048)
-    parser.add_argument("--num_sequences", type=int, default=32)
-    args = parser.parse_args()
-    
-    device = "cuda"
-    print("Loading model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path, dtype=torch.bfloat16,
-        low_cpu_mem_usage=True, attn_implementation="sdpa"
+def compute_dacc_perm(x_abs_t, group_size=16, channel_weights=None):
+    """Production DACC: cumulative seed selection followed by greedy fill."""
+    channels = x_abs_t.shape[0]
+    if channels % group_size:
+        raise ValueError(f"channels={channels} is not divisible by {group_size}")
+    n_groups = channels // group_size
+    if channel_weights is None:
+        channel_weights = torch.ones(channels, device=x_abs_t.device)
+    importance = x_abs_t.sum(dim=1) * channel_weights
+
+    first = importance.argmax().item()
+    seeds = [first]
+    cumulative = proxy_distances(x_abs_t, x_abs_t[first], channel_weights)
+    cumulative[first] = -float("inf")
+    while len(seeds) < n_groups:
+        seed = cumulative.argmax().item()
+        seeds.append(seed)
+        cumulative[seed] = -float("inf")
+        cumulative += proxy_distances(x_abs_t, x_abs_t[seed], channel_weights)
+        cumulative[seed] = -float("inf")
+
+    groups = [[seed] for seed in seeds]
+    envelopes = x_abs_t[seeds].clone()
+    sizes = torch.ones(n_groups, device=x_abs_t.device, dtype=torch.long)
+    chosen = set(seeds)
+    remaining = [c for c in range(channels) if c not in chosen]
+    remaining.sort(key=lambda c: float(importance[c]), reverse=True)
+    for channel in remaining:
+        distances = proxy_distances(envelopes, x_abs_t[channel])
+        distances[sizes >= group_size] = float("inf")
+        group = distances.argmin().item()
+        groups[group].append(channel)
+        envelopes[group] = torch.maximum(envelopes[group], x_abs_t[channel])
+        sizes[group] += 1
+    return torch.tensor([c for group in groups for c in group],
+                        device=x_abs_t.device, dtype=torch.long)
+
+
+def compute_outlier_stagger_perm(x, weight, group_size=16, quantile=0.9375):
+    """Greedily separate channels with co-occurring activation/weight outliers."""
+    channels = x.shape[1]
+    if channels % group_size:
+        raise ValueError(
+            f"channels={channels} is not divisible by {group_size}"
+        )
+
+    threshold_a = torch.quantile(
+        x.abs().float(), quantile, dim=1, keepdim=True
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-    
-    print("Loading calibration data...")
-    calib_data = get_data(args.dataset_name_or_path, tokenizer, args.sequence_length, args.num_sequences, seed=42)
-    
-    model.config.use_cache = False
-    model.requires_grad_(False)
+    activation_mask = (x.abs() > threshold_a).float()
+
+    threshold_w = torch.quantile(
+        weight.abs().float(), quantile, dim=1, keepdim=True
+    )
+    weight_mask = (weight.abs() > threshold_w).float()
+
+    # Balance activation-token and weight-row contributions, matching the
+    # staggering implementation used by the quantizer.
+    weight_factor = math.sqrt(x.shape[0] / max(weight.shape[0], 1))
+    joint_mask = torch.cat(
+        [activation_mask, weight_mask * weight_factor], dim=0
+    )
+    frequency = joint_mask.mean(dim=0)
+    channel_order = torch.argsort(frequency, descending=True).tolist()
+
+    num_groups = channels // group_size
+    groups = [[] for _ in range(num_groups)]
+    group_profiles = torch.zeros(
+        num_groups, joint_mask.shape[0], device=x.device,
+        dtype=torch.float32,
+    )
+    group_sizes = torch.zeros(
+        num_groups, device=x.device, dtype=torch.long
+    )
+
+    for channel in channel_order:
+        profile = joint_mask[:, channel]
+        penalties = torch.mv(group_profiles, profile)
+        penalties[group_sizes >= group_size] = float("inf")
+        group = penalties.argmin().item()
+        groups[group].append(channel)
+        group_profiles[group] += profile
+        group_sizes[group] += 1
+
+    return torch.tensor(
+        [channel for group in groups for channel in group],
+        device=x.device, dtype=torch.long,
+    )
+
+
+def compute_joint_second_moment_perm(x, weight, alpha=0.5):
+    """PermuQuant-style joint second-moment ordering control."""
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"alpha must be in [0, 1], but got {alpha}")
+
+    activation_moment = x.float().pow(2).mean(dim=0)
+    weight_moment = weight.float().pow(2).mean(dim=0)
+    eps = torch.finfo(torch.float32).tiny
+    score = (
+        alpha * torch.log(activation_moment.clamp_min(eps))
+        + (1.0 - alpha) * torch.log(weight_moment.clamp_min(eps))
+    )
+    return torch.argsort(score, descending=True)
+
+
+def build_layout_permutation(
+    x, weight, name, kind, group_size, model,
+    stagger_quantile=0.9375, permu_alpha=0.5,
+):
+    """Build a control or DACC permutation in the same scopes as production."""
+    channels = x.shape[1]
+    if name in {"o", "down"}:
+        # The production quantizer keeps attention heads/intermediate chunks
+        # independent for these two projections (default block scope=head_dim).
+        scope = model.config.hidden_size // model.config.num_attention_heads
+    else:
+        scope = channels
+    if scope % group_size:
+        raise ValueError(f"scope={scope} is not divisible by B={group_size}")
+
+    result = []
+    x_abs_t = x.abs().T.float()
+    for start in range(0, channels, scope):
+        stop = min(start + scope, channels)
+        local_values = x[:, start:stop].float()
+        local_weight = weight[:, start:stop].float()
+        local_x = x_abs_t[start:stop]
+        if kind == "dacc":
+            local_weights = local_weight.pow(2).sum(dim=0)
+            local_perm = compute_dacc_perm(local_x, group_size, local_weights)
+        elif kind == "outlier_stagger":
+            local_perm = compute_outlier_stagger_perm(
+                local_values, local_weight, group_size, stagger_quantile
+            )
+        elif kind == "joint_second_moment":
+            local_perm = compute_joint_second_moment_perm(
+                local_values, local_weight, permu_alpha
+            )
+        elif kind == "magnitude":
+            local_perm = torch.argsort(local_x.sum(dim=1), descending=True)
+        elif kind == "random":
+            local_perm = torch.randperm(stop - start, device=x.device)
+        elif kind == "identity":
+            local_perm = torch.arange(stop - start, device=x.device)
+        else:
+            raise ValueError(kind)
+        result.append(local_perm + start)
+    return torch.cat(result)
+
+
+def activation_stats(x, permutation, group_size=16, channel_scale=None):
+    """Quantize one layout and return comparable original-unit statistics."""
+    x_layout = x[:, permutation].float().contiguous()
+    if channel_scale is None:
+        channel_scale = torch.ones(x_layout.shape[1], device=x.device)
+    channel_scale = channel_scale.to(x.device).float()
+    x_work = x_layout * channel_scale.unsqueeze(0)
+    groups = x_work.view(-1, group_size)
+    abs_groups = groups.abs()
+    block_max = abs_groups.amax(dim=1, keepdim=True)
+    raw_scale = (block_max / FP4_E2M1_MAX).clamp(min=1e-10)
+    raw_scale = torch.where(block_max == 0, torch.ones_like(raw_scale), raw_scale)
+    global_scale = compute_global_scale(x_work)
+    block_scale = scale_to_e4m3(raw_scale, global_scale)
+    q = cast_to_fp4(groups / block_scale)
+    scale_groups = channel_scale.unsqueeze(0).expand(
+        x_layout.shape[0], -1).contiguous().view(-1, group_size)
+    reconstructed = (q * block_scale) / scale_groups
+    original = groups / scale_groups
+    error = (original - reconstructed) ** 2
+
+    # # u=6|z|/block_max is the normalized E2M1 coordinate used in the paper.
+    # u = 6.0 * abs_groups / block_max.clamp(min=1e-10)
+    # hdr = (u > 4.5) & (u < 5.5)
+    # mdr = (((u > 2.25) & (u < 2.75)) |
+    #        ((u > 3.25) & (u < 3.75)) |
+    #        ((u > 4.25) & (u <= 4.5)) |
+    #        ((u >= 5.5) & (u < 5.75)))
+    # mdr_hdr = mdr | hdr
+
+    # Use the actual effective block scale after E4M3 projection.
+    # This corresponds to |z_i| = |x_i| / (s_T * s_B).
+    u = (groups / block_scale).abs()
+
+    valid = u <= FP4_E2M1_MAX
+
+    hdr = valid & (u > 4.5) & (u < 5.5)
+
+    mdr = valid & (
+        ((u > 2.25) & (u < 2.75)) |
+        ((u > 3.25) & (u < 3.75)) |
+        ((u > 4.25) & (u <= 4.5)) |
+        ((u >= 5.5) & (u < 5.75))
+    )
+
+    ldr = valid & ~(mdr | hdr)
+    overflow = u > FP4_E2M1_MAX
+    mdr_hdr = mdr | hdr
+
+    total = error.sum().clamp(min=1e-20).item()
+    # Absolute regional MSE contribution in the original value units.  The
+    # denominator is the number of all values (not the number of values in
+    # the region), making this quantity comparable to ``mse`` and additive
+    # across disjoint regions.  This avoids the misleading effect where a
+    # lower total MSE can make a region's percentage contribution increase.
+    num_values = error.numel()
+    mdr_hdr_abs_mse = error[mdr_hdr].sum().item() / max(num_values, 1)
+    hdr_abs_mse = error[hdr].sum().item() / max(num_values, 1)
+    return {
+        "mse": float(error.mean().item()),
+        "ldr_pct": float(ldr.float().mean().item() * 100),
+        "mdr_pct": float(mdr.float().mean().item() * 100),
+        "hdr_pct": float(hdr.float().mean().item() * 100),
+        "overflow_pct": float(overflow.float().mean().item() * 100),
+        "mdr_hdr_mse_pct": float(error[mdr_hdr].sum().item() / total * 100),
+        "hdr_mse_pct": float(error[hdr].sum().item() / total * 100),
+        "mdr_hdr_mse_abs": float(mdr_hdr_abs_mse),
+        "hdr_mse_abs": float(hdr_abs_mse),
+    }
+
+
+def capture_inputs(model, calibration_data, device):
     blocks = model.model.layers
-    
-    print("Capturing layer inputs...")
-    blocks[0] = InputCollector(blocks[0], cpu_offload=False)
+    blocks[0] = InputCollector(blocks[0]).to(device)
     model.get_input_embeddings().to(device)
-    blocks[0] = blocks[0].to(device)
-    for sample in calib_data:
+    for sample in calibration_data:
         try:
-            with torch.no_grad(): model(sample.to(device))
-        except ForwardInterrupt: pass
-    input_args = blocks[0].input_args
-    input_kwargs = blocks[0].input_kwargs
+            with torch.no_grad():
+                model(sample.to(device))
+        except ForwardInterrupt:
+            pass
+    input_args, input_kwargs = blocks[0].input_args, blocks[0].input_kwargs
     blocks[0] = blocks[0].module.cpu()
     model.get_input_embeddings().cpu()
-    
-    target_layers = [0, 15, 31]
+    return input_args, input_kwargs
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name_or_path", default="meta-llama/Meta-Llama-3-8B")
+    parser.add_argument("--dataset_name_or_path", default="c4")
+    parser.add_argument("--sequence_length", type=int, default=2048)
+    parser.add_argument("--num_sequences", type=int, default=32)
+    parser.add_argument("--max_tokens", type=int, default=4096)
+    parser.add_argument("--group_size", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--num_random_permutations", type=int, default=5,
+        help="Number of independent random layouts used for the Random control.",
+    )
+    parser.add_argument(
+        "--stagger_quantile", type=float, default=0.9375,
+        help="Per-row quantile used to identify outliers for staggering.",
+    )
+    parser.add_argument(
+        "--permu_alpha", type=float, default=0.5,
+        help="Activation/weight balance for joint second-moment ordering.",
+    )
+    parser.add_argument("--output", type=Path,
+                        default=Path("dacc_mechanism_results.json"))
+    parser.add_argument("--skip_bitr", action="store_true")
+    args = parser.parse_args()
+    if args.num_random_permutations < 1:
+        parser.error("--num_random_permutations must be at least 1")
+    torch.manual_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"Loading model on {device}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path, dtype=torch.bfloat16,
+        low_cpu_mem_usage=True, attn_implementation="sdpa")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    calibration_data = get_data(
+        args.dataset_name_or_path, tokenizer, args.sequence_length,
+        args.num_sequences, seed=args.seed)
+    model.config.use_cache = False
+    model.requires_grad_(False)
+    input_args, input_kwargs = capture_inputs(model, calibration_data, device)
+
+    target_layers = {0, 15, 31}
     matrix_names = ["qkv", "o", "gate_up", "down"]
-    
-    # 全局统计累加器
-    stats = {mat: {
-        "deadly_orig": [], "deadly_km": [],
-        "dist_orig": [], "dist_km": [],
-        "mse_orig_mm": [], "mse_orig_lss1": [], "mse_orig_lss2": [], "mse_orig_lss3": [],
-        "mse_km_mm": [], "mse_km_lss1": [],
-        "flip1_orig": [], "flip1_km": [],
-        "flip2_orig": [], "flip2_km": [],
-        "flip3_orig": [], "flip3_km": [],
-    } for mat in matrix_names}
-    
-    print("Running experiments...\n")
-    
-    for block_idx, block in enumerate(blocks):
+    records = []
+    blocks = model.model.layers
+
+    for layer_idx, block in enumerate(blocks):
         block = block.to(device)
-        if block_idx not in target_layers:
+        if layer_idx not in target_layers:
             for i in range(len(input_args)):
                 with torch.no_grad():
-                    a = to_device(input_args[i], device)
-                    k = to_device(input_kwargs[i], device)
-                    out = block(*a, **k)
-                    input_args[i] = (maybe_first(out).cpu(),) + input_args[i][1:]
-            block = block.cpu(); continue
-        
-        print(f"  Processing Layer {block_idx}...")
-        block_copy = copy.deepcopy(block).to(device)
-        act_caches = {}
-        def hook_factory(name):
-            def _hook(_, inp, out):
-                if name not in act_caches: act_caches[name] = []
-                act_caches[name].append(inp[0].detach().float().view(-1, inp[0].shape[-1]))
-            return _hook
-        hooks = []
-        hooks.append(block_copy.self_attn.q_proj.register_forward_hook(hook_factory("qkv")))
-        hooks.append(block_copy.self_attn.o_proj.register_forward_hook(hook_factory("o")))
-        hooks.append(block_copy.mlp.gate_proj.register_forward_hook(hook_factory("gate_up")))
-        hooks.append(block_copy.mlp.down_proj.register_forward_hook(hook_factory("down")))
-        for i in range(len(input_args)):
-            with torch.no_grad():
-                a = to_device(input_args[i], device)
-                k = to_device(input_kwargs[i], device)
-                block_copy(*a, **k)
-        for h in hooks: h.remove()
-        del block_copy; torch.cuda.empty_cache()
-        
-        for mat_name in matrix_names:
-            if mat_name not in act_caches: continue
-            X = torch.cat(act_caches[mat_name], dim=0).to(device)
-            dim = X.shape[1]
-            perm_id = torch.arange(dim, device=device, dtype=torch.long)
-            max_samples = 4096
-            if X.shape[0] > max_samples:
-                idx = torch.linspace(0, X.shape[0]-1, max_samples, dtype=torch.long, device=device)
-                X_abs_T = X[idx].abs().T.float()
-                X_sub = X[idx]
-            else:
-                X_abs_T = X.abs().T.float()
-                X_sub = X
-            perm_km = compute_kmeans_fp4_perm(X_abs_T, group_size=16)
-            del X_abs_T
-            
-            r2 = run_experiment2(X_sub, perm_id, perm_km)
-            r34 = run_experiment34(X_sub, perm_id, perm_km, max_iters=3)
-            del X, X_sub; torch.cuda.empty_cache()
-            
-            s = stats[mat_name]
-            s["deadly_orig"].append(r2["Original"]["deadly_pct"])
-            s["deadly_km"].append(r2["KMeans"]["deadly_pct"])
-            s["dist_orig"].append(r2["Original"]["avg_grid_dist"])
-            s["dist_km"].append(r2["KMeans"]["avg_grid_dist"])
-            s["mse_orig_mm"].append(r34["Original"]["MinMax_MSE"])
-            s["mse_orig_lss1"].append(r34["Original"]["LSS1_MSE"])
-            s["mse_orig_lss2"].append(r34["Original"]["LSS2_MSE"])
-            s["mse_orig_lss3"].append(r34["Original"]["LSS3_MSE"])
-            s["mse_km_mm"].append(r34["KMeans"]["MinMax_MSE"])
-            s["mse_km_lss1"].append(r34["KMeans"]["LSS1_MSE"])
-            s["flip1_orig"].append(r34["Original"]["LSS1_Flip"])
-            s["flip1_km"].append(r34["KMeans"]["LSS1_Flip"])
-            s["flip2_orig"].append(r34["Original"]["LSS2_Flip"])
-            s["flip2_km"].append(r34["KMeans"]["LSS2_Flip"])
-            s["flip3_orig"].append(r34["Original"]["LSS3_Flip"])
-            s["flip3_km"].append(r34["KMeans"]["LSS3_Flip"])
-        
-        del act_caches; gc.collect(); torch.cuda.empty_cache()
-        for i in range(len(input_args)):
-            with torch.no_grad():
-                a = to_device(input_args[i], device)
-                k = to_device(input_kwargs[i], device)
-                out = block(*a, **k)
+                    out = block(*to_device(input_args[i], device),
+                                **to_device(input_kwargs[i], device))
                 input_args[i] = (maybe_first(out).cpu(),) + input_args[i][1:]
-        block = block.cpu(); torch.cuda.empty_cache()
+            block.cpu()
+            continue
 
-    # ================================================================
-    # 精简全局总结
-    # ================================================================
-    W = 100
-    print("\n\n" + "=" * W)
-    print("  KMeans + LSS 协同效应验证与抗质询分析  (多层平均: L0, L15, L31)")
-    print("=" * W)
+        print(f"Processing layer {layer_idx}...")
+        block_copy = copy.deepcopy(block).to(device)
+        caches = {}
 
-    # --- 论点1: KMeans 改善分组结构 ---
-    print(f"\n{'─'*W}")
-    print("  论点1: KMeans 静态预处理大幅改善组内数值结构，提升 LSS 格点预测的初始命中率")
-    print(f"{'─'*W}")
-    print(f"  {'Matrix':<8} │ {'致命区占比(%)':^22} │ {'平均格点距离':^22}")
-    print(f"  {'':<8} │ {'Orig':>8}  →  {'KMeans':>6} {'(Δ)':>6} │ {'Orig':>8}  →  {'KMeans':>6} {'(Δ)':>6}")
-    print(f"  {'─'*8}─┼{'─'*22}─┼{'─'*22}")
-    for mat in matrix_names:
-        s = stats[mat]
-        do = np.mean(s["deadly_orig"]); dk = np.mean(s["deadly_km"])
-        go = np.mean(s["dist_orig"]); gk = np.mean(s["dist_km"])
-        dd = (dk-do)/do*100 if do else 0
-        gd = (gk-go)/go*100 if go else 0
-        print(f"  {mat:<8} │ {do:>7.2f}%  →  {dk:>5.2f}% {dd:>+5.0f}% │ {go:>8.4f}  →  {gk:>6.4f} {gd:>+5.0f}%")
+        def hook_factory(name):
+            def hook(_, inputs, __):
+                caches.setdefault(name, []).append(
+                    inputs[0].detach().float().view(-1, inputs[0].shape[-1]))
+            return hook
 
-    # --- 论点2: 翻转率对比与收敛性 ---
-    print(f"\n{'─'*W}")
-    print("  论点2: KMeans 使初始格点更准(LSS-1翻转率低)，且均在LSS-3完全收敛证明已达各自局限")
-    print(f"{'─'*W}")
-    print(f"  {'Matrix':<8} │ {'第1步翻转率 (%)':^24} │ {'第2步翻转率 (%)':^24} │ {'第3步翻转率 (%)':^24}")
-    print(f"  {'':<8} │ {'Orig':>7}   {'KMeans':>7}   {'(Δ)':>5} │ {'Orig':>7}   {'KMeans':>7}   {'(Δ)':>5} │ {'Orig':>7}   {'KMeans':>7}")
-    print(f"  {'─'*8}─┼{'─'*24}─┼{'─'*24}─┼{'─'*24}")
-    for mat in matrix_names:
-        s = stats[mat]
-        f1o = np.mean(s["flip1_orig"]); f1k = np.mean(s["flip1_km"]); f1d = (f1k-f1o)/f1o*100 if f1o else 0
-        f2o = np.mean(s["flip2_orig"]); f2k = np.mean(s["flip2_km"]); f2d = (f2k-f2o)/f2o*100 if f2o else 0
-        f3o = np.mean(s["flip3_orig"]); f3k = np.mean(s["flip3_km"])
-        print(f"  {mat:<8} │ {f1o:>6.2f}%  {f1k:>6.2f}% {f1d:>+5.0f}% │ {f2o:>6.2f}%  {f2k:>6.2f}% {f2d:>+5.0f}% │ {f3o:>6.2f}%  {f3k:>6.2f}%")
+        hooks = [
+            block_copy.self_attn.q_proj.register_forward_hook(hook_factory("qkv")),
+            block_copy.self_attn.o_proj.register_forward_hook(hook_factory("o")),
+            block_copy.mlp.gate_proj.register_forward_hook(hook_factory("gate_up")),
+            block_copy.mlp.down_proj.register_forward_hook(hook_factory("down")),
+        ]
+        for i in range(len(input_args)):
+            with torch.no_grad():
+                block_copy(*to_device(input_args[i], device),
+                           **to_device(input_kwargs[i], device))
+        for hook in hooks:
+            hook.remove()
+        del block_copy
+        torch.cuda.empty_cache()
 
-    # --- 论点3: 完整 2×2 消融矩阵 + 抗质询 ---
-    print(f"\n{'─'*W}")
-    print("  论点3: 完整消融实验 —— 证明 KMeans 和 LSS 各自不可替代，合并达全局最优")
-    print(f"{'─'*W}")
-    print(f"  {'Matrix':<8} │ {'Orig+MinMax':>14} │ {'Orig+LSS(收敛)':>14} │ {'KM+MinMax':>14} │ {'KM+LSS ★':>14}")
-    print(f"  {'':<8} │ {'(baseline)':>14} │ {'(仅修Scale)':>14} │ {'(仅修分组)':>14} │ {'(完美协同)':>14}")
-    print(f"  {'─'*8}─┼{'─'*14}─┼{'─'*14}─┼{'─'*14}─┼{'─'*14}")
-    for mat in matrix_names:
-        s = stats[mat]
-        m_om  = np.mean(s["mse_orig_mm"])
-        m_ol  = np.mean(s["mse_orig_lss2"])   # Orig+LSS 收敛极限
-        m_km  = np.mean(s["mse_km_mm"])
-        m_kl  = np.mean(s["mse_km_lss1"])     # KMeans+LSS 仅1步
-        d_ol = (m_ol-m_om)/m_om*100
-        d_km = (m_km-m_om)/m_om*100
-        d_kl = (m_kl-m_om)/m_om*100
-        print(f"  {mat:<8} │ {m_om:>14.3e} │ {m_ol:>8.3e} ({d_ol:>+5.1f}%) │ {m_km:>8.3e} ({d_km:>+5.1f}%) │ {m_kl:>8.3e} ({d_kl:>+5.1f}%)")
+        for name in matrix_names:
+            if name not in caches:
+                continue
+            x_all = torch.cat(caches[name], dim=0).to(device)
+            if x_all.shape[0] > args.max_tokens:
+                indices = torch.linspace(
+                    0, x_all.shape[0] - 1, args.max_tokens,
+                    dtype=torch.long, device=device)
+                x = x_all[indices]
+            else:
+                x = x_all
+            channels = x.shape[1]
+            if channels % args.group_size:
+                raise ValueError(f"{name} has {channels} channels, not divisible by B")
+            weight = get_combined_weight(block, name).to(device)
+            # Production DACC uses squared input-column weight norms as its
+            # weight-aware importance when alpha=2.
+            x_abs_t = x.abs().T.float()
+            identity = build_layout_permutation(
+                x, weight, name, "identity", args.group_size, model)
+            random_perms = [build_layout_permutation(
+                x, weight, name, "random", args.group_size, model)
+                for _ in range(args.num_random_permutations)]
+            magnitude = build_layout_permutation(
+                x, weight, name, "magnitude", args.group_size, model)
+            outlier_stagger = build_layout_permutation(
+                x, weight, name, "outlier_stagger", args.group_size, model,
+                stagger_quantile=args.stagger_quantile)
+            joint_second_moment = build_layout_permutation(
+                x, weight, name, "joint_second_moment", args.group_size, model,
+                permu_alpha=args.permu_alpha)
+            dacc = build_layout_permutation(
+                x, weight, name, "dacc", args.group_size, model)
+            layouts = {
+                "Original": (identity, None),
+                "Magnitude": (magnitude, None),
+                "Outlier-Stagger": (outlier_stagger, None),
+                "Joint-2nd-Moment": (joint_second_moment, None),
+                "DACC": (dacc, None),
+            }
+            for random_idx, random_perm in enumerate(random_perms, start=1):
+                layouts[f"Random-{random_idx}"] = (random_perm, None)
+            if not args.skip_bitr:
+                print(f"  {name}: running DACC+BITR coordinate search")
+                scales = optimize_channel_scales_coordinate_descent(
+                    x[:, dacc].float(), weight[:, dacc].float(),
+                    weight_mse_ratio=1.0, group_size=args.group_size,
+                    top_k=5, num_rounds=3)
+                layouts["DACC+BITR"] = (dacc, scales)
+            for method, (perm, scale) in layouts.items():
+                records.append({"layer": layer_idx, "matrix": name,
+                                "method": method,
+                                **activation_stats(x, perm, args.group_size, scale)})
+            del x_all, x, x_abs_t, weight, random_perms
+            torch.cuda.empty_cache()
 
-    print(f"  {'─'*8}─┼{'─'*14}─┼{'─'*14}─┼{'─'*14}─┼{'─'*14}")
-    all_om = np.mean([np.mean(stats[m]["mse_orig_mm"]) for m in matrix_names])
-    all_ol = np.mean([np.mean(stats[m]["mse_orig_lss2"]) for m in matrix_names])
-    all_km = np.mean([np.mean(stats[m]["mse_km_mm"]) for m in matrix_names])
-    all_kl = np.mean([np.mean(stats[m]["mse_km_lss1"]) for m in matrix_names])
-    ad_ol = (all_ol-all_om)/all_om*100
-    ad_km = (all_km-all_om)/all_om*100
-    ad_kl = (all_kl-all_om)/all_om*100
-    print(f"  {'AVG':<8} │ {all_om:>14.3e} │ {all_ol:>8.3e} ({ad_ol:>+5.1f}%) │ {all_km:>8.3e} ({ad_km:>+5.1f}%) │ {all_kl:>8.3e} ({ad_kl:>+5.1f}%)")
+        del caches
+        gc.collect()
+        for i in range(len(input_args)):
+            with torch.no_grad():
+                out = block(*to_device(input_args[i], device),
+                            **to_device(input_kwargs[i], device))
+            input_args[i] = (maybe_first(out).cpu(),) + input_args[i][1:]
+        block.cpu()
+        torch.cuda.empty_cache()
 
-    # --- 质询反驳小结 ---
-    print(f"\n{'─'*W}")
-    print("  抗质询: 即使给 Original 多次 LSS 迭代至收敛，能否匹敌单步 KMeans+LSS？")
-    print(f"{'─'*W}")
-    print(f"  {'Matrix':<8} │ {'Orig+LSS×3(极限)':>18} │ {'KM+LSS×1':>18} │ {'KM+LSS 额外降幅'}")
-    print(f"  {'─'*8}─┼{'─'*18}─┼{'─'*18}─┼{'─'*18}")
-    for mat in matrix_names:
-        s = stats[mat]
-        m_ol3 = np.mean(s["mse_orig_lss3"])   # Orig+LSS 第3步(绝对极限)
-        m_kl1 = np.mean(s["mse_km_lss1"])
-        gap = (m_kl1 - m_ol3) / m_ol3 * 100
-        print(f"  {mat:<8} │ {m_ol3:>18.3e} │ {m_kl1:>18.3e} │ {gap:>+16.1f}%")
+    methods = [
+        "Original", "Random", "Magnitude", "Outlier-Stagger",
+        "Joint-2nd-Moment", "DACC",
+    ]
+    if not args.skip_bitr:
+        methods.append("DACC+BITR")
+    summary = {}
+    summary_std = {}
+    keys = ["mse", "ldr_pct", "mdr_pct", "hdr_pct", "overflow_pct",
+        "mdr_hdr_mse_pct", "hdr_mse_pct", "mdr_hdr_mse_abs",
+        "hdr_mse_abs"]
+    for method in methods:
+        if method == "Random":
+            # Treat each Random-i layout as one complete replicate, then
+            # compute mean/std across the requested independent replicates.
+            random_runs = []
+            for random_idx in range(1, args.num_random_permutations + 1):
+                run_rows = [r for r in records
+                            if r["method"] == f"Random-{random_idx}"]
+                random_runs.append({
+                    key: float(np.mean([r[key] for r in run_rows]))
+                    for key in keys
+                })
+            summary[method] = {
+                key: float(np.mean([run[key] for run in random_runs]))
+                for key in keys
+            }
+            summary_std[method] = {
+                key: float(np.std([run[key] for run in random_runs], ddof=1))
+                if len(random_runs) > 1 else 0.0
+                for key in keys
+            }
+            continue
+        else:
+            rows = [r for r in records if r["method"] == method]
+        summary[method] = {key: float(np.mean([r[key] for r in rows]))
+                           for key in keys}
+    output = {
+        "config": {"model": args.model_name_or_path,
+                   "dataset": args.dataset_name_or_path,
+                   "seed": args.seed, "layers": sorted(target_layers),
+                   "max_tokens_per_matrix": args.max_tokens,
+                   "group_size": args.group_size,
+                   "stagger_quantile": args.stagger_quantile,
+                   "permu_alpha": args.permu_alpha,
+                   "bitr": not args.skip_bitr},
+        "records": records, "summary": summary,
+        "summary_std": summary_std,
+    }
+    args.output.write_text(json.dumps(output, indent=2) + "\n")
+    print(f"Saved {args.output}")
+    print("method,mse,mdr_pct,hdr_pct,mdr_hdr_mse_pct,hdr_mse_pct,"
+          "mdr_hdr_mse_abs,hdr_mse_abs")
+    for method in methods:
+        row = summary[method]
+        print(f"{method},{row['mse']:.6e},{row['mdr_pct']:.3f},"
+              f"{row['hdr_pct']:.3f},{row['mdr_hdr_mse_pct']:.3f},"
+              f"{row['hdr_mse_pct']:.3f},{row['mdr_hdr_mse_abs']:.6e},"
+              f"{row['hdr_mse_abs']:.6e}")
 
-    print(f"\n{'='*W}")
-    print("  结论:")
-    print("    • LSS 不可少: KM+MinMax → KM+LSS 稳定再降，说明仅靠分组优化不够，Scale 微调不可或缺。")
-    print("    • KMeans 不可少: Orig+LSS(收敛极限) 远不如 KM+LSS(单步)，Scale 再优也救不了烂分组。")
-    print("    • 抗质询铁证: 即使 Orig 一侧榨干 LSS 迭代至第3步(翻转率0%)，MSE 仍被 KM+LSS×1 碾压。")
-    print("    • 两者分别在'分组结构'与'Scale选择'两个正交维度上独立降低误差，缺一不可、合并最优。")
-    print("=" * W)
+    random_std = summary_std.get("Random", {})
+    print("Random mean+/-std (across independent permutations),"
+          "mse,mdr_hdr_mse_abs,hdr_mse_abs")
+    row = summary["Random"]
+    print(f"Random,{row['mse']:.6e}+/-{random_std.get('mse', 0.0):.6e},"
+          f"{row['mdr_hdr_mse_abs']:.6e}+/-"
+          f"{random_std.get('mdr_hdr_mse_abs', 0.0):.6e},"
+          f"{row['hdr_mse_abs']:.6e}+/-"
+          f"{random_std.get('hdr_mse_abs', 0.0):.6e}")
+
+    # A compact copy-paste view in the units used by the paper's analysis
+    # table (10^{-4}); the JSON file retains the unscaled values above.
+    print("method,mdr_hdr_mse_x1e4,hdr_mse_x1e4")
+    for method in methods:
+        row = summary[method]
+        print(f"{method},{row['mdr_hdr_mse_abs'] * 1e4:.4f},"
+              f"{row['hdr_mse_abs'] * 1e4:.4f}")
+    print("Random mean+/-std x1e4,mdr_hdr_mse,hdr_mse")
+    random_row = summary["Random"]
+    print(f"Random,{random_row['mdr_hdr_mse_abs'] * 1e4:.4f}+/-"
+          f"{random_std.get('mdr_hdr_mse_abs', 0.0) * 1e4:.4f},"
+          f"{random_row['hdr_mse_abs'] * 1e4:.4f}+/-"
+          f"{random_std.get('hdr_mse_abs', 0.0) * 1e4:.4f}")
 
 
 if __name__ == "__main__":
