@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
-"""HF-transformers throughput for the exported NVFP4-LSS checkpoint,
-loaded PACKED (qweight/scales kept quantized, dequantize-inside-GEMM via
-QuTLASS matmul_nvf4_bf16_tn) to match the 2026-08-14 four_over_six_rtn_hf
-baseline's loading strategy and memory footprint.
+"""HF-transformers throughput for NADA and Four Over Six NVFP4 W4A4 models.
 
 Two arms:
   --arm lss           : Ours - packed weights from the exported checkpoint,
                         activation side = perm/rescale + LSS quantization
                         (vLLM kernel), GEMM = QuTLASS NVFP4.
-  --arm four_over_six : TRUE 4/6 baseline - weight side: per-group search
-                        over {absmax/6, absmax/4} minimizing MSE (offline,
-                        quantizer.py FOUR_OVER_SIX logic); activation side:
-                        the same 2-candidate MSE search at RUNTIME.  Same
-                        QuTLASS GEMM.  This is the honest naive-framework
-                        cost of 4/6 (the 8/14 baseline omitted the
-                        activation-side search and used absmax instead).
+  --arm lss_cutlass   : Ours with the same packed NADA values/scales, but
+                        SM120 CUTLASS GEMM after a runtime scale-layout
+                        conversion. This is a deployment probe.
+  --arm four_over_six : Official Four Over Six CUDA implementation: offline
+                        weight quantization and online MSE 4/6 activation
+                        selection, followed by its official CUTLASS NVFP4 GEMM.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import platform
 import sys
@@ -30,6 +27,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -55,14 +53,32 @@ if "fast_hadamard_transform" not in sys.modules:
 # All kernels are used through the `torch.ops.fp_quant.*` registrations in
 # vllm.model_executor.layers.quantization.fp_quant instead.
 import vllm.model_executor.layers.quantization.fp_quant  # registers torch.ops.fp_quant.*
-from vllm._custom_ops import nvfp4_lss_quant_permute_scale
+from vllm._custom_ops import (
+    nvfp4_lss_quant_permute_scale,
+    nvfp4_lss_quant_permute_scale_cutlass,
+)
 
 FPQ = torch.ops.vllm
 
+# The Four Over Six extension registers its CUDA quantizer and CUTLASS GEMM
+# under the independent ``fouroversix`` namespace.  Use its public Python API
+# rather than reimplementing candidate selection in PyTorch.
+import fouroversix._C  # noqa: F401
+from fouroversix.matmul import quantized_matmul as four_over_six_matmul
+from fouroversix.quantize import QuantizationConfig as FourOverSixQuantConfig
+from fouroversix.quantize import QuantizedTensor
+from fouroversix.quantize import quantize as four_over_six_quantize
+from fouroversix.quantize.utils import to_blocked
+from fouroversix.utils import (
+    DataType,
+    MatmulBackend,
+    QuantizeBackend,
+    RoundStyle,
+    ScaleRule,
+)
+
 from benchmark_e2e import PROMPT_SEED, NvmlMonitor, summarize
 from eval_exported_hf_perplexity import transform_owner
-from src.quantization.quant_ops import cast_to_fp4, pack_fp4_to_uint8
-
 BASE_MODEL = (
     "/home/pengliang/.cache/huggingface/hub/"
     "models--Qwen--Qwen3-8B/snapshots/"
@@ -73,33 +89,11 @@ EXPORTED_MODEL = (
     "qwen3_8b_ours_lss_validated_20260904_211031/ours"
 )
 PAD_TOKEN_ID = 151643
-FP8_E4M3_MAX = 448.0
-
-
-def four_over_six_search(
-    x: torch.Tensor, group_size: int = 16
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """True 4/6 scale search (src/quantization/quantizer.py:178-199).
-
-    Args: x [..., G, 16] grouped tensor.  Returns (grid_values, scales):
-    RAW E2M1 grid values in [-6, 6] (NOT dequantized - multiply by scales
-    to reconstruct) and the per-group winning scale ({absmax/6, absmax/4}
-    by per-group MSE)."""
-    abs_max = x.abs().amax(dim=-1, keepdim=True)
-    s6 = (abs_max / 6.0).clamp(min=1e-30)
-    s4 = (abs_max / 4.0).clamp(min=1e-30)
-    recon6 = cast_to_fp4(x / s6) * s6
-    recon4 = cast_to_fp4(x / s4) * s4
-    err6 = (x - recon6).pow(2).sum(dim=-1, keepdim=True)
-    err4 = (x - recon4).pow(2).sum(dim=-1, keepdim=True)
-    scales = torch.where(err4 < err6, s4, s6)
-    grid_values = cast_to_fp4(x / scales)
-    return grid_values, scales.squeeze(-1)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arm", choices=("lss", "four_over_six"), default="lss")
+    parser.add_argument(
+        "--arm", choices=("lss", "lss_cutlass", "four_over_six"), default="lss"
+    )
     parser.add_argument("--base-model", default=BASE_MODEL)
     parser.add_argument("--exported-model", default=EXPORTED_MODEL)
     parser.add_argument("--gpu", type=int, default=0)
@@ -108,6 +102,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--profile-first-linear",
+        action="store_true",
+        help="Profile quantization, GEMM, and full forward for layer 0 q_proj, then exit.",
+    )
+    parser.add_argument(
+        "--profile-rows",
+        type=int,
+        nargs="+",
+        default=[1, 512],
+        help="Token rows to profile; defaults cover decode and prefill.",
+    )
+    parser.add_argument("--profile-repeats", type=int, default=100)
+    parser.add_argument(
+        "--profile-nada-cutlass",
+        action="store_true",
+        help="For LSS only: validate and time Four Over Six CUTLASS GEMM on NADA tensors.",
+    )
     parser.add_argument("--nvml-interval-ms", type=float, default=20.0)
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
@@ -119,84 +131,132 @@ def fp4_codebook(device: torch.device) -> torch.Tensor:
 
 
 class PackedLSSLinear(nn.Module):
-    """Ours: packed NVFP4 weights + perm/rescale/LSS activation quantization."""
+    """NADA packed weights + perm/rescale/LSS activation quantization."""
 
-    def __init__(self, qweight, wscales_u8, w_gs, a_gs, perm, rescale, bias):
+    def __init__(
+        self, qweight, wscales_u8, w_gs, a_gs, perm, rescale, bias,
+        *, cutlass_gemm: bool = False, cutlass_weight=None,
+        original_shape: tuple[int, int] | None = None,
+    ):
         super().__init__()
-        self.register_buffer("qweight", qweight)
-        self.register_buffer("wscales_u8", wscales_u8)
-        self.register_buffer("w_gs", w_gs)
         self.register_buffer("a_gs", a_gs)
-        self.register_buffer("perm", perm)
+        # The deployment-only CUTLASS kernel uses int32 indices. This halves
+        # its static permutation traffic without changing the permutation.
+        self.register_buffer(
+            "perm", perm.to(torch.int32) if cutlass_gemm else perm
+        )
         self.register_buffer("rescale", rescale)
-        self.out_features, in_half = qweight.shape
-        self.in_features = in_half * 2
+        self.cutlass_gemm = cutlass_gemm
+        if cutlass_weight is not None:
+            if not cutlass_gemm or original_shape is None:
+                raise ValueError("prepacked weight requires CUTLASS and original_shape")
+            self.out_features, self.in_features = original_shape
+            self.cutlass_weight = cutlass_weight
+        else:
+            if qweight is None or wscales_u8 is None or w_gs is None:
+                raise ValueError("NADA export-layout tensors are required")
+            self.register_buffer("qweight", qweight)
+            self.register_buffer("wscales_u8", wscales_u8)
+            self.register_buffer("w_gs", w_gs)
+            self.out_features, in_half = qweight.shape
+            self.in_features = in_half * 2
+        if cutlass_gemm:
+            self.register_buffer(
+                "cutlass_input_amax",
+                (a_gs.reciprocal() * (6.0 * 448.0)).to(torch.float32),
+            )
+            if cutlass_weight is None:
+                self.cutlass_weight = nada_to_cutlass_tensor(
+                    qweight,
+                    wscales_u8.view(torch.float8_e4m3fn),
+                    w_gs,
+                    (self.out_features, self.in_features),
+                )
         self.bias = nn.Parameter(bias, requires_grad=False) if bias is not None else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x_flat = x.reshape(-1, self.in_features)
-        q, s = nvfp4_lss_quant_permute_scale(
-            x_flat, self.perm, self.rescale, self.a_gs
-        )
-        alpha = 1.0 / (self.a_gs * self.w_gs)
-        y = FPQ.matmul_nvf4_bf16(
-            q,
-            self.qweight,
-            s,
-            self.wscales_u8.view(torch.float8_e4m3fn),
-            alpha,
-        )
+        if self.cutlass_gemm:
+            q, s = nvfp4_lss_quant_permute_scale_cutlass(
+                x_flat, self.perm, self.rescale, self.a_gs
+            )
+            cutlass_input = nada_to_cutlass_tensor_preformatted(
+                q, s, self.cutlass_input_amax,
+                (x_flat.shape[0], self.in_features),
+            )
+            y = four_over_six_matmul(
+                cutlass_input, self.cutlass_weight, backend=MatmulBackend.cutlass
+            )
+        else:
+            q, s = nvfp4_lss_quant_permute_scale(
+                x_flat, self.perm, self.rescale, self.a_gs
+            )
+            alpha = 1.0 / (self.a_gs * self.w_gs)
+            y = FPQ.matmul_nvf4_bf16(
+                q,
+                self.qweight,
+                s,
+                self.wscales_u8.view(torch.float8_e4m3fn),
+                alpha,
+            )
         y = y.unflatten(0, shape[:-1])
         if self.bias is not None:
             y = y + self.bias
         return y
 
+    def release_cutlass_reference_storage(self) -> int:
+        """Drop export-layout weights retained only for the startup self-check."""
+        if not self.cutlass_gemm:
+            return 0
+        released = 0
+        for name in ("qweight", "wscales_u8", "w_gs"):
+            if name in self._buffers:
+                self._buffers.pop(name)
+                released += 1
+        return released
 
-class PackedFourOverSixLinear(nn.Module):
-    """TRUE 4/6: weight-side 4/6 MSE search offline (here in __init__),
-    activation-side 4/6 MSE search at runtime, same QuTLASS NVFP4 GEMM.
-    Identity transform; global scales = 1 (per-group scales stored directly
-    in E4M3, clamped to 448 like cast_scales_to_eXmY)."""
+
+class OfficialFourOverSixLinear(nn.Module):
+    """Four Over Six through its official CUDA quantizer and CUTLASS GEMM.
+
+    We quantize weights once during construction with the official MSE 4/6
+    rule.  Each forward call passes the dynamic activation to the same public
+    Four Over Six path, which performs the online MSE selection in CUDA.
+    """
 
     def __init__(self, weight: torch.Tensor, bias, device: torch.device):
         super().__init__()
         self.in_features = weight.shape[1]
         self.out_features = weight.shape[0]
-        w = weight.to(device).flatten(end_dim=-2).contiguous()
-        w_groups = w.view(self.out_features, self.in_features // 16, 16)
-        vals, scales = four_over_six_search(w_groups)
-        # Pack with the same convention as the exported checkpoints.
-        qweight = pack_fp4_to_uint8(vals.view(self.out_features, self.in_features))
-        wscales = scales.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-        self.register_buffer("qweight", qweight)
-        self.register_buffer("wscales", wscales)
-        self.register_buffer("one", torch.ones(1, dtype=torch.float32, device=device))
+        self.quant_config = FourOverSixQuantConfig(
+            backend=QuantizeBackend.cuda,
+            scale_rule="mse",
+            pseudo_quantize=False,
+        )
+        # QuantizedTensor is a lightweight dataclass rather than an nn.Module.
+        # Its tensors stay alive on device for the lifetime of this benchmark.
+        self.qweight = four_over_six_quantize(
+            weight.detach().to(device).contiguous(), self.quant_config
+        )
         self.bias = nn.Parameter(bias, requires_grad=False) if bias is not None else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x_flat = x.reshape(-1, self.in_features).contiguous()
-        m = x_flat.shape[0]
-        x_groups = x_flat.view(m, self.in_features // 16, 16)
-        vals, scales = four_over_six_search(x_groups)
-        q = pack_fp4_to_uint8(vals.view(m, self.in_features))
-        # Match the padded scale layout produced by the LSS kernel
-        # (rows rounded to 128, groups rounded to 4) for the shared GEMM.
-        padded_m = (m + 127) // 128 * 128
-        padded_g = (self.in_features // 16 + 3) // 4 * 4
-        s_padded = x_flat.new_zeros((padded_m, padded_g), dtype=torch.float32)
-        s_padded[:m, : self.in_features // 16] = scales
-        s_fp8 = s_padded.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-        y = FPQ.matmul_nvf4_bf16(q, self.qweight, s_fp8, self.wscales, self.one)
+        y = four_over_six_matmul(
+            x_flat,
+            self.qweight,
+            backend=MatmulBackend.cutlass,
+            input_config=self.quant_config,
+        )
         y = y.unflatten(0, shape[:-1])
         if self.bias is not None:
             y = y + self.bias
         return y
 
-
 def load_packed_model(args, device: torch.device):
-    if args.arm == "lss":
+    if args.arm in {"lss", "lss_cutlass"}:
         index = json.loads(
             (Path(args.exported_model) / "model.safetensors.index.json").read_text()
         )["weight_map"]
@@ -221,21 +281,48 @@ def load_packed_model(args, device: torch.device):
         if not isinstance(module, nn.Linear) or name.endswith("lm_head"):
             continue
         bias = module.bias.data.to(device) if module.bias is not None else None
-        if args.arm == "lss":
+        if args.arm in {"lss", "lss_cutlass"}:
             owner = transform_owner(name)
             perm = tensor(owner + ".input_perm").to(device)
             rescale = tensor(owner + ".input_rescale").to(device, dtype=torch.bfloat16)
-            new = PackedLSSLinear(
-                tensor(name + ".qweight").to(device),
-                tensor(name + ".scales").to(device),
-                tensor(name + ".weight_global_scale").to(device, dtype=torch.float32),
-                tensor(name + ".act_global_scale").to(device, dtype=torch.float32),
-                perm,
-                rescale,
-                bias,
+            qweight = tensor(name + ".qweight")
+            wscales = tensor(name + ".scales")
+            weight_gs = tensor(name + ".weight_global_scale").to(torch.float32)
+            act_gs = tensor(name + ".act_global_scale").to(
+                device, dtype=torch.float32
             )
+            original_shape = (qweight.shape[0], qweight.shape[1] * 2)
+            if args.arm == "lss_cutlass":
+                # Build the final CUTLASS representation on CPU, then transfer
+                # only that representation.  Uploading the export layout first
+                # leaves a multi-GiB CUDA allocator reservation after conversion.
+                packed_cpu = nada_to_cutlass_tensor(
+                    qweight,
+                    wscales.view(torch.float8_e4m3fn),
+                    weight_gs,
+                    original_shape,
+                )
+                packed_gpu = move_quantized_tensor_to_device(
+                    packed_cpu, device
+                )
+                new = PackedLSSLinear(
+                    None, None, None, act_gs, perm, rescale, bias,
+                    cutlass_gemm=True,
+                    cutlass_weight=packed_gpu,
+                    original_shape=original_shape,
+                )
+            else:
+                new = PackedLSSLinear(
+                    qweight.to(device),
+                    wscales.to(device),
+                    weight_gs.to(device),
+                    act_gs,
+                    perm,
+                    rescale,
+                    bias,
+                )
         else:
-            new = PackedFourOverSixLinear(module.weight.data, bias, device)
+            new = OfficialFourOverSixLinear(module.weight.data, bias, device)
         parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
         parent._modules[name.rsplit(".", 1)[-1]] = new
         replaced += 1
@@ -266,37 +353,22 @@ def numeric_self_check(model, device: torch.device, arm: str) -> None:
     # Reference: decode weights (validated path) and activations to BF16.
     codebook = fp4_codebook(device)
     if arm == "four_over_six":
-        fp4_w = codebook[
-            torch.stack((linear.qweight & 0xF, linear.qweight >> 4), dim=-1)
-            .reshape(linear.out_features, linear.in_features)
-            .long()
-        ]
-        w_deq = (
-            fp4_w
-            * linear.wscales.to(torch.float32).repeat_interleave(16, dim=1)
-        ).to(torch.bfloat16)
-        x_groups = x.view(x.shape[0], linear.in_features // 16, 16)
-        vals, scales = four_over_six_search(x_groups)
-        # The GEMM consumes E4M3-rounded scales; mirror that here.
-        s_e4m3 = (
-            scales.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-            .to(torch.float8_e4m3fn)
-            .to(torch.float32)
-        )
-        x_deq = (
-            vals.view(x.shape)
-            * s_e4m3.repeat_interleave(16, dim=1)
-        ).to(torch.bfloat16)
-        y_ref = x_deq @ w_deq.T
         with torch.no_grad():
-            y_gem = linear(x).reshape(y_ref.shape)
-        rel = (y_gem.float() - y_ref.float()).norm() / y_ref.float().norm()
-        print(
-            f"SELF_CHECK rel_err={rel.item():.6f} {'PASS' if rel < 0.02 else 'FAIL'}",
-            flush=True,
-        )
-        if rel >= 0.02:
-            raise RuntimeError("packed GEMM disagrees with 4/6 reference")
+            y = linear(x)
+        if not torch.isfinite(y).all():
+            raise RuntimeError("official Four Over Six CUDA path produced non-finite output")
+        print("SELF_CHECK official_4o6_cuda=PASS", flush=True)
+        return
+    if arm == "lss_cutlass" and not hasattr(linear, "qweight"):
+        # The deployment path is prepacked on CPU and therefore deliberately
+        # does not retain export-layout weights on GPU. Its tensor equivalence
+        # is validated separately before benchmark runs; here verify the final
+        # CUTLASS execution path is finite.
+        with torch.no_grad():
+            y = linear(x)
+        if not torch.isfinite(y).all():
+            raise RuntimeError("prepacked NADA CUTLASS path produced non-finite output")
+        print("SELF_CHECK prepacked_nada_cutlass=PASS", flush=True)
         return
     fp4_w = codebook[
         torch.stack((linear.qweight & 0xF, linear.qweight >> 4), dim=-1)
@@ -310,7 +382,10 @@ def numeric_self_check(model, device: torch.device, arm: str) -> None:
             / linear.w_gs
         ).repeat_interleave(16, dim=1)
     ).to(torch.bfloat16)
-    q, s = nvfp4_lss_quant_permute_scale(x, linear.perm, linear.rescale, linear.a_gs)
+    # The reference quantizer retains its public int64 permutation interface;
+    # this one-time cast is outside timed inference.
+    ref_perm = linear.perm if linear.perm.dtype == torch.long else linear.perm.long()
+    q, s = nvfp4_lss_quant_permute_scale(x, ref_perm, linear.rescale, linear.a_gs)
     fp4_x = codebook[
         torch.stack((q & 0xF, q >> 4), dim=-1).reshape(x.shape).long()
     ]
@@ -329,6 +404,246 @@ def numeric_self_check(model, device: torch.device, arm: str) -> None:
     print(f"SELF_CHECK rel_err={rel.item():.6f} {'PASS' if rel < 0.02 else 'FAIL'}", flush=True)
     if rel >= 0.02:
         raise RuntimeError("packed GEMM disagrees with BF16-decode reference")
+
+
+def release_cutlass_reference_storage(model) -> None:
+    """Release duplicate NADA export buffers before deployment measurement."""
+    released = sum(
+        module.release_cutlass_reference_storage()
+        for module in model.modules()
+        if isinstance(module, PackedLSSLinear)
+    )
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    if released:
+        print(f"RELEASED_CUTLASS_REFERENCE_BUFFERS={released}", flush=True)
+
+
+def _mean_cuda_ms(fn, warmups: int, repeats: int) -> float:
+    """Return mean GPU wall time without Python dispatch or synchronization cost."""
+    for _ in range(warmups):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(repeats):
+        fn()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / repeats
+
+
+def nada_to_cutlass_tensor(
+    values: torch.Tensor,
+    row_major_scales: torch.Tensor,
+    global_scale: torch.Tensor,
+    original_shape: tuple[int, int],
+) -> QuantizedTensor:
+    """Adapt NADA E2M1/E4M3 storage to Four Over Six's CUTLASS layout.
+
+    NADA reconstructs a block as ``q * sf / global_scale``.  The CUTLASS
+    frontend reconstructs static-6 NVFP4 with alpha ``amax / (6 * 448)``.
+    Setting ``amax = 6 * 448 / global_scale`` makes these representations
+    algebraically identical; only the scale-factor layout needs swizzling.
+    """
+    rows, cols = original_shape
+    padded_rows = (rows + 127) // 128 * 128
+    padded_cols = (cols + 63) // 64 * 64
+    packed_cols = padded_cols // 2
+    groups = padded_cols // 16
+
+    values = F.pad(
+        values,
+        (0, packed_cols - values.shape[1], 0, padded_rows - values.shape[0]),
+    )
+    scales = F.pad(
+        row_major_scales,
+        (0, groups - row_major_scales.shape[1], 0, padded_rows - row_major_scales.shape[0]),
+    )
+    amax = (global_scale.reciprocal() * (6.0 * 448.0)).to(torch.float32)
+    return QuantizedTensor(
+        values,
+        to_blocked(scales),
+        amax,
+        DataType.nvfp4,
+        original_shape,
+        ScaleRule.static_6,
+        RoundStyle.nearest,
+        (padded_rows, padded_cols),
+        scale_factors_are_in_blackwell_layout=True,
+    )
+
+
+def move_quantized_tensor_to_device(
+    packed: QuantizedTensor, device: torch.device
+) -> QuantizedTensor:
+    """Transfer an already blocked CPU QuantizedTensor without reformatting."""
+    return QuantizedTensor(
+        packed.values.to(device),
+        packed.scale_factors.to(device),
+        packed.amax.to(device),
+        packed.dtype,
+        packed.original_shape,
+        packed.scale_rule,
+        packed.round_style,
+        packed.padded_shape,
+        scale_factors_are_in_blackwell_layout=
+        packed.scale_factors_are_in_blackwell_layout,
+    )
+
+
+def nada_to_cutlass_tensor_preformatted(
+    values: torch.Tensor,
+    blocked_scales: torch.Tensor,
+    amax: torch.Tensor,
+    original_shape: tuple[int, int],
+) -> QuantizedTensor:
+    """Wrap already-padded NADA CUTLASS-layout buffers without an online copy."""
+    rows, cols = original_shape
+    padded_rows = (rows + 127) // 128 * 128
+    padded_cols = (cols + 63) // 64 * 64
+    expected_values = padded_rows * padded_cols // 2
+    expected_scales = padded_rows * (padded_cols // 16)
+    if values.numel() != expected_values or blocked_scales.numel() != expected_scales:
+        raise ValueError("invalid preformatted NADA CUTLASS buffer shape")
+    return QuantizedTensor(
+        values,
+        blocked_scales,
+        amax,
+        DataType.nvfp4,
+        original_shape,
+        ScaleRule.static_6,
+        RoundStyle.nearest,
+        (padded_rows, padded_cols),
+        scale_factors_are_in_blackwell_layout=True,
+    )
+
+
+def profile_first_linear(args, model, device: torch.device) -> None:
+    """Separate activation quantization from GEMM for a representative Q projection."""
+    linear = next(
+        m for n, m in model.named_modules()
+        if n.endswith("layers.0.self_attn.q_proj")
+    )
+    print(
+        f"PROFILE layer=layers.0.self_attn.q_proj in={linear.in_features} "
+        f"out={linear.out_features} arm={args.arm}",
+        flush=True,
+    )
+
+    for rows in args.profile_rows:
+        x = torch.randn(rows, linear.in_features, device=device, dtype=torch.bfloat16)
+        repeats = args.profile_repeats if rows <= 16 else max(10, args.profile_repeats // 5)
+
+        if args.arm in {"lss", "lss_cutlass"}:
+            if args.arm == "lss_cutlass":
+                def quantize_activation():
+                    return nvfp4_lss_quant_permute_scale_cutlass(
+                        x, linear.perm, linear.rescale, linear.a_gs
+                    )
+            else:
+                def quantize_activation():
+                    return nvfp4_lss_quant_permute_scale(
+                        x, linear.perm, linear.rescale, linear.a_gs
+                    )
+
+            q, scales = quantize_activation()
+
+            if args.arm == "lss_cutlass":
+                cutlass_input = nada_to_cutlass_tensor_preformatted(
+                    q, scales, linear.cutlass_input_amax,
+                    (rows, linear.in_features),
+                )
+
+                def gemm_only():
+                    return four_over_six_matmul(
+                        cutlass_input,
+                        linear.cutlass_weight,
+                        backend=MatmulBackend.cutlass,
+                    )
+            else:
+                def gemm_only():
+                    return FPQ.matmul_nvf4_bf16(
+                        q,
+                        linear.qweight,
+                        scales,
+                        linear.wscales_u8.view(torch.float8_e4m3fn),
+                        1.0 / (linear.a_gs * linear.w_gs),
+                    )
+        else:
+            def quantize_activation():
+                return four_over_six_quantize(x, linear.quant_config)
+
+            q = quantize_activation()
+
+            def gemm_only():
+                return four_over_six_matmul(
+                    q,
+                    linear.qweight,
+                    backend=MatmulBackend.cutlass,
+                )
+
+        quant_ms = _mean_cuda_ms(quantize_activation, 10, repeats)
+        gemm_ms = _mean_cuda_ms(gemm_only, 10, repeats)
+        full_ms = _mean_cuda_ms(lambda: linear(x), 10, repeats)
+        print(
+            f"PROFILE rows={rows} repeats={repeats} "
+            f"quant_ms={quant_ms:.4f} gemm_ms={gemm_ms:.4f} "
+            f"full_ms={full_ms:.4f}",
+            flush=True,
+        )
+
+        if args.profile_nada_cutlass:
+            if args.arm not in {"lss", "lss_cutlass"}:
+                raise ValueError("--profile-nada-cutlass requires a NADA arm")
+            # Reuse the exact NADA activation values and block scales above,
+            # then change only the GEMM backend/layout.
+            nada_input = nada_to_cutlass_tensor(
+                q, scales, linear.a_gs, (rows, linear.in_features)
+            )
+            nada_weight = nada_to_cutlass_tensor(
+                linear.qweight,
+                linear.wscales_u8.view(torch.float8_e4m3fn),
+                linear.w_gs,
+                (linear.out_features, linear.in_features),
+            )
+
+            def cutlass_gemm_only():
+                return four_over_six_matmul(
+                    nada_input, nada_weight, backend=MatmulBackend.cutlass
+                )
+
+            def layout_only():
+                return nada_to_cutlass_tensor(
+                    q, scales, linear.a_gs, (rows, linear.in_features)
+                )
+
+            def cutlass_full_forward():
+                lss_values, lss_scales = quantize_activation()
+                cutlass_input = nada_to_cutlass_tensor(
+                    lss_values, lss_scales, linear.a_gs,
+                    (rows, linear.in_features),
+                )
+                y = four_over_six_matmul(
+                    cutlass_input, nada_weight, backend=MatmulBackend.cutlass
+                )
+                return y + linear.bias if linear.bias is not None else y
+
+            native_y = gemm_only()
+            cutlass_y = cutlass_gemm_only()
+            rel = (native_y.float() - cutlass_y.float()).norm() / native_y.float().norm()
+            cutlass_ms = _mean_cuda_ms(cutlass_gemm_only, 10, repeats)
+            layout_ms = _mean_cuda_ms(layout_only, 10, repeats)
+            cutlass_full_ms = _mean_cuda_ms(cutlass_full_forward, 10, repeats)
+            print(
+                f"PROFILE_NADA_CUTLASS rows={rows} rel_err={rel.item():.6f} "
+                f"cutlass_gemm_ms={cutlass_ms:.4f} layout_ms={layout_ms:.4f} "
+                f"full_ms={cutlass_full_ms:.4f}",
+                flush=True,
+            )
 
 
 def generate_batch(model, input_ids, attention_mask, max_new: int):
@@ -358,18 +673,27 @@ def main() -> int:
     model = load_packed_model(args, device)
     load_seconds = time.perf_counter() - load_started
     load_nvml = monitor.stop()
-    post_load = monitor.sample_once()
 
-    if args.arm == "lss":
-        numeric_self_check(model, device, "lss")
+    if args.arm in {"lss", "lss_cutlass"}:
+        numeric_self_check(model, device, args.arm)
     else:
         numeric_self_check(model, device, "four_over_six")
+
+    if args.arm == "lss_cutlass":
+        release_cutlass_reference_storage(model)
+    post_load = monitor.sample_once()
+
+    if args.profile_first_linear:
+        profile_first_linear(args, model, device)
+        monitor.close()
+        return 0
 
     smoke_ids = torch.tensor(
         [fixed_token_ids(tokenizer, 32, 0)], device=device, dtype=torch.long
     )
+    smoke_mask = torch.ones_like(smoke_ids)
     with torch.no_grad():
-        smoke_out = generate_batch(model, smoke_ids, None, 8)
+        smoke_out = generate_batch(model, smoke_ids, smoke_mask, 8)
     print(f"SMOKE generated {smoke_out.shape[1] - smoke_ids.shape[1]} tokens", flush=True)
 
     raw_runs, summaries = [], []
@@ -429,7 +753,14 @@ def main() -> int:
 
     result = {
         "method": f"{args.arm}_hf_packed",
-        "runtime": "transformers+qutlass",
+        "runtime": (
+            "transformers+vllm-qutlass" if args.arm == "lss"
+            else (
+                "transformers+nada-lss+fouroversix-cutlass-layout-probe"
+                if args.arm == "lss_cutlass"
+                else "transformers+official-fouroversix-cutlass"
+            )
+        ),
         "settings": {
             "input_tokens": args.input_tokens,
             "output_tokens": args.output_tokens,
@@ -439,6 +770,11 @@ def main() -> int:
             "temperature": 0,
             "ignore_eos_equivalent": "min_new_tokens=max_new_tokens",
             "nvml_interval_ms": args.nvml_interval_ms,
+            "four_over_six": (
+                {"weight_scale_rule": "mse", "activation_scale_rule": "mse",
+                 "quantize_backend": "cuda", "matmul_backend": "cutlass"}
+                if args.arm == "four_over_six" else None
+            ),
         },
         "environment": {
             "hostname": platform.node(),

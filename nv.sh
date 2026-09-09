@@ -22,7 +22,7 @@ MODEL8="/data/pengliang/models--HuggingFaceTB--SmolLM2-135M/snapshots/93efa2f097
 
 
 $HOME/.conda/envs/awq/bin/python model_quant.py \
-    --model_name_or_path=${MODEL8} \
+    --model_name_or_path=${MODEL1} \
     --format=nvfp \
     --w_bits=4 \
     --a_bits=4 \
