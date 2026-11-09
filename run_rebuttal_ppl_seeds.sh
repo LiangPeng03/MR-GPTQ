@@ -87,6 +87,7 @@ import torch
 from datasets import load_dataset
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer
+from src.utils.data_utils import load_c4_shard
 
 method, *models = sys.argv[1:]
 assert torch.cuda.is_available(), "CUDA is unavailable for the selected GPU"
@@ -101,11 +102,8 @@ for model in models:
     AutoConfig.from_pretrained(model, local_files_only=True)
     AutoTokenizer.from_pretrained(model, local_files_only=True)
     print("model cache OK:", model)
-for split, shard in (
-    ("train", "en/c4-train.00000-of-01024.json.gz"),
-    ("validation", "en/c4-validation.00000-of-00008.json.gz"),
-):
-    dataset = load_dataset("allenai/c4", data_files={split: shard}, split=split)
+for split in ("train", "validation"):
+    dataset = load_c4_shard(split)
     print("C4", split, len(dataset))
 wiki = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
 print("WikiText-2 test", len(wiki))
