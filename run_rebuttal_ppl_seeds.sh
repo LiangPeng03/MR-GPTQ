@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run from this checkout with the existing MR-GPTQ environment.
 # Usage: bash run_rebuttal_ppl_seeds.sh {preflight|run} {small|8b} {rtn|gptq|mr-gptq|nada}
+#        GPU_ID=0 bash run_rebuttal_ppl_seeds.sh queue
 set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
@@ -14,6 +15,24 @@ export HF_DATASETS_OFFLINE=${HF_DATASETS_OFFLINE:-1}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128}
+
+if [[ "$action" == queue ]]; then
+    launcher="$PWD/run_rebuttal_ppl_seeds.sh"
+    export OUTPUT_ROOT
+    OUTPUT_ROOT=${OUTPUT_ROOT:-"$PWD/rebuttal_runs"}
+    bash "$launcher" preflight small mr-gptq
+    bash "$launcher" preflight 8b mr-gptq
+    mkdir -p -- "$OUTPUT_ROOT"
+    export CALIBRATION_TOKEN_DIR
+    CALIBRATION_TOKEN_DIR=$(mktemp -d "$OUTPUT_ROOT/calibration_c4_128x2048_XXXXXX")
+    echo "Shared calibration tokens: $CALIBRATION_TOKEN_DIR"
+    failed=0
+    for job in 'small gptq' 'small mr-gptq' '8b nada' '8b gptq' '8b mr-gptq' 'small rtn' '8b rtn'; do
+        read -r queue_group queue_method <<< "$job"
+        bash "$launcher" run "$queue_group" "$queue_method" || failed=1
+    done
+    exit "$failed"
+fi
 
 case "$group" in
     small)
@@ -119,6 +138,9 @@ for seed in "${seeds[@]}"; do
             --channel_resort "$resort" --channel_rescale "$rescale"
             --kmeans_block_size -1 --kmeans_alpha 2 --eval_perplexity "${gptq[@]}"
         )
+        if [[ -n "${CALIBRATION_TOKEN_DIR:-}" ]]; then
+            command+=(--save_calibration_tokens "$CALIBRATION_TOKEN_DIR/$stem.pt")
+        fi
         printf '%q ' "${command[@]}" > "$run_dir/$stem.cmd"
         printf '\n' >> "$run_dir/$stem.cmd"
         printf 'START %s %s seed=%s %s\n' "$method" "$model" "$seed" "$log"

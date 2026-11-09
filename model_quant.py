@@ -529,6 +529,8 @@ def parse_args():
         help="dtype to load the model.",
     )
     parser.add_argument("--seed", default=42, type=int, help="random seed.")
+    parser.add_argument("--save_calibration_tokens", default=None, type=str,
+                        help="Save the exact sampled calibration token IDs for paired baseline runs.")
     parser.add_argument("--cpu_offload_modules", action="store_true", help="whether to offload modules to CPU.")
     parser.add_argument("--cpu_offload_activations", action="store_true", help="whether to offload activations to CPU.")
     parser.add_argument(
@@ -791,6 +793,27 @@ def main():
         args.num_sequences,
         args.seed
     )
+    if args.save_calibration_tokens:
+        import tempfile
+        from pathlib import Path
+
+        destination = Path(args.save_calibration_tokens)
+        tokens = torch.cat(calibration_data, dim=0).cpu()
+        if destination.exists():
+            previous = torch.load(destination, map_location="cpu", weights_only=True)
+            if not torch.equal(previous, tokens):
+                raise ValueError(f"Calibration tokens differ from {destination}")
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as temporary:
+                temp_path = Path(temporary.name)
+                try:
+                    torch.save(tokens, temporary)
+                    temporary.close()
+                    temp_path.replace(destination)
+                finally:
+                    temp_path.unlink(missing_ok=True)
+        print(f"Calibration tokens: {destination} {tuple(tokens.shape)}")
 
     if quantize_anything:
         if args.gptq:
