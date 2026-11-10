@@ -147,6 +147,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--gpu", type=int, default=0, help="Physical GPU index.")
     parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--quantization", default=None,
+                        help="Explicit vLLM quantization name, e.g. fouroversix (NVFP4 MSE QDQ).")
+    parser.add_argument("--plugin-module", default=None,
+                        help="Import a quantization registration module before creating the engine.")
     parser.add_argument("--input-tokens", type=int, default=512)
     parser.add_argument("--output-tokens", type=int, default=128)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16])
@@ -250,6 +254,10 @@ def child_command(
     ]
     if args.skip_smoke:
         command.append("--skip-smoke")
+    if args.quantization:
+        command.extend(["--quantization", args.quantization])
+    if args.plugin_module:
+        command.extend(["--plugin-module", args.plugin_module])
     if args.enable_cudagraph:
         command.append("--enable-cudagraph")
     return command
@@ -347,6 +355,11 @@ def child_main(args: argparse.Namespace) -> int:
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
+    if args.plugin_module:
+        import importlib
+        plugin = importlib.import_module(args.plugin_module)
+        print(f"QUANTIZATION_PLUGIN={plugin.__file__}", flush=True)
+
     try:
         vllm_version = version("vllm")
     except PackageNotFoundError:
@@ -363,6 +376,7 @@ def child_main(args: argparse.Namespace) -> int:
         model=args._model_path,
         tokenizer=args.tokenizer,
         dtype=args.dtype,
+        quantization=args.quantization,
         max_model_len=max_model_len,
         max_num_seqs=max(args.batch_sizes),
         max_num_batched_tokens=args.max_num_batched_tokens,
@@ -507,6 +521,8 @@ def child_main(args: argparse.Namespace) -> int:
         },
         "settings": {
             "dtype": args.dtype,
+            "quantization": args.quantization,
+            "plugin_module": args.plugin_module,
             "input_tokens": args.input_tokens,
             "output_tokens": args.output_tokens,
             "batch_sizes": args.batch_sizes,
