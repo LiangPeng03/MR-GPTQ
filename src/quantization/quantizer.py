@@ -2,9 +2,84 @@ from typing import Tuple, Optional
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+
 from .quant_args import QuantizationFormat, QuantizationGranularity, QuantizationObserver, ScalePrecision
 from .quant_ops import FP8_E4M3_MAX, FP4_E2M1_MAX, FP4_SCALE, get_quantization_fns, get_quantization_range, cast_to_eBm0
 from ..helpers import split_dim
+
+
+if triton is not None:
+    @triton.jit
+    def _scalesweep_round_even(value):
+        integer = tl.floor(value)
+        fraction = value - integer
+        increment = (fraction > 0.5) | (
+            (fraction == 0.5) & ((integer.to(tl.int32) & 1) != 0)
+        )
+        return integer + increment.to(tl.float32)
+
+    @triton.jit
+    def _scalesweep_scale_kernel(
+        X, Importance, InverseGlobal, Result, groups, column_groups,
+        LOWER: tl.constexpr, WEIGHTED: tl.constexpr, BLOCKS: tl.constexpr,
+    ):
+        rows = tl.program_id(0) * BLOCKS + tl.arange(0, BLOCKS)
+        channels = tl.arange(0, 16)
+        candidates = tl.arange(0, 16)
+        values = tl.load(
+            X + rows[:, None] * 16 + channels[None, :],
+            mask=rows[:, None] < groups, other=0,
+        ).to(tl.float32)
+        inverse = tl.load(InverseGlobal).to(tl.float32)
+        base = tl.minimum(tl.max(tl.abs(values), axis=1) * inverse / 6.0, 448.0)
+        # Positive E4M3 floor, including subnormals, without searchsorted.
+        bits = base.to(tl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) - 127 + 7
+        mantissa = (bits & 0x7fffff) >> 20
+        normal_raw = (exponent << 3) + mantissa
+        subnormal_raw = tl.floor(base * 512.0).to(tl.int32)
+        base_raw = tl.where(exponent > 0, normal_raw, subnormal_raw)
+        base_raw = tl.minimum(tl.maximum(base_raw, 0), 126)
+        offsets = candidates + LOWER
+        raw = tl.minimum(tl.maximum(base_raw[:, None] + offsets[None, :], 1), 126)
+        scale_exponent = raw >> 3
+        scale_mantissa = raw & 7
+        fp32_bits = ((scale_exponent - 7 + 127) << 23) | (scale_mantissa << 20)
+        decoded = tl.where(
+            scale_exponent > 0, fp32_bits.to(tl.float32, bitcast=True),
+            scale_mantissa.to(tl.float32) / 512.0,
+        )
+        scales = decoded / inverse
+        normalized = values[:, :, None] / scales[:, None, :]
+        magnitude = tl.abs(normalized)
+        code = tl.where(
+            magnitude > 5.0, 6.0,
+            tl.where(magnitude >= 3.5, 4.0,
+                     tl.where(magnitude >= 1.75, _scalesweep_round_even(magnitude),
+                              _scalesweep_round_even(magnitude * 2.0) * 0.5)),
+        )
+        code = tl.where(normalized < 0, -code, code)
+        difference = code * scales[:, None, :] - values[:, :, None]
+        error = difference * difference
+        if WEIGHTED:
+            importance = tl.load(
+                Importance + (rows[:, None] % column_groups) * 16 + channels[None, :],
+                mask=rows[:, None] < groups, other=0,
+            ).to(tl.float32)
+            error = error * importance[:, :, None]
+        losses = tl.sum(error, axis=1) / 16.0
+        losses = tl.where(offsets[None, :] <= 7, losses, float("inf"))
+        minimum = tl.min(losses, axis=1)
+        winner = tl.min(
+            tl.where(losses == minimum[:, None], candidates[None, :], 16), axis=1
+        )
+        selected = tl.sum(tl.where(candidates[None, :] == winner[:, None], scales, 0.0), axis=1)
+        tl.store(Result + rows, selected, mask=rows < groups)
 
 # Utility function for inversion.
 def get_reciprocal(x):
@@ -52,6 +127,8 @@ class Quantizer:
             QuantizationObserver.SCALESWEEP_MSE, QuantizationObserver.SCALESWEEP_WMSE,
         }
         self.importance = None
+        self._scalesweep_checked_importance = None
+        self._scalesweep_checked_global = None
         self.global_scale_max = 256 if self.is_scalesweep else FP8_E4M3_MAX
         if self.is_scalesweep and (
             self.format != QuantizationFormat.NVFP or self.bits != 4
@@ -304,22 +381,34 @@ class Quantizer:
                                   torch.ones_like(maximum))
             self.global_scale = torch.minimum(self.global_scale.to(x.device), current)
         inverse_global = self.global_scale.to(device=x.device, dtype=torch.float32)
-        if not torch.isfinite(inverse_global).all() or not (inverse_global > 0).all():
-            raise ValueError("ScaleSweep global scale must be finite and positive.")
-
-        table = torch.arange(127, device=x.device, dtype=torch.uint8)
-        table = table.view(torch.float8_e4m3fn).float()
-        groups = x.detach().reshape(-1, 16).float()
+        if self._scalesweep_checked_global is not self.global_scale:
+            if not torch.isfinite(inverse_global).all() or not (inverse_global > 0).all():
+                raise ValueError("ScaleSweep global scale must be finite and positive.")
+            self._scalesweep_checked_global = self.global_scale
+        groups = x.detach().reshape(-1, 16).float().contiguous()
         result = torch.empty(groups.shape[0], device=x.device, dtype=torch.float32)
         importance = None
         if weighted:
             importance = self.importance.to(device=x.device, dtype=torch.float32)
             if importance.numel() != x.shape[-1]:
                 raise ValueError("ScaleSweep importance must have one entry per input channel.")
-            importance = importance.reshape(-1, 16)
-            if not torch.isfinite(importance).all() or (importance < 0).any():
-                raise ValueError("ScaleSweep importance must be finite and nonnegative.")
+            importance = importance.reshape(-1, 16).contiguous()
+            if self._scalesweep_checked_importance is not self.importance:
+                if not torch.isfinite(importance).all() or (importance < 0).any():
+                    raise ValueError("ScaleSweep importance must be finite and nonnegative.")
+                self._scalesweep_checked_importance = self.importance
         lower = -8 if weighted else -3
+        if triton is not None and groups.is_cuda:
+            _scalesweep_scale_kernel[(triton.cdiv(groups.shape[0], 16),)](
+                groups, importance if weighted else groups, inverse_global, result,
+                groups.shape[0], x.shape[-1] // 16,
+                LOWER=lower, WEIGHTED=weighted, BLOCKS=16,
+                num_warps=4, enable_fp_fusion=False,
+            )
+            scales = result.reshape(*x.shape[:-1], x.shape[-1] // 16)
+            return scales, torch.zeros_like(scales)
+        table = torch.arange(127, device=x.device, dtype=torch.uint8)
+        table = table.view(torch.float8_e4m3fn).float()
         for start in range(0, groups.shape[0], 65536):
             values = groups[start:start + 65536]
             base = values.abs().amax(-1) * inverse_global / FP4_E2M1_MAX
