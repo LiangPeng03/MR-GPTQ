@@ -24,9 +24,18 @@ if triton is not None:
         return integer + increment.to(tl.float32)
 
     @triton.jit
+    def _decode_positive_e4m3(raw):
+        exponent = raw >> 3
+        mantissa = raw & 7
+        bits = ((exponent - 7 + 127) << 23) | (mantissa << 20)
+        return tl.where(exponent > 0, bits.to(tl.float32, bitcast=True),
+                        mantissa.to(tl.float32) / 512.0)
+
+    @triton.jit
     def _scalesweep_scale_kernel(
         X, Importance, InverseGlobal, Result, groups, column_groups,
         LOWER: tl.constexpr, WEIGHTED: tl.constexpr, BLOCKS: tl.constexpr,
+        UPPER: tl.constexpr = 7, SCALESEARCH: tl.constexpr = False,
     ):
         rows = tl.program_id(0) * BLOCKS + tl.arange(0, BLOCKS)
         channels = tl.arange(0, 16)
@@ -45,8 +54,17 @@ if triton is not None:
         subnormal_raw = tl.floor(base * 512.0).to(tl.int32)
         base_raw = tl.where(exponent > 0, normal_raw, subnormal_raw)
         base_raw = tl.minimum(tl.maximum(base_raw, 0), 126)
+        if SCALESEARCH:
+            next_raw = tl.minimum(base_raw + 1, 126)
+            down = _decode_positive_e4m3(base_raw)
+            up = _decode_positive_e4m3(next_raw)
+            choose_up = ((up - base) < (base - down)) | (
+                ((up - base) == (base - down)) & ((next_raw & 1) == 0)
+            )
+            base_raw = tl.where(choose_up, next_raw, base_raw)
         offsets = candidates + LOWER
-        raw = tl.minimum(tl.maximum(base_raw[:, None] + offsets[None, :], 1), 126)
+        candidate_raw = base_raw[:, None] + offsets[None, :]
+        raw = tl.minimum(tl.maximum(candidate_raw, 1), 126)
         scale_exponent = raw >> 3
         scale_mantissa = raw & 7
         fp32_bits = ((scale_exponent - 7 + 127) << 23) | (scale_mantissa << 20)
@@ -73,7 +91,10 @@ if triton is not None:
             ).to(tl.float32)
             error = error * importance[:, :, None]
         losses = tl.sum(error, axis=1) / 16.0
-        losses = tl.where(offsets[None, :] <= 7, losses, float("inf"))
+        valid = offsets[None, :] <= UPPER
+        if SCALESEARCH:
+            valid = valid & (candidate_raw >= 1) & (candidate_raw <= 126)
+        losses = tl.where(valid, losses, float("inf"))
         minimum = tl.min(losses, axis=1)
         winner = tl.min(
             tl.where(losses == minimum[:, None], candidates[None, :], 16), axis=1
@@ -125,11 +146,16 @@ class Quantizer:
         self.scale_min_clip = scale_min_clip
         self.is_scalesweep = self.observer in {
             QuantizationObserver.SCALESWEEP_MSE, QuantizationObserver.SCALESWEEP_WMSE,
+            QuantizationObserver.SCALESEARCH,
         }
         self.importance = None
         self._scalesweep_checked_importance = None
         self._scalesweep_checked_global = None
-        self.global_scale_max = 256 if self.is_scalesweep else FP8_E4M3_MAX
+        self.global_scale_max = (
+            256 if self.observer in {QuantizationObserver.SCALESWEEP_MSE,
+                                    QuantizationObserver.SCALESWEEP_WMSE}
+            else FP8_E4M3_MAX
+        )
         if self.is_scalesweep and (
             self.format != QuantizationFormat.NVFP or self.bits != 4
             or not self.symmetric or self.group_size != 16 or self.dim != -1
@@ -369,15 +395,20 @@ class Quantizer:
 
     @torch.no_grad()
     def _scalesweep_params(self, x):
-        """Source ScaleSweep FP8-code sweep, with bounded temporary storage."""
+        """ScaleSweep or ScaleSearch FP8-code search with bounded storage.
+
+        ScaleSearch follows Algorithm 1 and Section 4.1 of arXiv:2605.12464.
+        E4M3 code 127 is NaN in PyTorch and is excluded from finite candidates.
+        """
         weighted = self.observer == QuantizationObserver.SCALESWEEP_WMSE
+        scalesearch = self.observer == QuantizationObserver.SCALESEARCH
         if weighted and self.importance is None:
             raise ValueError("ScaleSweep-WMSE requires calibrated channel importance.")
         if x.shape[-1] % 16:
             raise ValueError("ScaleSweep input width must be divisible by 16.")
         if self._track_global_scale:
             maximum = x.detach().abs().amax().float().reshape(1)
-            current = torch.where(maximum > 0, 256 * FP4_E2M1_MAX / maximum,
+            current = torch.where(maximum > 0, self.global_scale_max * FP4_E2M1_MAX / maximum,
                                   torch.ones_like(maximum))
             self.global_scale = torch.minimum(self.global_scale.to(x.device), current)
         inverse_global = self.global_scale.to(device=x.device, dtype=torch.float32)
@@ -397,12 +428,14 @@ class Quantizer:
                 if not torch.isfinite(importance).all() or (importance < 0).any():
                     raise ValueError("ScaleSweep importance must be finite and nonnegative.")
                 self._scalesweep_checked_importance = self.importance
-        lower = -8 if weighted else -3
+        lower = -2 if scalesearch else (-8 if weighted else -3)
+        upper = 6 if scalesearch else 7
         if triton is not None and groups.is_cuda:
             _scalesweep_scale_kernel[(triton.cdiv(groups.shape[0], 16),)](
                 groups, importance if weighted else groups, inverse_global, result,
                 groups.shape[0], x.shape[-1] // 16,
                 LOWER=lower, WEIGHTED=weighted, BLOCKS=16,
+                UPPER=upper, SCALESEARCH=scalesearch,
                 num_warps=4, enable_fp_fusion=False,
             )
             scales = result.reshape(*x.shape[:-1], x.shape[-1] // 16)
@@ -412,14 +445,23 @@ class Quantizer:
         for start in range(0, groups.shape[0], 65536):
             values = groups[start:start + 65536]
             base = values.abs().amax(-1) * inverse_global / FP4_E2M1_MAX
+            base = base.clamp(0, FP8_E4M3_MAX)
+            unrounded = base
             base = (torch.searchsorted(table, base.contiguous(), right=True) - 1).clamp(0, 126)
+            if scalesearch:
+                next_raw = (base + 1).clamp(0, 126)
+                down, up = table[base], table[next_raw]
+                choose_up = ((up - unrounded) < (unrounded - down)) | (
+                    ((up - unrounded) == (unrounded - down)) & (next_raw % 2 == 0)
+                )
+                base = torch.where(choose_up, next_raw, base)
             best_error = torch.full_like(base, float("inf"), dtype=torch.float32)
             best_scale = torch.empty_like(best_error)
             weights = None
             if importance is not None:
                 indices = torch.arange(start, start + len(values), device=x.device)
                 weights = importance[indices % importance.shape[0]]
-            for offset in range(lower, 8):
+            for offset in range(lower, upper + 1):
                 raw = (base + offset).clamp(1, 126)
                 scale = (table[raw] / inverse_global).unsqueeze(-1)
                 reconstructed = self.dequant_fn(
@@ -430,6 +472,9 @@ class Quantizer:
                 if weights is not None:
                     error = error * weights
                 error = error.mean(-1)
+                if scalesearch:
+                    valid = ((base + offset) >= 1) & ((base + offset) <= 126)
+                    error = torch.where(valid, error, torch.full_like(error, float("inf")))
                 improved = error < best_error
                 best_error = torch.where(improved, error, best_error)
                 best_scale = torch.where(improved, scale.squeeze(-1), best_scale)

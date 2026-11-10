@@ -30,6 +30,7 @@ class QuantizationObserver(str, Enum):
     LSS_3ROUND = "lss_3round"
     SCALESWEEP_MSE = "scalesweep_mse"
     SCALESWEEP_WMSE = "scalesweep_wmse"
+    SCALESEARCH = "scalesearch"
 
 class QuantizationOrder(str, Enum):
     """

@@ -226,6 +226,122 @@ class GPTQ:
         return self.step()
 
 
+@torch.no_grad()
+def permuquant_llm_permutations(block, input_args, input_kwargs, args, device, head_dim):
+    """Paper Eq.9/10 and Appendix E, adapted to linear-output MSE in LLMs.
+
+    All calibration tokens contribute to second moments and the global scale.
+    Alpha selection uses a uniform token subset controlled by permuquant_tokens.
+    Source: https://arxiv.org/html/2605.09503v2 .
+    """
+    names = {
+        "qkv": [block.self_attn.q_proj, block.self_attn.k_proj, block.self_attn.v_proj],
+        "o": [block.self_attn.o_proj],
+        "gate_up": [block.mlp.gate_proj, block.mlp.up_proj],
+        "down": [block.mlp.down_proj],
+    }
+    stats = {name: {"sum": None, "count": 0, "maximum": None, "samples": []} for name in names}
+    per_sequence = max(1, args.permuquant_tokens // len(input_args))
+    handles = []
+
+    def make_hook(name):
+        def hook(module, inputs, output):
+            values = inputs[0].detach().reshape(-1, inputs[0].shape[-1])
+            moment = values.float().square().sum(0)
+            entry = stats[name]
+            entry["sum"] = moment if entry["sum"] is None else entry["sum"] + moment
+            entry["count"] += values.shape[0]
+            maximum = values.abs().amax().float()
+            entry["maximum"] = maximum if entry["maximum"] is None else torch.maximum(entry["maximum"], maximum)
+            indices = torch.linspace(
+                0, values.shape[0] - 1, min(per_sequence, values.shape[0]),
+                device=values.device, dtype=torch.long,
+            )
+            entry["samples"].append(values[indices].cpu())
+        return hook
+
+    try:
+        for name, linears in names.items():
+            handles.append(linears[0].register_forward_hook(make_hook(name)))
+        for inp_args, inp_kwargs in zip(input_args, input_kwargs):
+            kwargs = inp_kwargs.copy()
+            kwargs["use_cache"] = False
+            if "past_key_value" in kwargs:
+                kwargs["past_key_value"] = None
+            block(*to(inp_args, device=device), **to(kwargs, device=device))
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    def quantizer(maximum):
+        result = Quantizer(bits=4, format="nvfp", granularity="group",
+                           group_size=16, observer="minmax", scale_precision="e4m3")
+        maximum = maximum.float().reshape(1)
+        result.global_scale = torch.where(
+            maximum > 0, FP8_E4M3_MAX * FP4_E2M1_MAX / maximum,
+            torch.ones_like(maximum),
+        )
+        result._track_global_scale = False
+        return result
+
+    permutations = {}
+    for name, linears in names.items():
+        entry = stats.pop(name)
+        x = torch.cat(entry["samples"], dim=0)[:args.permuquant_tokens].to(device).float()
+        weight = torch.cat([linear.weight.detach() for linear in linears], dim=0).float()
+        activation_moment = entry["sum"] / entry["count"]
+        weight_moment = weight.square().mean(0)
+        act_quantizer = quantizer(entry["maximum"].to(device))
+        weight_quantizer = quantizer(weight.abs().amax())
+        del entry
+        identity = torch.arange(x.shape[1], device=device)
+        reference = torch.nn.functional.linear(x, weight)
+
+        def output_error(permutation):
+            ordered_weight = weight[:, permutation].contiguous()
+            scales, zeros = weight_quantizer.get_quantization_params(ordered_weight)
+            qw = weight_quantizer(ordered_weight, scales, zeros)
+            total = torch.zeros((), device=device, dtype=torch.float64)
+            count = 0
+            for start in range(0, x.shape[0], 128):
+                values = x[start:start + 128, permutation].contiguous()
+                scales, zeros = act_quantizer.get_quantization_params(values)
+                qx = act_quantizer(values, scales, zeros)
+                error = torch.nn.functional.linear(qx, qw) - reference[start:start + 128]
+                total.add_(error.square().sum(dtype=torch.float64))
+                count += error.numel()
+            return total.item() / count
+
+        baseline = output_error(identity)
+        best_error, best_alpha, best_permutation = baseline, None, identity
+        for alpha in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
+            score = (
+                alpha * activation_moment.clamp_min(1e-30).log()
+                + (1.0 - alpha) * weight_moment.clamp_min(1e-30).log()
+            )
+            # Keep attention heads separate. GQA uses an explicit o-input
+            # permutation rather than a V-output permutation.
+            scope = head_dim if name == "o" else score.numel()
+            permutation = torch.cat([
+                torch.argsort(score[start:start + scope], descending=True, stable=True) + start
+                for start in range(0, score.numel(), scope)
+            ])
+            error = output_error(permutation)
+            if error < best_error:
+                best_error, best_alpha, best_permutation = error, alpha, permutation
+        improvement = (baseline - best_error) / baseline if baseline > 0 else 0.0
+        accepted = best_alpha is not None and improvement > args.permuquant_threshold
+        if accepted:
+            permutations[name] = best_permutation
+        print(
+            f"[PermuQuant-LLM] {name} tokens={x.shape[0]} alpha={best_alpha} "
+            f"output_mse={baseline:.6e}->{best_error:.6e} "
+            f"improvement={improvement:.3%} accepted={accepted}"
+        )
+        del x, weight, reference, act_quantizer, weight_quantizer
+    return permutations
+
+
 def gptq_quantization(
     model: AutoModelForCausalLM, 
     calibration_data: List[torch.Tensor],
@@ -300,7 +416,14 @@ def gptq_quantization(
 
         # === 0. Evaluate FP16 Block Outputs & Channel Resort Stats ===
         resort_perms = {}
-        do_channel_resort = getattr(args, "channel_resort", "none") != "none"
+        if args.channel_resort == "permuquant":
+            head_dim = getattr(model.config, "head_dim", None) or (
+                model.config.hidden_size // model.config.num_attention_heads
+            )
+            resort_perms = permuquant_llm_permutations(
+                block, input_args, input_kwargs, args, device, head_dim
+            )
+        do_channel_resort = getattr(args, "channel_resort", "none") not in {"none", "permuquant"}
         do_channel_rescale = getattr(args, "channel_rescale", "none") != "none"
         do_show_act_mse = getattr(args, "show_act_mse", False)
         
@@ -998,7 +1121,9 @@ def gptq_quantization(
                 o_perm = resort_perms["o"]
                 if hasattr(block, "gics_scales") and "o" in block.gics_scales:
                     o_in_transform = build_composite_with_gics("o", o_in_transform)
-                if block.self_attn.v_proj.weight.shape[0] == block.self_attn.o_proj.weight.shape[1]:
+                if args.channel_resort == "permuquant":
+                    o_in_transform = build_composite_with_gics("o", o_in_transform)
+                elif block.self_attn.v_proj.weight.shape[0] == block.self_attn.o_proj.weight.shape[1]:
                     block.self_attn.o_proj.weight.data = block.self_attn.o_proj.weight.data[:, o_perm]
                     block.self_attn.v_proj.weight.data = block.self_attn.v_proj.weight.data[o_perm, :]
             elif hasattr(block, "gics_scales") and "o" in block.gics_scales:

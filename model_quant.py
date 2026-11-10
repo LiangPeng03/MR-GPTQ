@@ -335,7 +335,7 @@ def parse_args():
         "--w_observer",
         type=str,
         default="minmax",
-        choices=["minmax", "mse", "mse_n", "scalesweep_mse", "scalesweep_wmse"],
+        choices=["minmax", "mse", "mse_n", "scalesweep_mse", "scalesweep_wmse", "scalesearch"],
         help="Weight observer.",
     )
     parser.add_argument(
@@ -361,13 +361,21 @@ def parse_args():
         "--a_observer",
         type=str,
         default="minmax",
-        choices=["minmax","lss","four_over_six","lss_3round","scalesweep_mse","scalesweep_wmse"],
+        choices=["minmax","lss","four_over_six","lss_3round","scalesweep_mse","scalesweep_wmse","scalesearch"],
         help="Activation observer.",
     )
     parser.add_argument(
         "--scalesweep", choices=["mse", "wmse"], default=None,
         help="Select ScaleSweep-MSE or WMSE for both weight and activation observers.",
     )
+    parser.add_argument("--scalesearch", action="store_true",
+                        help="ScaleSearch Algorithm 1: nearest E4M3 base, offsets [-2,6], W/A MSE.")
+    parser.add_argument("--permuquant", action="store_true",
+                        help="Paper-based PermuQuant LLM adaptation with alpha search and acceptance.")
+    parser.add_argument("--permuquant_tokens", type=int, default=4096,
+                        help="Uniformly sampled calibration tokens used for PermuQuant output-MSE selection.")
+    parser.add_argument("--permuquant_threshold", type=float, default=0.0,
+                        help="Required relative output-MSE improvement to accept a permutation.")
     parser.add_argument(
         "--export_quantized_model",
         type=str,
@@ -427,7 +435,7 @@ def parse_args():
         "--channel_resort",
         type=str,
         default="none",
-        choices=["none", "mean", "P95", "minmax", "stagger", "channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3"],
+        choices=["none", "mean", "P95", "minmax", "stagger", "channel_cluster", "kmeans_fp4", "kmeans_fp4_w", "kmeans_fp4_top3", "permuquant"],
         help="Channel reordering strategy: 'none', 'mean', 'P95', 'minmax', 'stagger', 'channel_cluster' (K-Means FP4 clustering). "
              "Legacy aliases 'kmeans_fp4', 'kmeans_fp4_w', 'kmeans_fp4_top3' are also accepted for backward compatibility.",
     )
@@ -629,16 +637,31 @@ def parse_args():
     )
     # Parse arguments
     args = parser.parse_args()
+    if sum((args.scalesweep is not None, args.scalesearch, args.permuquant)) > 1:
+        parser.error("Select one of --scalesweep, --scalesearch, or --permuquant.")
     if args.scalesweep is not None:
         args.w_observer = args.a_observer = f"scalesweep_{args.scalesweep}"
-    if any(observer.startswith("scalesweep_") for observer in (args.w_observer, args.a_observer)):
+    if args.scalesearch:
+        args.w_observer = args.a_observer = "scalesearch"
+    if args.permuquant:
+        args.channel_resort = "permuquant"
+    if args.channel_resort == "permuquant":
+        if (not args.gptq or args.format != "nvfp" or args.transform_class != "identity"
+                or args.channel_rescale != "none" or args.awq or args.gajs
+                or args.smoothquant_alpha is not None
+                or args.w_observer != "minmax" or args.a_observer != "minmax"):
+            parser.error("PermuQuant-LLM currently requires GPTQ NVFP4, identity transform, and no other preprocessing.")
+        if args.permuquant_tokens < args.num_sequences or args.permuquant_threshold < 0:
+            parser.error("PermuQuant token budget must cover all calibration sequences and threshold must be nonnegative.")
+    if any(observer.startswith("scalesweep_") or observer == "scalesearch"
+           for observer in (args.w_observer, args.a_observer)):
         if args.format != "nvfp":
             parser.error("ScaleSweep requires --format nvfp.")
         if args.lock_global_scale:
             parser.error("ScaleSweep computes its own global scale; omit --lock_global_scale.")
         if args.export_quantized_model or args.validate_realquant_export:
             parser.error("ScaleSweep currently supports in-memory evaluation; checkpoint export needs its runtime format.")
-        print(f"ScaleSweep observers: weights={args.w_observer}, activations={args.a_observer}")
+        print(f"FP8 scale-search observers: weights={args.w_observer}, activations={args.a_observer}")
     # Check and fix group_size (if needed)
     if args.format == "nvfp":
         if args.w_group_size != NVFP_GROUPSIZE:
