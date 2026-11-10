@@ -48,6 +48,18 @@ class Quantizer:
         self.dim = dim
         self.group_size = group_size
         self.scale_min_clip = scale_min_clip
+        self.is_scalesweep = self.observer in {
+            QuantizationObserver.SCALESWEEP_MSE, QuantizationObserver.SCALESWEEP_WMSE,
+        }
+        self.importance = None
+        self.global_scale_max = 256 if self.is_scalesweep else FP8_E4M3_MAX
+        if self.is_scalesweep and (
+            self.format != QuantizationFormat.NVFP or self.bits != 4
+            or not self.symmetric or self.group_size != 16 or self.dim != -1
+            or self.granularity != QuantizationGranularity.GROUP
+            or self.scale_precision != ScalePrecision.E4M3
+        ):
+            raise ValueError("ScaleSweep requires symmetric NVFP4 group-16 with E4M3 scales.")
 
         self.quant_fn, self.dequant_fn, self.quant_dequant_fn = get_quantization_fns(
             format=self.format,
@@ -95,6 +107,8 @@ class Quantizer:
         """
         Get scale and zero point for an input tensor.
         """
+        if self.is_scalesweep:
+            return self._scalesweep_params(x)
         dim = x.ndim - 1 if self.dim == -1 else self.dim
         if self.granularity == QuantizationGranularity.GROUP:
             reduce_dim = dim + 1
@@ -275,6 +289,64 @@ class Quantizer:
             raise ValueError(f"Scales are not finite.")
       
         return scales, zeros
+
+    @torch.no_grad()
+    def _scalesweep_params(self, x):
+        """Source ScaleSweep FP8-code sweep, with bounded temporary storage."""
+        weighted = self.observer == QuantizationObserver.SCALESWEEP_WMSE
+        if weighted and self.importance is None:
+            raise ValueError("ScaleSweep-WMSE requires calibrated channel importance.")
+        if x.shape[-1] % 16:
+            raise ValueError("ScaleSweep input width must be divisible by 16.")
+        if self._track_global_scale:
+            maximum = x.detach().abs().amax().float().reshape(1)
+            current = torch.where(maximum > 0, 256 * FP4_E2M1_MAX / maximum,
+                                  torch.ones_like(maximum))
+            self.global_scale = torch.minimum(self.global_scale.to(x.device), current)
+        inverse_global = self.global_scale.to(device=x.device, dtype=torch.float32)
+        if not torch.isfinite(inverse_global).all() or not (inverse_global > 0).all():
+            raise ValueError("ScaleSweep global scale must be finite and positive.")
+
+        table = torch.arange(127, device=x.device, dtype=torch.uint8)
+        table = table.view(torch.float8_e4m3fn).float()
+        groups = x.detach().reshape(-1, 16).float()
+        result = torch.empty(groups.shape[0], device=x.device, dtype=torch.float32)
+        importance = None
+        if weighted:
+            importance = self.importance.to(device=x.device, dtype=torch.float32)
+            if importance.numel() != x.shape[-1]:
+                raise ValueError("ScaleSweep importance must have one entry per input channel.")
+            importance = importance.reshape(-1, 16)
+            if not torch.isfinite(importance).all() or (importance < 0).any():
+                raise ValueError("ScaleSweep importance must be finite and nonnegative.")
+        lower = -8 if weighted else -3
+        for start in range(0, groups.shape[0], 65536):
+            values = groups[start:start + 65536]
+            base = values.abs().amax(-1) * inverse_global / FP4_E2M1_MAX
+            base = (torch.searchsorted(table, base.contiguous(), right=True) - 1).clamp(0, 126)
+            best_error = torch.full_like(base, float("inf"), dtype=torch.float32)
+            best_scale = torch.empty_like(best_error)
+            weights = None
+            if importance is not None:
+                indices = torch.arange(start, start + len(values), device=x.device)
+                weights = importance[indices % importance.shape[0]]
+            for offset in range(lower, 8):
+                raw = (base + offset).clamp(1, 126)
+                scale = (table[raw] / inverse_global).unsqueeze(-1)
+                reconstructed = self.dequant_fn(
+                    self.quant_fn(values, scale, None, self.q_min, self.q_max),
+                    scale, None,
+                )
+                error = (reconstructed - values).square()
+                if weights is not None:
+                    error = error * weights
+                error = error.mean(-1)
+                improved = error < best_error
+                best_error = torch.where(improved, error, best_error)
+                best_scale = torch.where(improved, scale.squeeze(-1), best_scale)
+            result[start:start + len(values)] = best_scale
+        scales = result.reshape(*x.shape[:-1], x.shape[-1] // 16)
+        return scales, torch.zeros_like(scales)
         
     def quantize(self, x: torch.Tensor, scales: torch.Tensor, zeros: Optional[torch.Tensor] = None) -> torch.Tensor:
         original_shape = x.shape
@@ -298,4 +370,4 @@ class Quantizer:
             self.q_min, 
             self.q_max
         ).reshape(original_shape)
-        return q
+        return q.to(x.dtype) if self.is_scalesweep else q

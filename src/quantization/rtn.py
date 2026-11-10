@@ -6,7 +6,7 @@ from typing import List
 import torch
 from transformers import AutoModelForCausalLM
 
-from .qlinear import QLinear
+from .qlinear import QLinear, set_scalesweep_activation_importance
 from .quant_ops import (
     FP4_BITPACKING_PERM,
     FP4_GRID,
@@ -899,7 +899,7 @@ def rtn_quantization(
                     if layer.weight_quantizer is not None:
                         # Compute global_scale directly from max abs (avoids expensive get_quantization_params MSE search)
                         max_val = layer.weight.abs().max().to(torch.float32).view(1)
-                        layer.weight_quantizer.global_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(max_val)
+                        layer.weight_quantizer.global_scale = layer.weight_quantizer.global_scale_max * FP4_E2M1_MAX * get_reciprocal(max_val)
                         layer.weight_quantizer._track_global_scale = False
                     
                     if layer.act_quantizer is not None:
@@ -936,23 +936,60 @@ def rtn_quantization(
         # so activation scales are calibrated on FP16 (transformed) weights.
         # Without this, F.linear(perm(x), W_unrotated) produces wrong activation distributions
         # when channel_resort is active, causing severe accuracy degradation.
+        for linears, transform in (
+            ([block.self_attn.q_proj, block.self_attn.k_proj, block.self_attn.v_proj], qkv_in_transform),
+            ([block.self_attn.o_proj], o_in_transform),
+            ([block.mlp.gate_proj, block.mlp.up_proj], gate_up_in_transform),
+            ([block.mlp.down_proj], down_in_transform),
+        ):
+            set_scalesweep_activation_importance(linears, transform)
         saved_weight_quantizers = {}
+        scalesweep_hooks = []
+        def collect_scalesweep_importance(quantizer):
+            count = 0
+            def hook(module, inputs):
+                nonlocal count
+                values = inputs[0].detach().reshape(-1, inputs[0].shape[-1]).float()
+                moment = values.square().mean(0)
+                new_count = count + values.shape[0]
+                if count == 0:
+                    quantizer.importance = moment
+                else:
+                    quantizer.importance.mul_(count / new_count).add_(
+                        moment, alpha=values.shape[0] / new_count
+                    )
+                count = new_count
+            return hook
         for layer_name, layer in block.named_modules():
             if isinstance(layer, QLinear):
                 saved_weight_quantizers[layer_name] = layer.weight_quantizer
+                if (layer.weight_quantizer is not None and
+                        layer.weight_quantizer.observer.value == "scalesweep_wmse"):
+                    scalesweep_hooks.append(layer.register_forward_pre_hook(
+                        collect_scalesweep_importance(layer.weight_quantizer)
+                    ))
                 layer.weight_quantizer = None
 
         # Calibrate activations (if needed)
-        if need_calibration:
-            device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
-            for inp_args, inp_kwargs in zip(input_args, input_kwargs):
-                with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
-                    block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
+        try:
+            if need_calibration:
+                device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+                for inp_args, inp_kwargs in zip(input_args, input_kwargs):
+                    with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=args.amp):
+                        block(*to(inp_args, device=device), **to(inp_kwargs, device=device))
+        finally:
+            for hook in scalesweep_hooks:
+                hook.remove()
 
         # Restore weight quantizers and disable train_mode for fix_parametrization
         for layer_name, layer in block.named_modules():
             if isinstance(layer, QLinear):
                 layer.weight_quantizer = saved_weight_quantizers.get(layer_name)
+                if (layer.weight_quantizer is not None and
+                        layer.weight_quantizer.observer.value == "scalesweep_wmse"
+                        and layer.weight_quantizer.importance is not None):
+                    importance = layer.weight_quantizer.importance
+                    layer.weight_quantizer.importance = importance + args.rel_damp * importance.mean()
                 layer._train_mode = False
 
         

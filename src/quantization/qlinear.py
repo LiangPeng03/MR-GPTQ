@@ -3,7 +3,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .quantizer import Quantizer
+from .quant_args import QuantizationObserver
 from ..transforms.transforms import BaseTransform
+
+
+@torch.no_grad()
+def set_scalesweep_activation_importance(linears, transform=None):
+    """Share source ScaleSweep's concatenated weight-column mean squares."""
+    if not any(layer.act_quantizer is not None and
+               layer.act_quantizer.observer == QuantizationObserver.SCALESWEEP_WMSE
+               for layer in linears):
+        return
+    importance = None
+    rows = 0
+    for layer in linears:
+        weight = layer.weight.detach()
+        if transform is not None:
+            weight = transform(weight, inv_t=True, dim=-1)
+        contribution = weight.float().square().sum(0)
+        importance = contribution if importance is None else importance + contribution
+        rows += weight.shape[0]
+    importance = importance / rows
+    for layer in linears:
+        if layer.act_quantizer is not None:
+            layer.act_quantizer.importance = importance
 
 
 class QLinear(nn.Linear):
@@ -45,6 +68,9 @@ class QLinear(nn.Linear):
                 weight = self.weight_quantizer(weight, w_scales, w_zeros)
 
         if self.act_quantizer is not None:
+            if (self.act_quantizer.observer == QuantizationObserver.SCALESWEEP_WMSE
+                    and self.act_quantizer.importance is None):
+                self.act_quantizer.importance = weight.detach().float().square().mean(dim=0)
             a_scales, a_zeros = self.act_quantizer.get_quantization_params(x)
             x_q = self.act_quantizer(x, a_scales, a_zeros)
             
@@ -85,7 +111,7 @@ class QLinear(nn.Linear):
                 from .quant_ops import FP8_E4M3_MAX, FP4_E2M1_MAX
                 from .quantizer import get_reciprocal
                 max_val = weight.abs().max().to(torch.float32).view(1)
-                current_global_scale = FP8_E4M3_MAX * FP4_E2M1_MAX * get_reciprocal(max_val)
+                current_global_scale = self.weight_quantizer.global_scale_max * FP4_E2M1_MAX * get_reciprocal(max_val)
                 self.weight_quantizer.global_scale = torch.minimum(self.weight_quantizer.global_scale.to(weight.device), current_global_scale)
                 self.weight_quantizer._track_global_scale = False
                 

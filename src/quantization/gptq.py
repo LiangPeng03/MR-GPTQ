@@ -9,9 +9,9 @@ import torch.nn as nn
 from torch.nn.modules.conv import _ConvNd
 from transformers import AutoModelForCausalLM
 
-from .qlinear import QLinear
+from .qlinear import QLinear, set_scalesweep_activation_importance
 from .quantizer import Quantizer, get_reciprocal
-from .quant_args import QuantizationOrder
+from .quant_args import QuantizationOrder, QuantizationObserver
 from .quant_ops import pack_fp4_to_uint8, cast_scales_to_eXmY, ScalePrecision, FP8_E4M3_MAX, FP4_E2M1_MAX
 from .rtn import _validate_saved_nvfp4_layer
 from .accumulate_hessian import accumulate_hessian
@@ -140,6 +140,9 @@ class GPTQ:
         if self.export_quantized_model:
             qweight = torch.empty(self.W.shape, device=device, dtype=dtype)
         # Get scales and zeros 
+        if self.quantizer.observer == QuantizationObserver.SCALESWEEP_WMSE:
+            diagonal = self.H.diag().clone()
+            self.quantizer.importance = diagonal + self.rel_damp * diagonal.mean()
         scales, zeros = self.quantizer.get_quantization_params(self.W) 
         # Dirty hack for GPTQ quantization
         self.quantizer.group_size = None
@@ -1067,6 +1070,16 @@ def gptq_quantization(
         block.mlp.up_proj.weight.data = gate_up_in_transform(block.mlp.up_proj.weight, inv_t=True)
         block.mlp.down_proj.weight.data = down_in_transform(block.mlp.down_proj.weight, inv_t=True)
 
+        # ScaleSweep groups share an activation quantizer importance vector,
+        # matching the concatenated QKV and gate/up weights in the source.
+        for linears in (
+            [block.self_attn.q_proj, block.self_attn.k_proj, block.self_attn.v_proj],
+            [block.self_attn.o_proj],
+            [block.mlp.gate_proj, block.mlp.up_proj],
+            [block.mlp.down_proj],
+        ):
+            set_scalesweep_activation_importance(linears)
+
         # 4. Create GPTQ handles and hooks
         gptq_handles = {}
         hooks = {}
@@ -1106,7 +1119,15 @@ def gptq_quantization(
                     else:
                         # Weights are already rotated, just compute scales
                         if gptq_handles[layer_name].quantizer is not None:
-                            gptq_handles[layer_name].quantizer.get_quantization_params(layer.weight)
+                            quantizer = gptq_handles[layer_name].quantizer
+                            if quantizer.is_scalesweep:
+                                maximum = layer.weight.detach().abs().amax().float().reshape(1)
+                                quantizer.global_scale = torch.where(
+                                    maximum > 0, quantizer.global_scale_max * FP4_E2M1_MAX / maximum,
+                                    torch.ones_like(maximum),
+                                )
+                            else:
+                                quantizer.get_quantization_params(layer.weight)
                             gptq_handles[layer_name].quantizer._track_global_scale = False
 
                 # Attach hook. The activation inp[0] is ALREADY transformed by LlamaAttention/LlamaMLP.

@@ -335,7 +335,7 @@ def parse_args():
         "--w_observer",
         type=str,
         default="minmax",
-        choices=["minmax", "mse", "mse_n"],
+        choices=["minmax", "mse", "mse_n", "scalesweep_mse", "scalesweep_wmse"],
         help="Weight observer.",
     )
     parser.add_argument(
@@ -361,8 +361,12 @@ def parse_args():
         "--a_observer",
         type=str,
         default="minmax",
-        choices=["minmax","lss","four_over_six","lss_3round"],
+        choices=["minmax","lss","four_over_six","lss_3round","scalesweep_mse","scalesweep_wmse"],
         help="Activation observer.",
+    )
+    parser.add_argument(
+        "--scalesweep", choices=["mse", "wmse"], default=None,
+        help="Select ScaleSweep-MSE or WMSE for both weight and activation observers.",
     )
     parser.add_argument(
         "--export_quantized_model",
@@ -625,6 +629,16 @@ def parse_args():
     )
     # Parse arguments
     args = parser.parse_args()
+    if args.scalesweep is not None:
+        args.w_observer = args.a_observer = f"scalesweep_{args.scalesweep}"
+    if any(observer.startswith("scalesweep_") for observer in (args.w_observer, args.a_observer)):
+        if args.format != "nvfp":
+            parser.error("ScaleSweep requires --format nvfp.")
+        if args.lock_global_scale:
+            parser.error("ScaleSweep computes its own global scale; omit --lock_global_scale.")
+        if args.export_quantized_model or args.validate_realquant_export:
+            parser.error("ScaleSweep currently supports in-memory evaluation; checkpoint export needs its runtime format.")
+        print(f"ScaleSweep observers: weights={args.w_observer}, activations={args.a_observer}")
     # Check and fix group_size (if needed)
     if args.format == "nvfp":
         if args.w_group_size != NVFP_GROUPSIZE:
