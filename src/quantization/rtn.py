@@ -172,7 +172,16 @@ def rtn_quantization(
 
         # === 0. Resonance-Aware Channel Reordering & Global Scale Lock ===
         resort_perms = {}
-        do_channel_resort = getattr(args, "channel_resort", "none") != "none"
+        if args.channel_resort == "permuquant":
+            from .gptq import permuquant_llm_permutations
+
+            head_dim = getattr(model.config, "head_dim", None) or (
+                model.config.hidden_size // model.config.num_attention_heads
+            )
+            resort_perms = permuquant_llm_permutations(
+                block, input_args, input_kwargs, args, device, head_dim
+            )
+        do_channel_resort = getattr(args, "channel_resort", "none") not in {"none", "permuquant"}
         do_channel_rescale = getattr(args, "channel_rescale", "none") != "none"
         do_lock_global_scale = args.scale_precision in ["e4m3", ScalePrecision.E4M3] and getattr(args, "lock_global_scale", False)
         
@@ -849,7 +858,9 @@ def rtn_quantization(
                 o_perm = resort_perms["o"]
                 if hasattr(block, "gics_scales") and "o" in block.gics_scales:
                     o_in_transform = build_composite_with_gics("o", o_in_transform)
-                if block.self_attn.v_proj.weight.shape[0] == block.self_attn.o_proj.weight.shape[1]:
+                if args.channel_resort == "permuquant":
+                    o_in_transform = build_composite_with_gics("o", o_in_transform)
+                elif block.self_attn.v_proj.weight.shape[0] == block.self_attn.o_proj.weight.shape[1]:
                     block.self_attn.o_proj.weight.data = block.self_attn.o_proj.weight.data[:, o_perm]
                     block.self_attn.v_proj.weight.data = block.self_attn.v_proj.weight.data[o_perm, :]
             elif (hasattr(block, "gics_scales") and "o" in block.gics_scales) or "o" in smoothquant_scales:

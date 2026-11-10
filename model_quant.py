@@ -646,11 +646,11 @@ def parse_args():
     if args.permuquant:
         args.channel_resort = "permuquant"
     if args.channel_resort == "permuquant":
-        if (not args.gptq or args.format != "nvfp" or args.transform_class != "identity"
+        if (args.format != "nvfp" or args.transform_class != "identity"
                 or args.channel_rescale != "none" or args.awq or args.gajs
                 or args.smoothquant_alpha is not None
                 or args.w_observer != "minmax" or args.a_observer != "minmax"):
-            parser.error("PermuQuant-LLM currently requires GPTQ NVFP4, identity transform, and no other preprocessing.")
+            parser.error("PermuQuant-LLM requires NVFP4, identity transform, and no other preprocessing.")
         if args.permuquant_tokens < args.num_sequences or args.permuquant_threshold < 0:
             parser.error("PermuQuant token budget must cover all calibration sequences and threshold must be nonnegative.")
     if any(observer.startswith("scalesweep_") or observer == "scalesearch"
