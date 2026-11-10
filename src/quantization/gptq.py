@@ -1461,6 +1461,11 @@ def gptq_quantization(
                             "weight_global_scale": weight_global_scale.clone(),
                             "act_global_scale": act_global_scale.clone()
                         }
+                        if gptq_handle.layer.act_quantizer.observer == QuantizationObserver.SCALESWEEP_WMSE:
+                            importance = gptq_handle.layer.act_quantizer.importance
+                            if importance is None:
+                                raise RuntimeError(f"Missing ScaleSweep importance: {layer_key}")
+                            saved_layer["act_importance"] = importance.detach().float().cpu().clone()
                         quantized_state_dict[layer_key] = saved_layer
                         if args.validate_realquant_export:
                             max_abs, mean_abs = _validate_saved_nvfp4_layer(

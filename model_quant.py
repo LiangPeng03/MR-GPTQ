@@ -239,6 +239,17 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
         activation_observer=args.a_observer,
         identity_transform=(args.transform_class == "identity"),
     )
+    if args.a_observer in {"scalesweep_mse", "scalesweep_wmse"}:
+        config.quantization_config.update({
+            "scalesweep_base_rounding": "floor",
+            "scalesweep_lower_bound": -8 if args.a_observer == "scalesweep_wmse" else -3,
+            "scalesweep_upper_bound": 7,
+            "weight_observer": args.w_observer,
+            "calibration": {
+                "dataset": args.dataset_name_or_path, "samples": args.num_sequences,
+                "sequence_length": args.sequence_length, "seed": args.seed,
+            },
+        })
     # Save configs
     config.save_pretrained(args.save_path)
     model.generation_config.save_pretrained(args.save_path)
@@ -660,7 +671,16 @@ def parse_args():
         if args.lock_global_scale:
             parser.error("ScaleSweep computes its own global scale; omit --lock_global_scale.")
         if args.export_quantized_model or args.validate_realquant_export:
-            parser.error("ScaleSweep currently supports in-memory evaluation; checkpoint export needs its runtime format.")
+            if (args.a_observer not in {"scalesweep_mse", "scalesweep_wmse"}
+                    or args.w_observer not in {"scalesweep_mse", "scalesweep_wmse"}
+                    or args.export_quantized_model != "realquant" or not args.gptq
+                    or args.transform_class != "identity" or not args.fuse_global_scale
+                    or args.hadamard_group_size != 16):
+                parser.error(
+                    "ScaleSweep vLLM export requires W/A ScaleSweep observers, "
+                    "--gptq --export_quantized_model realquant "
+                    "--transform_class identity --hadamard_group_size 16 --fuse_global_scale."
+                )
         print(f"FP8 scale-search observers: weights={args.w_observer}, activations={args.a_observer}")
     # Check and fix group_size (if needed)
     if args.format == "nvfp":

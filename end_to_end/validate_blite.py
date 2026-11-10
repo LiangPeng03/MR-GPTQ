@@ -18,6 +18,13 @@ from vllm._custom_ops import (
     permute_and_scale_cols,
 )
 
+if len(sys.argv) > 1 and sys.argv[1] == "scalesweep":
+    from vllm.model_executor.layers.quantization import fp_quant
+    from vllm.model_executor.layers.quantization.utils.scalesweep import validate_runtime
+
+    validate_runtime()
+    raise SystemExit(0)
+
 MODEL_DIR = (
     "/home/pengliang/Desktop/MR-GPTQ/e2e_models/"
     "qwen3_8b_ours_lss_validated_20260904_211031/ours"

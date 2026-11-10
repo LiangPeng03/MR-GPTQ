@@ -176,6 +176,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument(
+        "--require-matched-config", action="store_true",
+        help="Require matching local model architecture and tokenizer across benchmark methods.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate arguments and print child commands without loading models.",
@@ -270,6 +274,39 @@ def controller_main(args: argparse.Namespace) -> int:
     if len(names) != len(set(names)):
         raise ValueError("model names must be unique")
 
+    checkpoint_configs = {}
+    signature = None
+    tokenizer_reference = None
+    architecture_fields = (
+        "model_type", "hidden_size", "intermediate_size", "num_hidden_layers",
+        "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size",
+    )
+    for method, model_path in models:
+        config_path = Path(model_path) / "config.json"
+        if not config_path.is_file():
+            if args.require_matched_config:
+                raise FileNotFoundError(config_path)
+            continue
+        config = json.loads(config_path.read_text())
+        checkpoint_configs[method] = {
+            "architecture": {key: config.get(key) for key in architecture_fields},
+            "quantization_config": config.get("quantization_config"),
+        }
+        architecture = checkpoint_configs[method]["architecture"]
+        if architecture["head_dim"] is None and architecture["num_attention_heads"]:
+            architecture["head_dim"] = architecture["hidden_size"] // architecture["num_attention_heads"]
+        if architecture["num_key_value_heads"] is None:
+            architecture["num_key_value_heads"] = architecture["num_attention_heads"]
+        if args.require_matched_config:
+            current = checkpoint_configs[method]["architecture"]
+            tokenizer = tokenizer_overrides.get(method, args.tokenizer)
+            if signature is not None and current != signature:
+                raise ValueError(f"Benchmark model architecture differs: {method}")
+            if tokenizer_reference is not None and tokenizer != tokenizer_reference:
+                raise ValueError(f"Benchmark tokenizer differs: {method}")
+            signature = current
+            tokenizer_reference = tokenizer
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (args.output_dir or Path("benchmark_results") / stamp).resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -280,6 +317,7 @@ def controller_main(args: argparse.Namespace) -> int:
         "models": dict(models),
         "tokenizer": args.tokenizer,
         "tokenizer_overrides": tokenizer_overrides,
+        "checkpoint_configs": checkpoint_configs,
         "settings": {
             key: value
             for key, value in vars(args).items()
