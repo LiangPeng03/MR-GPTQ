@@ -182,6 +182,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument(
+        "--nada-fast-model", action="append", default=None, metavar="NAME",
+        help="Enable NADA Fast only for these method names; disable it for all others.",
+    )
+    parser.add_argument(
+        "--check-output-pair", action="append", type=parse_mapping, default=[],
+        metavar="LEGACY=FAST",
+        help="Check repeat stability and exact output-token hashes for a same-checkpoint pair.",
+    )
+    parser.add_argument(
         "--require-matched-config", action="store_true",
         help="Require matching local model architecture and tokenizer across benchmark methods.",
     )
@@ -283,6 +292,13 @@ def controller_main(args: argparse.Namespace) -> int:
     names = [name for name, _ in models]
     if len(names) != len(set(names)):
         raise ValueError("model names must be unique")
+    if args.nada_fast_model is not None and not set(args.nada_fast_model).issubset(names):
+        raise ValueError("--nada-fast-model contains an unknown method name")
+    for left, right in args.check_output_pair:
+        if left not in names or right not in names or left == right:
+            raise ValueError("--check-output-pair requires two different known method names")
+        if Path(dict(models)[left]).resolve() != Path(dict(models)[right]).resolve():
+            raise ValueError("Output-equivalence pairs must use the same checkpoint")
 
     checkpoint_configs = {}
     signature = None
@@ -351,6 +367,10 @@ def controller_main(args: argparse.Namespace) -> int:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+        if args.nada_fast_model is not None:
+            env["VLLM_FPQUANT_NADA_FAST"] = (
+                "1" if method in args.nada_fast_model else "0"
+            )
         env.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
         env.setdefault("TOKENIZERS_PARALLELISM", "false")
         completed_process = subprocess.run(command, env=env, check=False)
@@ -365,6 +385,13 @@ def controller_main(args: argparse.Namespace) -> int:
 
     if not args.dry_run:
         write_combined_outputs(output_dir, completed, args.reference_method)
+        if args.check_output_pair:
+            checks_ok = write_output_checks(
+                output_dir, completed, args.check_output_pair, args.batch_sizes,
+                args.repeats,
+            )
+            if not checks_ok:
+                failures.append("output_equivalence")
     print(f"\nRESULT_DIR={output_dir}")
     if failures:
         print("FAILED_METHODS=" + ",".join(failures), file=sys.stderr)
@@ -688,6 +715,37 @@ def write_combined_outputs(
     (output_dir / "all_results.json").write_text(
         json.dumps(results, indent=2, ensure_ascii=False, allow_nan=True) + "\n"
     )
+
+
+def write_output_checks(output_dir, results, pairs, batch_sizes, repeats):
+    by_method = {result["method"]: result for result in results}
+    checks = []
+    for left, right in pairs:
+        for batch in batch_sizes:
+            hashes = []
+            counts = []
+            for method in (left, right):
+                runs = [
+                    run for run in by_method.get(method, {}).get("raw_runs", [])
+                    if run["batch_size"] == batch
+                ]
+                hashes.append({run.get("output_token_sha256") for run in runs})
+                counts.append(len(runs))
+            stable_left = len(hashes[0]) == 1 and None not in hashes[0]
+            stable_right = len(hashes[1]) == 1 and None not in hashes[1]
+            equal = (
+                counts == [repeats, repeats] and stable_left and stable_right
+                and hashes[0] == hashes[1]
+            )
+            checks.append({
+                "legacy": left, "fast": right, "batch_size": batch,
+                "legacy_repeat_count": counts[0], "fast_repeat_count": counts[1],
+                "legacy_stable": stable_left, "fast_stable": stable_right,
+                "output_tokens_equal": equal,
+            })
+            print(f"OUTPUT_CHECK {left}/{right} batch={batch} equal={equal}", flush=True)
+    write_csv(output_dir / "output_checks.csv", checks)
+    return all(row["output_tokens_equal"] for row in checks)
 
 
 def main() -> int:
