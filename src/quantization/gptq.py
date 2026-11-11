@@ -32,6 +32,117 @@ def get_relative_mse_error(q: torch.Tensor, w: torch.Tensor, H: torch.Tensor):
     return (delta).mm(H).mul(delta).mean() / (w.mm(H).mul(w).mean() + 1e-6)
 
 
+def compensated_group(w, w_blk, errs, upper, c1, c2, i, positions):
+    """Snapshot an unstarted original group, including pending lazy updates."""
+    if any(p < c1 + i for p in positions):
+        raise RuntimeError("Lazy scale initialization encountered an already visited group column")
+    result = w[:, positions].clone()
+    local = [j for j, p in enumerate(positions) if p < c2]
+    far = [j for j, p in enumerate(positions) if p >= c2]
+    if local:
+        result[:, local] = w_blk[:, [positions[j] - c1 for j in local]]
+    if far and i:
+        future = [positions[j] for j in far]
+        result[:, far] -= errs[:, :i] @ upper[c1:c1 + i, future]
+    return result
+
+
+@torch.no_grad()
+def validate_lazy_group_scales(device="cuda"):
+    """Compare real WMSE blocked GPTQ to an immediate-update reference.
+
+    Act-order deliberately interleaves original groups; non-aligned computation
+    blocks exercise pending compensation into later blocks.
+    """
+    from .quant_ops import pack_fp4_to_uint8
+
+    kwargs = dict(bits=4, format="nvfp", granularity="group", group_size=16,
+                  scale_precision="e4m3", observer="scalesweep_wmse", global_scale_max=448)
+
+    def make(weight, hessian, block_size):
+        layer = nn.Linear(64, weight.shape[0], bias=False, device=device, dtype=weight.dtype)
+        layer.weight.copy_(weight)
+        q = Quantizer(**kwargs)
+        q.global_scale = torch.tensor([64.], device=device)
+        q._track_global_scale = False
+        handle = GPTQ(layer, q, quantization_order="activation", block_size=block_size,
+                      export_quantized_model="realquant")
+        handle.H = hessian.clone()
+        return handle
+
+    for seed in (0, 42):
+        torch.manual_seed(seed)
+        weight = torch.randn(8, 64, device=device, dtype=torch.bfloat16)
+        prefix = [0, 16, 1, 17, 2, 18, 3, 19, 32, 4, 20, 33, 48]
+        order = torch.tensor(prefix + [j for j in range(64) if j not in prefix], device=device)
+        diagonal = torch.empty(64, device=device)
+        diagonal[order] = torch.linspace(100., 2., 64, device=device)
+        a = torch.randn(80, 64, device=device)
+        hessian = torch.diag(diagonal) + .01 * (a.T @ a)
+        reference = make(weight, hessian, 1)
+        reference.quantization_pre_step()
+        perm = hessian.diag().argsort(descending=True)
+        inverse = perm.argsort()
+        reference.H = hessian[perm][:, perm].clone()
+        upper = reference._get_hessian_inverse()
+        work = weight.float()[:, perm].clone()
+        importance = hessian.diag() + reference.rel_damp * hessian.diag().mean()
+        positions = inverse.reshape(4, 16).tolist()
+        visits = (perm // 16).tolist()
+        expected_scales = torch.empty(8, 4, device=device)
+        expected_codes = torch.empty_like(work)
+        snapshots, expected_importance, search_order = [], [], []
+        seen = set()
+        for column, group in enumerate(visits):
+            if group not in seen:
+                snapshot = work[:, positions[group]].clone()
+                snapshots.append(snapshot)
+                imp = importance[group * 16:(group + 1) * 16]
+                expected_importance.append(imp)
+                search_order.append(group)
+                reference.quantizer.importance = imp
+                reference.quantizer.group_size = 16
+                s, _ = reference.quantizer.get_quantization_params(snapshot)
+                expected_scales[:, group] = s[:, 0]
+                reference.quantizer.group_size = None
+                seen.add(group)
+            value = work[:, column].clone()
+            scale = expected_scales[:, group]
+            code = reference.quantizer.quantize(value, scale, torch.zeros_like(scale))
+            quantized = reference.quantizer.dequantize(code, scale, torch.zeros_like(scale))
+            expected_codes[:, column] = code
+            error = (value - quantized) / upper[column, column]
+            work[:, column:] -= error[:, None] * upper[column, column:][None, :]
+        expected_codes = expected_codes[:, inverse]
+        expected_weight = (expected_codes.reshape(8, 4, 16)
+                           * expected_scales[..., None]).flatten(-2).to(weight.dtype)
+        for block_size in (1, 7, 32):
+            actual = make(weight, hessian, block_size)
+            actual.quantizer._lazy_group_scales = True
+            captured, captured_importance = [], []
+            original_get = actual.quantizer.get_quantization_params
+
+            def record(values):
+                captured.append(values.clone())
+                captured_importance.append(actual.quantizer.importance.clone())
+                return original_get(values)
+
+            actual.quantizer.get_quantization_params = record
+            qw, codes, scales = actual.quantize()
+            assert len(captured) == 4, "Each original group must be searched exactly once"
+            for got, want, got_imp, want_imp in zip(captured, snapshots, captured_importance, expected_importance):
+                torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)
+                assert torch.equal(got_imp, want_imp), "Original-channel importance misaligned"
+            assert torch.equal(scales, expected_scales), "Delayed scales differ from reference"
+            assert torch.equal(pack_fp4_to_uint8(codes), pack_fp4_to_uint8(expected_codes)), "FP4 code mismatch"
+            assert torch.equal(qw, expected_weight), "Reconstructed weight mismatch"
+            assert actual.quantizer.group_size == 16
+            assert torch.equal(actual.quantizer.global_scale, torch.tensor([64.], device=device))
+            print(f"LAZY_SCALE_REFERENCE_OK seed={seed} compute_block={block_size} "
+                  f"search_order={search_order} snapshots/scales/codes/weights OK", flush=True)
+    print("ALL LAZY GROUP SCALE CHECKS PASSED", flush=True)
+
+
 class GPTQ:
 
     def __init__(
@@ -149,10 +260,19 @@ class GPTQ:
                 blocks = self.H[indices[:, :, None], indices[:, None, :]].clone()
                 blocks.diagonal(dim1=-2, dim2=-1).add_(self.rel_damp * diagonal.mean())
                 self.quantizer.group_hessian = blocks
-        try:
-            scales, zeros = self.quantizer.get_quantization_params(self.W)
-        finally:
-            self.quantizer.group_hessian = None
+        lazy = getattr(self.quantizer, "_lazy_group_scales", False)
+        if lazy:
+            if (self.quantizer.observer != QuantizationObserver.SCALESWEEP_WMSE
+                    or group_size != 16 or self.quantizer._track_global_scale
+                    or self.quantization_order != QuantizationOrder.ACTIVATION):
+                raise ValueError("Lazy initialization needs frozen NVFP4 WMSE group-16 act-order")
+            scales = torch.empty((self.W.shape[0], num_groups), device=device, dtype=torch.float32)
+            zeros = torch.zeros_like(scales)
+        else:
+            try:
+                scales, zeros = self.quantizer.get_quantization_params(self.W)
+            finally:
+                self.quantizer.group_hessian = None
         # Dirty hack for GPTQ quantization
         self.quantizer.group_size = None
         # Get permutation
@@ -162,6 +282,12 @@ class GPTQ:
         else:
             perm = torch.arange(d_col, device=device)
         perm_inv = torch.argsort(perm)
+        if lazy:
+            group_visits = (perm // group_size).tolist()
+            group_positions = perm_inv.reshape(num_groups, group_size).tolist()
+            initialized = [False] * num_groups
+            full_importance = self.quantizer.importance
+            frozen_global = self.quantizer.global_scale.clone()
         # Permute Hessian prior to inversion
         self.H = self.H[perm][:, perm]
         # Get weight
@@ -184,6 +310,21 @@ class GPTQ:
                     g_idx = group_idx[c1 + i]
                 else:
                     g_idx = (c1 + i) // group_size    
+                if lazy:
+                    group = group_visits[c1 + i]
+                    if not initialized[group]:
+                        current = compensated_group(w, w_blk, errs, H_inv_cho,
+                                                    c1, c2, i, group_positions[group])
+                        self.quantizer.importance = full_importance[group * group_size:(group + 1) * group_size]
+                        self.quantizer.group_size = group_size
+                        try:
+                            s, z = self.quantizer.get_quantization_params(current)
+                        finally:
+                            self.quantizer.importance = full_importance
+                            self.quantizer.group_size = None
+                        scales[:, group] = s[:, 0]
+                        zeros[:, group] = z[:, 0]
+                        initialized[group] = True
                 # Quantize weight column
                 if self.export_quantized_model:
                     q = self.quantizer.quantize(w_ci, scales[:, g_idx], zeros[:, g_idx])
@@ -200,6 +341,11 @@ class GPTQ:
             w[:, c2:].addmm_(errs, H_inv_cho[c1:c2, c2:], alpha=-1)
 
         # Invert permutation
+        if lazy:
+            assert all(initialized), "Not all fixed groups were initialized"
+            assert torch.equal(frozen_global, self.quantizer.global_scale), "Global scale changed"
+            print(f"[GPTQ LAZY SCALES] groups={num_groups} searches={sum(initialized)} "
+                  "original_grouping=True frozen_global=True", flush=True)
         w = w[:, perm_inv].contiguous()
         if qweight is not None:
             qweight = qweight[:, perm_inv].contiguous()
@@ -1358,6 +1504,8 @@ def gptq_quantization(
                 if gptq_handles[layer_name].quantizer is not None:
                     gptq_handles[layer_name].quantizer._use_group_hessian = getattr(
                         args, "weight_group_hessian", False)
+                    gptq_handles[layer_name].quantizer._lazy_group_scales = getattr(
+                        args, "gptq_lazy_group_scales", False)
                 
                 # Update weight reference in handle (since it was just rotated)
                 gptq_handles[layer_name].W = layer.weight.data.clone()

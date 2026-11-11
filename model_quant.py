@@ -409,6 +409,8 @@ def parse_args():
                         help="Output directory for fixed-weight activation and post-GPTQ scale diagnostics.")
     parser.add_argument("--nada_refit_groups", type=int, default=8,
                         help="Maximum weight groups per linear layer updated in one refit sweep.")
+    parser.add_argument("--gptq_lazy_group_scales", action="store_true",
+                        help="Initialize each fixed weight group's WMSE scale at its first act-order visit.")
     parser.add_argument("--scalesearch", action="store_true",
                         help="ScaleSearch Algorithm 1: nearest E4M3 base, offsets [-2,6], W/A MSE.")
     parser.add_argument("--permuquant", action="store_true",
@@ -714,6 +716,15 @@ def parse_args():
         parser.error("--bitr_power_search requires --nada_wmse weight, channel_cluster and gics.")
     if args.weight_group_hessian and args.nada_wmse != "weight":
         parser.error("--weight_group_hessian requires --nada_wmse weight.")
+    if args.gptq_lazy_group_scales and (
+        args.nada_wmse != "weight" or args.quantization_order != "activation"
+        or not args.fuse_global_scale or args.lock_global_scale
+        or args.nada_global_sweep or args.bitr_power_search or args.weight_group_hessian
+        or args.dacc_weighted_proxy or args.nada_diagnostics
+        or args.export_quantized_model or args.validate_realquant_export
+    ):
+        parser.error("Lazy group scales require --nada_wmse weight, activation order and "
+                     "fused global scales; standalone PPL experiment without export/other ablations.")
     if args.nada_diagnostics and (
         args.nada_wmse != "weight" or not args.eval_perplexity or args.eval_openllm
         or args.export_quantized_model or args.validate_realquant_export or args.compile
