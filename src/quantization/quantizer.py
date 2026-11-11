@@ -478,6 +478,32 @@ class Quantizer:
                 self._scalesweep_checked_importance = self.importance
         lower = -2 if scalesearch else (-8 if weighted else -3)
         upper = 6 if scalesearch else 7
+        if getattr(self, "group_hessian", None) is not None:
+            if not weighted:
+                raise ValueError("Group Hessian scale selection requires weighted ScaleSweep")
+            hessian = self.group_hessian.to(device=x.device, dtype=torch.float32)
+            if hessian.shape != (x.shape[-1] // 16, 16, 16):
+                raise ValueError("Group Hessian must have shape [input_width/16, 16, 16]")
+            table = torch.arange(127, device=x.device, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+            offsets = torch.arange(-8, 8, device=x.device)
+            for start in range(0, groups.shape[0], 2048):
+                values = groups[start:start + 2048]
+                base = (values.abs().amax(-1) * inverse_global / FP4_E2M1_MAX).clamp(0, FP8_E4M3_MAX)
+                base = (torch.searchsorted(table, base.contiguous(), right=True) - 1).clamp(0, 126)
+                raw = (base[:, None] + offsets[None, :]).clamp(1, 126)
+                candidate = table[raw] / inverse_global
+                scaled = values[:, :, None] / candidate[:, None, :]
+                reconstructed = self.dequant_fn(
+                    self.quant_fn(scaled, torch.ones_like(scaled), None, self.q_min, self.q_max),
+                    candidate[:, None, :], None,
+                )
+                error = reconstructed - values[:, :, None]
+                indices = torch.arange(start, start + len(values), device=x.device) % hessian.shape[0]
+                losses = (error * torch.bmm(hessian[indices], error)).sum(dim=1)
+                best = losses.argmin(-1, keepdim=True)
+                result[start:start + len(values)] = candidate.gather(1, best).squeeze(1)
+            scales = result.reshape(*x.shape[:-1], x.shape[-1] // 16)
+            return scales, torch.zeros_like(scales)
         if triton is not None and groups.is_cuda:
             _scalesweep_scale_kernel[(triton.cdiv(groups.shape[0], 16),)](
                 groups, importance if weighted else groups, inverse_global, result,

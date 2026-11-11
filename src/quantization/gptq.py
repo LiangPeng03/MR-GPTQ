@@ -6,6 +6,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.modules.conv import _ConvNd
 from transformers import AutoModelForCausalLM
 
@@ -143,7 +144,15 @@ class GPTQ:
         if self.quantizer.observer == QuantizationObserver.SCALESWEEP_WMSE:
             diagonal = self.H.diag().clone()
             self.quantizer.importance = diagonal + self.rel_damp * diagonal.mean()
-        scales, zeros = self.quantizer.get_quantization_params(self.W) 
+            if getattr(self.quantizer, "_use_group_hessian", False):
+                indices = torch.arange(d_col, device=device).reshape(-1, group_size)
+                blocks = self.H[indices[:, :, None], indices[:, None, :]].clone()
+                blocks.diagonal(dim1=-2, dim2=-1).add_(self.rel_damp * diagonal.mean())
+                self.quantizer.group_hessian = blocks
+        try:
+            scales, zeros = self.quantizer.get_quantization_params(self.W)
+        finally:
+            self.quantizer.group_hessian = None
         # Dirty hack for GPTQ quantization
         self.quantizer.group_size = None
         # Get permutation
@@ -225,6 +234,105 @@ class GPTQ:
         self.quantization_pre_step()
         return self.step()
 
+
+@torch.no_grad()
+def select_nada_global_scales(handles, samples):
+    """Jointly select one group scale on calibration output error after GPTQ.
+
+    Samples are transformed inputs to the linear layers, captured before their
+    activation quantizers. Candidate evaluation uses the actual frozen LSS and
+    GPTQ+WMSE quantizers, and leaves all GPTQ/Hessian state unchanged.
+    """
+    bounds = (256, 320, 384, 448)
+    maxima = [handle.W.detach().abs().amax().float().reshape(1) for handle in handles]
+    if any(not torch.isfinite(maximum).all() for maximum in maxima):
+        raise ValueError("Non-finite weights in NADA global-scale selection")
+    prepared = []
+    for handle, chunks in zip(handles, samples):
+        if not chunks or handle.H is None or handle.layer.act_quantizer is None:
+            raise ValueError("Global-scale selection needs calibration inputs, Hessian and LSS")
+        x = torch.cat(chunks, dim=0).to(handle.W.device)
+        aq = handle.layer.act_quantizer
+        if aq._track_global_scale:
+            raise RuntimeError("Freeze activation global scales before selecting weights")
+        a_scale, a_zero = aq.get_quantization_params(x)
+        xq = aq(x, a_scale, a_zero)
+        reference = F.linear(x.float(), handle.W.detach().float())
+        prepared.append((xq.float(), reference))
+
+    losses = []
+    original = [(h.W, h.H, h.quantizer.global_scale, h.quantizer.importance,
+                 h.quantizer.group_size, h.quantizer._track_global_scale)
+                for h in handles]
+    try:
+        for bound in bounds:
+            # The same inverse global scale is shared by all fused projections.
+            global_scale = torch.stack([
+                torch.where(m > 0, bound * FP4_E2M1_MAX / m, torch.ones_like(m))
+                for m in maxima
+            ]).min(dim=0).values
+            loss = 0.0
+            for handle, state, (xq, reference) in zip(handles, original, prepared):
+                weight, hessian, _, _, _, _ = state
+                handle.W = weight
+                handle.H = hessian.clone()
+                handle.quantizer.global_scale = global_scale
+                handle.quantizer._track_global_scale = False
+                quantized_weight, _, _ = handle.quantize()
+                error = F.linear(xq, quantized_weight.float()) - reference
+                loss += error.square().sum().item()
+            losses.append(loss)
+    finally:
+        for handle, state in zip(handles, original):
+            (handle.W, handle.H, handle.quantizer.global_scale,
+             handle.quantizer.importance, handle.quantizer.group_size,
+             handle.quantizer._track_global_scale) = state
+
+    if not all(math.isfinite(loss) for loss in losses):
+        raise ValueError(f"Non-finite NADA global-scale losses: {losses}")
+    best = min(range(len(bounds)), key=losses.__getitem__)
+    selected = torch.stack([
+        torch.where(m > 0, bounds[best] * FP4_E2M1_MAX / m, torch.ones_like(m))
+        for m in maxima
+    ]).min(dim=0).values
+    for handle in handles:
+        handle.quantizer.global_scale = selected
+        handle.quantizer._track_global_scale = False
+    return bounds[best], losses
+
+
+@torch.no_grad()
+def select_bitr_power(x, weight, scale):
+    """Select one offline power using signed calibration linear-output error.
+
+    Uses NVFP4 WMSE weight QDQ and LSS activation QDQ before GPTQ; the final
+    GPTQ pass and serialized transform remain unchanged.
+    """
+    indices = torch.linspace(0, x.shape[0] - 1, min(256, x.shape[0]),
+                             device=x.device).long()
+    x = x[indices].to(torch.bfloat16)
+    weight = weight.to(torch.bfloat16)
+    scale = scale.float().clamp_min(1e-8)
+    reference = F.linear(x.float(), weight.float())
+    options, errors = (1.0, 0.75, 0.5), []
+    kwargs = dict(bits=4, format="nvfp", granularity="group", group_size=16,
+                  scale_precision="e4m3")
+    for power in options:
+        factor = scale.pow(power)
+        x_scaled = (x.float() * factor).to(x.dtype)
+        w_scaled = (weight.float() / factor).to(weight.dtype)
+        aq = Quantizer(observer="lss", **kwargs)
+        a_scale, a_zero = aq.get_quantization_params(x_scaled)
+        xq = aq(x_scaled, a_scale, a_zero)
+        wq = Quantizer(observer="scalesweep_wmse", global_scale_max=448, **kwargs)
+        wq.importance = x_scaled.float().square().mean(0)
+        w_scale, w_zero = wq.get_quantization_params(w_scaled)
+        qw = wq(w_scaled, w_scale, w_zero)
+        errors.append((F.linear(xq.float(), qw.float()) - reference).square().mean().item())
+    if not all(math.isfinite(error) for error in errors):
+        raise ValueError(f"Non-finite BITR power-search errors: {errors}")
+    best = min(range(len(options)), key=errors.__getitem__)
+    return scale.pow(options[best]), options[best], errors
 
 @torch.no_grad()
 def permuquant_llm_permutations(block, input_args, input_kwargs, args, device, head_dim):
@@ -473,7 +581,8 @@ def gptq_quantization(
                                 temp_transform = build_transform(args.transform_class, size=val.shape[-1], **transform_kwargs).to(val.device)
                                 val = temp_transform(val)
                                 
-                            act_caches[name].append(val.abs().cpu().view(-1, val.shape[-1]))
+                            cached = val if getattr(args, "bitr_power_search", False) else val.abs()
+                            act_caches[name].append(cached.cpu().view(-1, val.shape[-1]))
                     return _hook
 
                 resort_hooks.append(block.self_attn.q_proj.register_forward_hook(hook_factory("qkv")))
@@ -773,7 +882,9 @@ def gptq_quantization(
                 device = X_abs_T.device
                 grid_mults = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device, dtype=torch.float32)
                 
-                def compute_loss_distances(all_ch_abs, ref_ch_abs, chunk_size=256, c_weights=None):
+                weighted_proxy = getattr(args, "dacc_weighted_proxy", False)
+
+                def compute_loss_distances(all_ch_abs, ref_ch_abs, chunk_size=256, c_weights=None, ref_weight=None):
                     ref = ref_ch_abs.unsqueeze(0)
                     n_ch = all_ch_abs.shape[0]
                     losses = torch.zeros(n_ch, device=device, dtype=torch.float32)
@@ -786,11 +897,14 @@ def gptq_quantization(
                         diff = (p_min.unsqueeze(-1) - grid).abs()
                         min_q = grid.gather(-1, diff.argmin(-1, keepdim=True)).squeeze(-1)
                         mse = (p_min - min_q) ** 2
+                        if weighted_proxy:
+                            weights = torch.where(chunk <= ref, c_weights[i:i+chunk_size, None], ref_weight)
+                            mse = mse * weights
                         if act_alpha > 0.0:
                             act_weight = p_min.abs() ** act_alpha
                             mse = mse * act_weight
                         mse = mse.sum(dim=1)
-                        if c_weights is not None:
+                        if c_weights is not None and not weighted_proxy:
                             mse = mse * c_weights[i:i+chunk_size]
                         losses[i:i+chunk_size] = mse
                     return losses
@@ -819,14 +933,14 @@ def gptq_quantization(
                             new_seed = candidates.argmax().item()
                         seed_order.append(new_seed)
                         selected[new_seed] = True
-                        dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed], c_weights=channel_weights)
+                        dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed], c_weights=channel_weights, ref_weight=channel_weights[new_seed] if weighted_proxy else None)
                         min_dist = dists if k == 0 else torch.minimum(min_dist, dists)
                 elif seed_strategy == "max_sum":
                     # Cumulative-loss max-sum dispersion (the production default).
                     accumulated_dist = torch.zeros(dim, device=device, dtype=torch.float32)
                     seed_order.append(first_seed)
                     accumulated_dist[first_seed] = -float('inf')
-                    dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed], c_weights=channel_weights)
+                    dists = compute_loss_distances(X_abs_T, X_abs_T[first_seed], c_weights=channel_weights, ref_weight=channel_weights[first_seed] if weighted_proxy else None)
                     accumulated_dist += dists
                     accumulated_dist[first_seed] = -float('inf')
 
@@ -834,13 +948,15 @@ def gptq_quantization(
                         new_seed = accumulated_dist.argmax().item()
                         seed_order.append(new_seed)
                         accumulated_dist[new_seed] = -float('inf')
-                        dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed], c_weights=channel_weights)
+                        dists = compute_loss_distances(X_abs_T, X_abs_T[new_seed], c_weights=channel_weights, ref_weight=channel_weights[new_seed] if weighted_proxy else None)
                         accumulated_dist += dists
                 else:
                     raise ValueError(f"Unsupported channel_seed_strategy: {seed_strategy}")
 
                 opt_groups = [[s] for s in seed_order]
                 group_maxes = X_abs_T[seed_order].clone()
+                group_max_weights = (channel_weights[seed_order, None].expand_as(group_maxes).clone()
+                                     if weighted_proxy else None)
                 group_sizes = torch.ones(n_groups, device=device, dtype=torch.long)
                 seed_set = set(seed_order)
                 remaining = [c for c in range(dim) if c not in seed_set]
@@ -860,10 +976,18 @@ def gptq_quantization(
                         grid = scale.unsqueeze(-1) * grid_mults
                         diff = (p_min.unsqueeze(-1) - grid).abs()
                         min_q = grid.gather(-1, diff.argmin(-1, keepdim=True)).squeeze(-1)
-                        losses[i:i+256] = ((p_min - min_q) ** 2).sum(dim=1)
+                        mse = (p_min - min_q) ** 2
+                        if weighted_proxy:
+                            weights = torch.where(ref <= g_chunk, channel_weights[c],
+                                                  group_max_weights[i:i+256])
+                            mse = mse * weights
+                        losses[i:i+256] = mse.sum(dim=1)
                     losses[group_sizes >= group_size] = float('inf')
                     best_g = losses.argmin().item()
                     opt_groups[best_g].append(c)
+                    if weighted_proxy:
+                        group_max_weights[best_g] = torch.where(
+                            c_abs > group_maxes[best_g], channel_weights[c], group_max_weights[best_g])
                     group_maxes[best_g] = torch.maximum(group_maxes[best_g], c_abs)
                     group_sizes[best_g] += 1
                 
@@ -1061,6 +1185,10 @@ def gptq_quantization(
                         num_rounds = getattr(args, "channel_rescale_rounds", 3)
                         print(f"    [{name:8}] Running Coordinate Descent Channel Scale Search (top_k={top_k}, num_rounds={num_rounds})...")
                         S_top3 = run_channel_rescale(X_perm, W_perm, group_size=quant_group_size, top_k=top_k, num_rounds=num_rounds, weight_mse_ratio=1)
+                        if getattr(args, "bitr_power_search", False):
+                            S_top3, power, errors = select_bitr_power(X_perm, W_perm, S_top3)
+                            print(f"    [BITR POWER SEARCH] group={name} powers=1,0.75,0.5 "
+                                  f"selected={power} pre_gptq_output_mse={errors}")
                         
                         if not hasattr(block, "gics_scales"):
                             block.gics_scales = {}
@@ -1211,6 +1339,7 @@ def gptq_quantization(
         # 4. Create GPTQ handles and hooks
         gptq_handles = {}
         hooks = {}
+        global_sweep_samples = {}
         for layer_name, layer in block.named_modules():
             if isinstance(layer, QLinear):
                 # Create GPTQ handle
@@ -1221,6 +1350,9 @@ def gptq_quantization(
                     rel_damp=args.rel_damp,
                     export_quantized_model=args.export_quantized_model
                 )
+                if gptq_handles[layer_name].quantizer is not None:
+                    gptq_handles[layer_name].quantizer._use_group_hessian = getattr(
+                        args, "weight_group_hessian", False)
                 
                 # Update weight reference in handle (since it was just rotated)
                 gptq_handles[layer_name].W = layer.weight.data.clone()
@@ -1267,6 +1399,13 @@ def gptq_quantization(
                 def update_handle_hook(name):
                     def _hook(_, inp, out):
                         x = inp[0]
+                        if getattr(args, "nada_global_sweep", False):
+                            flat = x.detach().reshape(-1, x.shape[-1])
+                            # Two deterministic interior tokens per calibration sequence.
+                            positions = [flat.shape[0] // 3, (2 * flat.shape[0]) // 3]
+                            global_sweep_samples.setdefault(name, []).append(
+                                flat[positions].cpu()
+                            )
                         if getattr(args, "awq", 0) > 0 or getattr(args, "gajs", False):
                             block._layer_inputs[name].append(x.cpu())
                         else:
@@ -1421,6 +1560,24 @@ def gptq_quantization(
             if isinstance(layer, QLinear):
                 if layer.act_quantizer:
                     layer.act_quantizer._track_global_scale = False
+
+        if getattr(args, "nada_global_sweep", False):
+            groups = (
+                ("qkv", ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")),
+                ("o", ("self_attn.o_proj",)),
+                ("gate_up", ("mlp.gate_proj", "mlp.up_proj")),
+                ("down", ("mlp.down_proj",)),
+            )
+            for group_name, names in groups:
+                selected_bound, losses = select_nada_global_scales(
+                    [gptq_handles[name] for name in names],
+                    [global_sweep_samples[name] for name in names],
+                )
+                print(f"[NADA GLOBAL SWEEP] block={block_idx} group={group_name} "
+                      f"tokens={sum(len(x) for x in global_sweep_samples[names[0]])} "
+                      f"bounds=256,320,384,448 selected={selected_bound} "
+                      f"output_sse={losses}", flush=True)
+            del global_sweep_samples
 
         # 7. Run GPTQ quantization (Already aligned) — skip if weight is not quantized (w_bits >= 16)
         if weight_quantizer_kwargs is not None:

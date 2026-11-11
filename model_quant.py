@@ -393,6 +393,18 @@ def parse_args():
         "--nada_wmse", choices=["weight", "weight_activation"], default=None,
         help="NADA hybrid: ScaleSweep-WMSE weights, optionally weighted activation LSS; preserve global bound 448.",
     )
+    parser.add_argument(
+        "--nada_global_sweep", action="store_true",
+        help="Select shared weight global scales from 256,320,384,448 using calibration output error.",
+    )
+    parser.add_argument(
+        "--bitr_power_search", action="store_true",
+        help="Select BITR S, S**0.75 or S**0.5 using signed calibration output error.",
+    )
+    parser.add_argument(
+        "--weight_group_hessian", action="store_true",
+        help="Score WMSE weight-scale candidates using full group-16 Hessian blocks.",
+    )
     parser.add_argument("--scalesearch", action="store_true",
                         help="ScaleSearch Algorithm 1: nearest E4M3 base, offsets [-2,6], W/A MSE.")
     parser.add_argument("--permuquant", action="store_true",
@@ -513,6 +525,10 @@ def parse_args():
         type=float,
         default=0.0,
         help="Alpha parameter for weighting K-means FP4 loss by activation magnitude itself.",
+    )
+    parser.add_argument(
+        "--dacc_weighted_proxy", action="store_true",
+        help="Weight DACC pairwise proxy by the sensitivity of the channel actually incurring the error.",
     )
     parser.add_argument(
         "--outlier_ratio",
@@ -678,6 +694,22 @@ def parse_args():
         args.a_observer = "lss_wmse" if args.nada_wmse == "weight_activation" else "lss"
         print(f"[NADA WMSE] mode={args.nada_wmse} W={args.w_observer} "
               f"A={args.a_observer} global_bound=448")
+    if args.nada_global_sweep and (
+        args.nada_wmse != "weight" or not args.fuse_global_scale
+        or args.lock_global_scale or args.export_quantized_model
+        or args.validate_realquant_export
+    ):
+        parser.error("--nada_global_sweep currently requires --nada_wmse weight "
+                     "and --fuse_global_scale; calibration/PPL only, without export.")
+    if args.dacc_weighted_proxy and (args.channel_resort != "channel_cluster"
+                                     or args.kmeans_alpha <= 0):
+        parser.error("--dacc_weighted_proxy requires channel_cluster and positive --kmeans_alpha.")
+    if args.bitr_power_search and (args.nada_wmse != "weight"
+                                   or args.channel_resort != "channel_cluster"
+                                   or args.channel_rescale != "gics"):
+        parser.error("--bitr_power_search requires --nada_wmse weight, channel_cluster and gics.")
+    if args.weight_group_hessian and args.nada_wmse != "weight":
+        parser.error("--weight_group_hessian requires --nada_wmse weight.")
     if args.a_observer == "lss_wmse" and (args.export_quantized_model or args.validate_realquant_export):
         parser.error("Weighted activation LSS is HF PPL-only for now; its deployment kernel is not implemented.")
     if args.permuquant:
