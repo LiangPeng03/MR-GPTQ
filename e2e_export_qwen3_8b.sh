@@ -61,6 +61,9 @@ COMMON_ARGS=(
     --export_quantized_model realquant
     --save_path "$SAVE_PATH"
 )
+if [[ "${VALIDATE_EXPORT:-0}" == "1" ]]; then
+    COMMON_ARGS+=(--validate_realquant_export)
+fi
 
 case "$METHOD" in
     rtn)
