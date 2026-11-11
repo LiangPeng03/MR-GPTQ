@@ -170,6 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow vLLM compilation/CUDA Graph instead of enforce_eager mode.",
     )
     parser.add_argument(
+        "--decode-cudagraph-only",
+        action="store_true",
+        help="Disable torch.compile and capture full decode CUDA Graphs only.",
+    )
+    parser.add_argument(
         "--reference-method",
         default="gptq",
         help="Method used for the relative comparison CSV (default: gptq).",
@@ -193,6 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.enable_cudagraph and args.decode_cudagraph_only:
+        raise ValueError("Choose --enable-cudagraph or --decode-cudagraph-only, not both")
     if args.input_tokens <= 0 or args.output_tokens <= 0:
         raise ValueError("input/output token counts must be positive")
     if args.warmups < 0 or args.repeats < 1:
@@ -265,6 +272,8 @@ def child_command(
         command.extend(["--plugin-module", args.plugin_module])
     if args.enable_cudagraph:
         command.append("--enable-cudagraph")
+    if args.decode_cudagraph_only:
+        command.append("--decode-cudagraph-only")
     return command
 
 
@@ -408,6 +417,15 @@ def child_main(args: argparse.Namespace) -> int:
     idle = monitor.sample_once()
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=False)
     max_model_len = args.input_tokens + args.output_tokens
+    graph_enabled = args.enable_cudagraph or args.decode_cudagraph_only
+    compilation_kwargs = {}
+    if args.decode_cudagraph_only:
+        # Keep eager kernels/numerical boundaries, but remove Python/kernel
+        # launch overhead on decode using full-model CUDA Graph replay.
+        compilation_kwargs["compilation_config"] = {
+            "level": 0,
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+        }
 
     monitor.start()
     load_started = time.perf_counter()
@@ -420,13 +438,22 @@ def child_main(args: argparse.Namespace) -> int:
         max_num_seqs=max(args.batch_sizes),
         max_num_batched_tokens=args.max_num_batched_tokens,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=not args.enable_cudagraph,
+        enforce_eager=not graph_enabled,
         enable_prefix_caching=False,
         disable_log_stats=True,
         seed=args.seed,
+        **compilation_kwargs,
     )
     load_seconds = time.perf_counter() - load_started
     load_nvml = monitor.stop()
+    if args.decode_cudagraph_only:
+        effective = llm.llm_engine.vllm_config.compilation_config
+        print(
+            f"DECODE_GRAPH_CONFIG level={effective.level} mode={effective.cudagraph_mode}",
+            flush=True,
+        )
+        if effective.level != 0 or not effective.cudagraph_mode.has_full_cudagraphs():
+            raise RuntimeError("Decode-only CUDA Graph configuration was not enabled as requested")
     post_load = monitor.sample_once()
 
     smoke_output = None
@@ -577,8 +604,10 @@ def child_main(args: argparse.Namespace) -> int:
             "temperature": 0,
             "ignore_eos": True,
             "prefix_cache": False,
-            "enforce_eager": not args.enable_cudagraph,
-            "cudagraph_enabled": args.enable_cudagraph,
+            "enforce_eager": not graph_enabled,
+            "cudagraph_enabled": graph_enabled,
+            "decode_cudagraph_only": args.decode_cudagraph_only,
+            "compilation_config": compilation_kwargs.get("compilation_config"),
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "nvml_interval_ms": args.nvml_interval_ms,
