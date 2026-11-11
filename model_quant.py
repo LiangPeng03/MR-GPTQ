@@ -405,6 +405,10 @@ def parse_args():
         "--weight_group_hessian", action="store_true",
         help="Score WMSE weight-scale candidates using full group-16 Hessian blocks.",
     )
+    parser.add_argument("--nada_diagnostics", type=str, default=None,
+                        help="Output directory for fixed-weight activation and post-GPTQ scale diagnostics.")
+    parser.add_argument("--nada_refit_groups", type=int, default=8,
+                        help="Maximum weight groups per linear layer updated in one refit sweep.")
     parser.add_argument("--scalesearch", action="store_true",
                         help="ScaleSearch Algorithm 1: nearest E4M3 base, offsets [-2,6], W/A MSE.")
     parser.add_argument("--permuquant", action="store_true",
@@ -710,6 +714,16 @@ def parse_args():
         parser.error("--bitr_power_search requires --nada_wmse weight, channel_cluster and gics.")
     if args.weight_group_hessian and args.nada_wmse != "weight":
         parser.error("--weight_group_hessian requires --nada_wmse weight.")
+    if args.nada_diagnostics and (
+        args.nada_wmse != "weight" or not args.eval_perplexity or args.eval_openllm
+        or args.export_quantized_model or args.validate_realquant_export or args.compile
+        or args.cpu_offload_eval or args.amp or args.num_sequences < 4
+        or args.nada_refit_groups < 1 or args.nada_global_sweep
+        or args.bitr_power_search or args.weight_group_hessian or args.dacc_weighted_proxy
+    ):
+        parser.error("--nada_diagnostics requires clean --nada_wmse weight PPL evaluation, "
+                     "at least 4 calibration sequences and positive refit groups; "
+                     "no export, AMP, compile, CPU-offload evaluation or other ablations.")
     if args.a_observer == "lss_wmse" and (args.export_quantized_model or args.validate_realquant_export):
         parser.error("Weighted activation LSS is HF PPL-only for now; its deployment kernel is not implemented.")
     if args.permuquant:
@@ -1021,6 +1035,11 @@ def main():
 
     wikitext2_ppl = None
     c4_ppl = None
+
+    if args.nada_diagnostics:
+        from src.quantization.nada_diagnostics import run_diagnostics
+        run_diagnostics(model, tokenizer, args)
+        return
 
     if args.eval_perplexity:
         eval_data = get_wikitext2(tokenizer, args.sequence_length)

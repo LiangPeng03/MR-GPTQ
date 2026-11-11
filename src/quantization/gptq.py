@@ -1335,6 +1335,11 @@ def gptq_quantization(
             [block.mlp.down_proj],
         ):
             set_scalesweep_activation_importance(linears)
+            if getattr(args, "nada_diagnostics", None):
+                importance = sum(layer.weight.detach().float().square().sum(0)
+                                 for layer in linears) / sum(layer.weight.shape[0] for layer in linears)
+                for layer in linears:
+                    layer._nada_diag_importance = importance.cpu()
 
         # 4. Create GPTQ handles and hooks
         gptq_handles = {}
@@ -1399,7 +1404,8 @@ def gptq_quantization(
                 def update_handle_hook(name):
                     def _hook(_, inp, out):
                         x = inp[0]
-                        if getattr(args, "nada_global_sweep", False):
+                        if (getattr(args, "nada_global_sweep", False)
+                                or getattr(args, "nada_diagnostics", None)):
                             flat = x.detach().reshape(-1, x.shape[-1])
                             # Two deterministic interior tokens per calibration sequence.
                             positions = [flat.shape[0] // 3, (2 * flat.shape[0]) // 3]
@@ -1595,8 +1601,23 @@ def gptq_quantization(
                 block_export_max_mean_abs = 0.0
 
             for layer_name, gptq_handle in gptq_handles.items():
-                dequantized_qweight, qweight, scales = gptq_handle.quantize()
+                diagnostic = bool(getattr(args, "nada_diagnostics", None))
+                original_export = gptq_handle.export_quantized_model
+                if diagnostic:
+                    gptq_handle.export_quantized_model = "realquant"
+                try:
+                    dequantized_qweight, qweight, scales = gptq_handle.quantize()
+                finally:
+                    gptq_handle.export_quantized_model = original_export
                 orig_weight = gptq_handle.layer.weight
+                if diagnostic:
+                    gptq_handle.layer._nada_diag = {
+                        "codes": pack_fp4_to_uint8(qweight).cpu(),
+                        "scales": scales.detach().float().cpu(),
+                        "global_scale": gptq_handle.quantizer.global_scale.detach().float().cpu(),
+                        "reference_weight": orig_weight.detach().cpu().clone(),
+                        "samples": global_sweep_samples.pop(layer_name),
+                    }
                 with torch.no_grad():
                     relative_mse_error = get_relative_mse_error(dequantized_qweight.float(), orig_weight.float(), gptq_handle.H)
                 print(f"[{layer_name:16}]: Relative MSE error: {relative_mse_error.item():.2e}")
