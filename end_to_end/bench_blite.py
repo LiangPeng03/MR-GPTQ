@@ -11,6 +11,97 @@ from vllm._custom_ops import (
     permute_and_scale_cols,
 )
 
+
+def validate_and_benchmark_nada_fast():
+    """Compare actual packed outputs and CUDA Graph latency against legacy LSS."""
+    from vllm._custom_ops import nvfp4_lss_quant_permute_scale_cutlass
+    from vllm.model_executor.layers.quantization import fp_quant
+    from vllm.model_executor.layers.quantization.qutlass_utils import to_blocked
+
+    def graph_time(function):
+        for _ in range(5):
+            function()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = function()
+        for _ in range(10):
+            graph.replay()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(100):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        elapsed = start.elapsed_time(end) / 100
+        del graph, result
+        return elapsed
+
+    torch.manual_seed(0)
+    print("GPU:", torch.cuda.get_device_name(0), flush=True)
+    print("vLLM:", fp_quant.__file__, flush=True)
+    for channels in (2048, 4096, 14336):
+        perm = torch.randperm(channels, device="cuda")
+        perm32 = perm.to(torch.int32)
+        rescale = torch.linspace(0.5, 1.5, channels, device="cuda").bfloat16()
+        a_gs = torch.tensor([64.0], device="cuda")
+        w_gs = torch.tensor([64.0], device="cuda")
+        alpha = 1.0 / (a_gs * w_gs)
+        weight = torch.randn(256, channels, device="cuda", dtype=torch.bfloat16)
+        qw, ws = nvfp4_lss_quant_identity(weight, w_gs)
+        ws = ws[:256, :channels // 16].view(torch.uint8).contiguous()
+        blocked_ws = to_blocked(ws).view(torch.float8_e4m3fn).reshape(-1, channels // 16)
+        bias = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+        hadamard = torch.eye(16, device="cuda", dtype=torch.bfloat16)
+        for rows in (1, 16, 128, 512):
+            x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16)
+            if rows == 16:
+                x[:4] = 0
+                x[4:8] *= 1e4
+                x[8:12] *= 1e-4
+            old_q, old_s = nvfp4_lss_quant_permute_scale(x, perm, rescale, a_gs)
+            new_q, new_s = nvfp4_lss_quant_permute_scale_cutlass(x, perm32, rescale, a_gs)
+            row = torch.arange(rows, device="cuda")[:, None]
+            group = torch.arange(channels // 16, device="cuda")[None, :]
+            positions = (
+                ((row // 128) * (channels // 64) + group // 4) * 512
+                + (row % 32) * 16 + ((row % 128) // 32) * 4 + group % 4
+            )
+            assert torch.equal(old_q, new_q[:rows]), (channels, rows, "FP4 codes")
+            assert torch.equal(
+                old_s[:rows, :channels // 16].view(torch.uint8),
+                new_s.view(torch.uint8).flatten()[positions],
+            ), (channels, rows, "E4M3 scales")
+
+            def legacy():
+                return fp_quant.quantized_forward(
+                    x, qw, ws, w_gs, a_gs, bias,
+                    hadamard,
+                    "lss", "nvfp4", perm, rescale,
+                )
+
+            def fast():
+                return fp_quant.nada_fast_forward(
+                    x, qw, blocked_ws, alpha, perm32, rescale, a_gs, bias,
+                )
+
+            expected, actual = legacy(), fast()
+            assert torch.equal(expected, actual), (channels, rows, "GEMM output")
+            old_ms, new_ms = graph_time(legacy), graph_time(fast)
+            print(
+                f"NADA_FAST_OK K={channels} M={rows} "
+                f"legacy_ms={old_ms:.6f} fast_ms={new_ms:.6f} "
+                f"speedup={old_ms / new_ms:.3f}x",
+                flush=True,
+            )
+    print("ALL NADA FAST CHECKS PASSED", flush=True)
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "nada-fast":
+    validate_and_benchmark_nada_fast()
+    raise SystemExit(0)
+
 model_dir = sys.argv[1]
 index = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
 key = next(k for k in index["weight_map"] if k.endswith("input_perm"))
