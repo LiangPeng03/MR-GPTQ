@@ -102,6 +102,93 @@ if len(sys.argv) > 1 and sys.argv[1] == "nada-fast":
     validate_and_benchmark_nada_fast()
     raise SystemExit(0)
 
+
+def validate_nada_checkpoint(model_dir):
+    """Compare real fused QKV/gate-up parameters at their calibrated scales."""
+    from vllm._custom_ops import nvfp4_lss_quant_permute_scale_cutlass
+    from vllm.model_executor.layers.quantization import fp_quant
+    from vllm.model_executor.layers.quantization.qutlass_utils import to_blocked
+    from pathlib import Path
+
+    root = Path(model_dir)
+    mapping = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
+
+    def load(key):
+        with safe_open(root / mapping[key], framework="pt", device="cpu") as shard:
+            return shard.get_tensor(key).cuda().contiguous()
+
+    config = json.loads((root / "config.json").read_text())
+    torch.manual_seed(0)
+    for layer in sorted({0, (config["num_hidden_layers"] - 1) // 2,
+                         config["num_hidden_layers"] - 1}):
+        for name, modules in (
+            ("qkv", ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")),
+            ("o", ("self_attn.o_proj",)),
+            ("gate_up", ("mlp.gate_proj", "mlp.up_proj")),
+            ("down", ("mlp.down_proj",)),
+        ):
+            prefixes = [f"model.layers.{layer}.{module}" for module in modules]
+            perm = load(prefixes[0] + ".input_perm")
+            rescale = load(prefixes[0] + ".input_rescale")
+            a_gs = load(prefixes[0] + ".act_global_scale")
+            w_gs = load(prefixes[0] + ".weight_global_scale")
+            for prefix in prefixes[1:]:
+                for suffix, reference in (
+                    ("input_perm", perm), ("input_rescale", rescale),
+                    ("act_global_scale", a_gs), ("weight_global_scale", w_gs),
+                ):
+                    # Some exports store shared transforms only on q_proj/gate_proj.
+                    if prefix + "." + suffix not in mapping:
+                        if suffix in {"input_perm", "input_rescale"}:
+                            continue
+                        raise KeyError(prefix + "." + suffix)
+                    assert torch.equal(load(prefix + "." + suffix), reference), (
+                        layer, name, "fused parameter mismatch", suffix
+                    )
+            weight = torch.cat([load(prefix + ".qweight") for prefix in prefixes])
+            scales = torch.cat([load(prefix + ".scales") for prefix in prefixes])
+            channels = weight.shape[1] * 2
+            blocked = to_blocked(scales).view(torch.float8_e4m3fn).reshape(-1, channels // 16)
+            perm32 = perm.int()
+            alpha = 1.0 / (a_gs * w_gs)
+            hadamard = torch.eye(16, device="cuda", dtype=torch.bfloat16)
+            for rows in (1, 2, 8, 16, 64, 128, 512):
+                x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16)
+                old_q, old_s = nvfp4_lss_quant_permute_scale(x, perm, rescale, a_gs)
+                new_q, new_s = nvfp4_lss_quant_permute_scale_cutlass(x, perm32, rescale, a_gs)
+                r = torch.arange(rows, device="cuda")[:, None]
+                g = torch.arange(channels // 16, device="cuda")[None, :]
+                positions = (
+                    ((r // 128) * (channels // 64) + g // 4) * 512
+                    + (r % 32) * 16 + ((r % 128) // 32) * 4 + g % 4
+                )
+                assert torch.equal(old_q, new_q[:rows]), (layer, name, rows, "FP4 codes")
+                assert torch.equal(
+                    old_s[:rows, :channels // 16].view(torch.uint8),
+                    new_s.view(torch.uint8).flatten()[positions],
+                ), (layer, name, rows, "FP8 scales")
+                expected = fp_quant.quantized_forward(
+                    x, weight, scales, w_gs, a_gs, None, hadamard,
+                    "lss", "nvfp4", perm, rescale,
+                )
+                actual = fp_quant.nada_fast_forward(
+                    x, weight, blocked, alpha, perm32, rescale, a_gs, None,
+                )
+                equal = torch.equal(expected, actual)
+                maximum = (expected.float() - actual.float()).abs().max().item()
+                print(
+                    f"REAL_NADA layer={layer} group={name} M={rows} "
+                    f"N={weight.shape[0]} K={channels} equal={equal} max_abs={maximum}",
+                    flush=True,
+                )
+                assert equal, (layer, name, rows, "GEMM output")
+    print("ALL REAL CHECKPOINT LAYER CHECKS PASSED", flush=True)
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "nada-real":
+    validate_nada_checkpoint(sys.argv[2])
+    raise SystemExit(0)
+
 model_dir = sys.argv[1]
 index = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
 key = next(k for k in index["weight_map"] if k.endswith("input_perm"))
