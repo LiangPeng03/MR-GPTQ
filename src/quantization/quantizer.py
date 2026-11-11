@@ -124,7 +124,8 @@ class Quantizer:
         dim: int = -1,
         group_size: Optional[int] = None,
         scale_precision: str = "fp16",
-        scale_min_clip: Optional[float] = None
+        scale_min_clip: Optional[float] = None,
+        global_scale_max: Optional[float] = None,
     ):
         # Sanity checks
         if format in ["fp", "nvfp", "mxfp"]:
@@ -151,11 +152,24 @@ class Quantizer:
         self.importance = None
         self._scalesweep_checked_importance = None
         self._scalesweep_checked_global = None
+        self._wlss_importance_cache = None
         self.global_scale_max = (
             256 if self.observer in {QuantizationObserver.SCALESWEEP_MSE,
                                     QuantizationObserver.SCALESWEEP_WMSE}
             else FP8_E4M3_MAX
         )
+        if global_scale_max is not None:
+            if (self.format != QuantizationFormat.NVFP
+                    or not 0 < float(global_scale_max) <= FP8_E4M3_MAX):
+                raise ValueError("global_scale_max must be in (0, 448] for NVFP4.")
+            self.global_scale_max = float(global_scale_max)
+        if self.observer == QuantizationObserver.LSS_WMSE and (
+            self.format != QuantizationFormat.NVFP or self.bits != 4
+            or not self.symmetric or self.group_size != 16 or self.dim != -1
+            or self.granularity != QuantizationGranularity.GROUP
+            or self.scale_precision != ScalePrecision.E4M3
+        ):
+            raise ValueError("Weighted LSS requires symmetric NVFP4 group-16/E4M3.")
         if self.is_scalesweep and (
             self.format != QuantizationFormat.NVFP or self.bits != 4
             or not self.symmetric or self.group_size != 16 or self.dim != -1
@@ -271,7 +285,7 @@ class Quantizer:
                     if not self.symmetric:
                         zeros[improved_ids] = candidate_zeros[improved_ids]
 
-        elif self.observer == QuantizationObserver.LSS:
+        elif self.observer in {QuantizationObserver.LSS, QuantizationObserver.LSS_WMSE}:
             if not self.symmetric:
                 raise NotImplementedError("LSS observer only supports symmetric quantization.")
             abs_x = x.abs()
@@ -283,8 +297,18 @@ class Quantizer:
             g = self.quant_fn(abs_x, s_0, zeros, self.q_min, self.q_max)
             g = g.abs() # Ensure positive grid values
             
-            num = (abs_x * g).sum(dim=reduce_dim, keepdim=True)
-            den = (g * g).sum(dim=reduce_dim, keepdim=True)
+            if self.observer == QuantizationObserver.LSS_WMSE:
+                width = x.shape[-2] * self.group_size
+                importance = self._wlss_importance(width, x.device)
+                # Preserve the original LSS BF16 product/sum boundaries. With
+                # uniform importance this is exactly the existing LSS formula.
+                num = ((abs_x * g).float() * importance).sum(
+                    dim=reduce_dim, keepdim=True).to(x.dtype)
+                den = ((g * g).float() * importance).sum(
+                    dim=reduce_dim, keepdim=True).to(x.dtype)
+            else:
+                num = (abs_x * g).sum(dim=reduce_dim, keepdim=True)
+                den = (g * g).sum(dim=reduce_dim, keepdim=True)
             
             den_zero = (den == 0)
             den[den_zero] = 1.0
@@ -392,6 +416,30 @@ class Quantizer:
             raise ValueError(f"Scales are not finite.")
       
         return scales, zeros
+
+    def _wlss_importance(self, width, device):
+        """Frozen weight-column second moments in the transformed coordinates."""
+        if self.importance is None:
+            raise ValueError("Weighted LSS requires calibrated channel importance.")
+        cached = self._wlss_importance_cache
+        if (cached is not None and cached[0] is self.importance
+                and cached[1] == device and cached[2].numel() == width):
+            return cached[2]
+        weights = self.importance.detach().to(device=device, dtype=torch.float32)
+        if weights.numel() != width:
+            raise ValueError("Weighted LSS importance must match the input width.")
+        if not torch.isfinite(weights).all() or (weights < 0).any():
+            raise ValueError("Weighted LSS importance must be finite and nonnegative.")
+        weights = weights.reshape(-1, self.group_size)
+        maximum = weights.amax(-1, keepdim=True)
+        # Groupwise normalization cancels in the LS ratio and bounds products.
+        # A zero-importance group has no preferred scale: fall back to LSS.
+        weights = torch.where(
+            maximum > 0, weights / maximum.clamp_min(torch.finfo(torch.float32).tiny),
+            torch.ones_like(weights),
+        ).contiguous()
+        self._wlss_importance_cache = (self.importance, device, weights)
+        return weights
 
     @torch.no_grad()
     def _scalesweep_params(self, x):
@@ -505,3 +553,84 @@ class Quantizer:
             self.q_max
         ).reshape(original_shape)
         return q.to(x.dtype) if self.is_scalesweep else q
+
+
+@torch.no_grad()
+def validate_nada_wmse(device="cuda"):
+    """Small numerical preflight; does not load/export models or change files."""
+    from .qlinear import set_scalesweep_activation_importance
+
+    torch.manual_seed(0)
+    kwargs = dict(bits=4, format="nvfp", granularity="group", group_size=16,
+                  scale_precision="e4m3")
+
+    def frozen(observer, where=device, **extra):
+        q = Quantizer(observer=observer, **kwargs, **extra)
+        q.global_scale = torch.tensor([64.], device=where)
+        q._track_global_scale = False
+        return q
+
+    x = torch.randn(2, 7, 64, device=device, dtype=torch.bfloat16)
+    x[..., :16] = 0
+    ordinary, weighted = frozen("lss"), frozen("lss_wmse")
+    expected, _ = ordinary.get_quantization_params(x)
+    for constant in (0., 1., 10.):
+        weighted.importance = torch.full((64,), constant, device=device)
+        actual, _ = weighted.get_quantization_params(x)
+        assert torch.equal(expected, actual), f"Uniform/zero importance mismatch: {constant}"
+    weighted.importance = torch.exp(torch.linspace(-5, 5, 64, device=device))
+    actual, _ = weighted.get_quantization_params(x)
+    assert not torch.equal(expected, actual), "Weighted LSS importance has no effect"
+    grouped = x.abs().reshape(2, 7, 4, 16)
+    initial = grouped.amax(-1, keepdim=True) / 6
+    initial = torch.where(initial == 0, torch.ones_like(initial), initial)
+    grid = ordinary.quant_fn(grouped, initial, None, -6, 6).abs()
+    weights = weighted.importance.reshape(4, 16)
+    weights = weights / weights.amax(-1, keepdim=True)
+    numerator = ((grouped * grid).float() * weights).sum(-1, keepdim=True).to(x.dtype)
+    denominator = ((grid * grid).float() * weights).sum(-1, keepdim=True).to(x.dtype)
+    reference = torch.where(denominator > 0, numerator / denominator.clamp_min(1e-30),
+                            grouped.amax(-1, keepdim=True) / 6).squeeze(-1)
+    reference = ((reference * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
+                 .float() / 64).to(x.dtype)
+    reference[reference == 0] = 1
+    assert torch.equal(actual, reference), "Weighted LS closed-form mismatch"
+    for bad in (None, torch.ones(63, device=device),
+                -torch.ones(64, device=device),
+                torch.full((64,), float("nan"), device=device)):
+        weighted.importance = bad
+        try:
+            weighted.get_quantization_params(x)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Invalid weighted LSS importance was accepted")
+    print("NADA weighted LSS: formula/uniform/zero/importance checks OK", flush=True)
+
+    layers = []
+    perm = torch.randperm(64, device=device)
+    rescale = torch.linspace(.5, 1.5, 64, device=device).bfloat16()
+    for rows in (32, 16, 16):
+        layer = torch.nn.Linear(64, rows, bias=False, device=device, dtype=torch.bfloat16)
+        layer.weight.data = (layer.weight.data[:, perm] / rescale).contiguous()
+        layer.act_quantizer = frozen("lss_wmse")
+        layers.append(layer)
+    set_scalesweep_activation_importance(layers)
+    target = torch.cat([layer.weight.float() for layer in layers]).square().mean(0)
+    for layer in layers:
+        assert torch.allclose(layer.act_quantizer.importance, target, rtol=1e-6, atol=1e-8)
+    assert layers[0].act_quantizer.importance is layers[1].act_quantizer.importance
+    print("NADA transformed/fused QKV importance: OK", flush=True)
+
+    base_search = Quantizer(observer="scalesweep_wmse", **kwargs)
+    search = frozen("scalesweep_wmse", global_scale_max=448)
+    assert base_search.global_scale_max == 256 and search.global_scale_max == 448
+    values = torch.randn(8, 64, device=device, dtype=torch.float32)
+    search.importance = torch.exp(torch.linspace(-2, 2, 64, device=device))
+    scales, _ = search.get_quantization_params(values)
+    cpu_reference = frozen("scalesweep_wmse", where="cpu", global_scale_max=448)
+    cpu_reference.importance = search.importance.cpu()
+    expected, _ = cpu_reference.get_quantization_params(values.cpu())
+    assert torch.equal(scales.cpu(), expected), "Weight WMSE CUDA/CPU search mismatch"
+    print("NADA weight WMSE: CUDA/reference OK; original global bound 448 preserved", flush=True)
+    print("ALL NADA WMSE CHECKS PASSED", flush=True)

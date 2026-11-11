@@ -9,9 +9,10 @@ from ..transforms.transforms import BaseTransform
 
 @torch.no_grad()
 def set_scalesweep_activation_importance(linears, transform=None):
-    """Share source ScaleSweep's concatenated weight-column mean squares."""
+    """Share transformed weight-column mean squares for ScaleSweep or weighted LSS."""
     if not any(layer.act_quantizer is not None and
-               layer.act_quantizer.observer == QuantizationObserver.SCALESWEEP_WMSE
+               layer.act_quantizer.observer in {
+                   QuantizationObserver.SCALESWEEP_WMSE, QuantizationObserver.LSS_WMSE}
                for layer in linears):
         return
     importance = None
@@ -68,7 +69,8 @@ class QLinear(nn.Linear):
                 weight = self.weight_quantizer(weight, w_scales, w_zeros)
 
         if self.act_quantizer is not None:
-            if (self.act_quantizer.observer == QuantizationObserver.SCALESWEEP_WMSE
+            if (self.act_quantizer.observer in {
+                    QuantizationObserver.SCALESWEEP_WMSE, QuantizationObserver.LSS_WMSE}
                     and self.act_quantizer.importance is None):
                 self.act_quantizer.importance = weight.detach().float().square().mean(dim=0)
             a_scales, a_zeros = self.act_quantizer.get_quantization_params(x)

@@ -7,6 +7,8 @@ def prepare_quantization_config(
     activation_observer: str = "minmax",
     identity_transform: bool = False,
 ) -> dict[str, Any]:
+    if activation_observer == "lss_wmse":
+        raise ValueError("Weighted LSS has no deployment kernel yet; do not export as abs_max/LSS.")
     if format in ["mxfp", "nvfp"]:
         forward_method = "abs_max"
         if format == "nvfp" and activation_observer in {"lss", "scalesweep_mse", "scalesweep_wmse"}:

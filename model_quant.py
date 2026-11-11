@@ -29,7 +29,7 @@ except ImportError:
 
 from src.metrics.perplexity import compute_perplexity
 from src.transforms.transforms import TRANSFORMS
-from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE
+from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE, FP8_E4M3_MAX
 import os
 os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 from src.quantization.qconfig import prepare_quantization_config
@@ -239,6 +239,16 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
         activation_observer=args.a_observer,
         identity_transform=(args.transform_class == "identity"),
     )
+    if getattr(args, "nada_wmse", None):
+        config.quantization_config.update({
+            "nada_wmse": args.nada_wmse,
+            "weight_observer": args.w_observer,
+            "weight_global_scale_max": FP8_E4M3_MAX,
+            "calibration": {
+                "dataset": args.dataset_name_or_path, "samples": args.num_sequences,
+                "sequence_length": args.sequence_length, "seed": args.seed,
+            },
+        })
     if args.a_observer in {"scalesweep_mse", "scalesweep_wmse"}:
         config.quantization_config.update({
             "scalesweep_base_rounding": "floor",
@@ -372,12 +382,16 @@ def parse_args():
         "--a_observer",
         type=str,
         default="minmax",
-        choices=["minmax","lss","four_over_six","lss_3round","scalesweep_mse","scalesweep_wmse","scalesearch"],
+        choices=["minmax","lss","lss_wmse","four_over_six","lss_3round","scalesweep_mse","scalesweep_wmse","scalesearch"],
         help="Activation observer.",
     )
     parser.add_argument(
         "--scalesweep", choices=["mse", "wmse"], default=None,
         help="Select ScaleSweep-MSE or WMSE for both weight and activation observers.",
+    )
+    parser.add_argument(
+        "--nada_wmse", choices=["weight", "weight_activation"], default=None,
+        help="NADA hybrid: ScaleSweep-WMSE weights, optionally weighted activation LSS; preserve global bound 448.",
     )
     parser.add_argument("--scalesearch", action="store_true",
                         help="ScaleSearch Algorithm 1: nearest E4M3 base, offsets [-2,6], W/A MSE.")
@@ -648,12 +662,24 @@ def parse_args():
     )
     # Parse arguments
     args = parser.parse_args()
-    if sum((args.scalesweep is not None, args.scalesearch, args.permuquant)) > 1:
-        parser.error("Select one of --scalesweep, --scalesearch, or --permuquant.")
+    if sum((args.scalesweep is not None, args.scalesearch, args.permuquant,
+            args.nada_wmse is not None)) > 1:
+        parser.error("Select one of --scalesweep, --scalesearch, --permuquant, or --nada_wmse.")
     if args.scalesweep is not None:
         args.w_observer = args.a_observer = f"scalesweep_{args.scalesweep}"
     if args.scalesearch:
         args.w_observer = args.a_observer = "scalesearch"
+    if args.nada_wmse:
+        if (not args.gptq or args.format != "nvfp" or args.w_bits != 4
+                or args.a_bits != 4 or args.transform_class != "identity"
+                or args.awq or args.gajs):
+            parser.error("--nada_wmse requires GPTQ NVFP4 W4A4, identity transform, and no AWQ/GAJS.")
+        args.w_observer = "scalesweep_wmse"
+        args.a_observer = "lss_wmse" if args.nada_wmse == "weight_activation" else "lss"
+        print(f"[NADA WMSE] mode={args.nada_wmse} W={args.w_observer} "
+              f"A={args.a_observer} global_bound=448")
+    if args.a_observer == "lss_wmse" and (args.export_quantized_model or args.validate_realquant_export):
+        parser.error("Weighted activation LSS is HF PPL-only for now; its deployment kernel is not implemented.")
     if args.permuquant:
         args.channel_resort = "permuquant"
     if args.channel_resort == "permuquant":
@@ -671,13 +697,16 @@ def parse_args():
         if args.lock_global_scale:
             parser.error("ScaleSweep computes its own global scale; omit --lock_global_scale.")
         if args.export_quantized_model or args.validate_realquant_export:
-            if (args.a_observer not in {"scalesweep_mse", "scalesweep_wmse"}
+            hybrid_weight_export = args.nada_wmse == "weight" and args.a_observer == "lss"
+            if ((args.a_observer not in {"scalesweep_mse", "scalesweep_wmse"}
+                 and not hybrid_weight_export)
                     or args.w_observer not in {"scalesweep_mse", "scalesweep_wmse"}
                     or args.export_quantized_model != "realquant" or not args.gptq
                     or args.transform_class != "identity" or not args.fuse_global_scale
                     or args.hadamard_group_size != 16):
                 parser.error(
-                    "ScaleSweep vLLM export requires W/A ScaleSweep observers, "
+                    "ScaleSweep vLLM export requires W/A ScaleSweep observers "
+                    "(or --nada_wmse weight with activation LSS), "
                     "--gptq --export_quantized_model realquant "
                     "--transform_class identity --hadamard_group_size 16 --fuse_global_scale."
                 )

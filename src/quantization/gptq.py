@@ -369,6 +369,9 @@ def gptq_quantization(
             scale_precision=args.scale_precision
         )
     act_quantizer_kwargs = None
+    if weight_quantizer_kwargs is not None and getattr(args, "nada_wmse", None):
+        # Hybrid ablation changes scale selection, not NADA's global FP8 bound.
+        weight_quantizer_kwargs["global_scale_max"] = FP8_E4M3_MAX
     if args.a_bits < 16:
         act_quantizer_kwargs = dict(
             bits=args.a_bits,
