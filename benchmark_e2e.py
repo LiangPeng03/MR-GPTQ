@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import platform
@@ -484,6 +485,12 @@ def child_main(args: argparse.Namespace) -> int:
                 "elapsed_seconds": elapsed,
                 "output_tokens_per_second": generated / elapsed,
                 "requests_per_second": batch_size / elapsed,
+                "output_token_sha256": hashlib.sha256(
+                    json.dumps(
+                        [list(item.outputs[0].token_ids) for item in output],
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
                 **nvml,
                 "peak_memory_delta_from_idle_mib": (
                     nvml["peak_memory_mib"] - idle.memory_used_mib
@@ -556,6 +563,7 @@ def child_main(args: argparse.Namespace) -> int:
             "vllm": vllm_version,
             "gpu": torch.cuda.get_device_name(0),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "nada_fast": os.environ.get("VLLM_FPQUANT_NADA_FAST", "0"),
         },
         "settings": {
             "dtype": args.dtype,
