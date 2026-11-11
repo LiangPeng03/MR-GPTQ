@@ -175,6 +175,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable torch.compile and capture full decode CUDA Graphs only.",
     )
     parser.add_argument(
+        "--shared-nvfp4-prepack", action="store_true",
+        help="Prepack static NVFP4 weight scales and alpha equally for every method.",
+    )
+    parser.add_argument(
         "--reference-method",
         default="gptq",
         help="Method used for the relative comparison CSV (default: gptq).",
@@ -283,6 +287,8 @@ def child_command(
         command.append("--enable-cudagraph")
     if args.decode_cudagraph_only:
         command.append("--decode-cudagraph-only")
+    if args.shared_nvfp4_prepack:
+        command.append("--shared-nvfp4-prepack")
     return command
 
 
@@ -367,6 +373,8 @@ def controller_main(args: argparse.Namespace) -> int:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+        if args.shared_nvfp4_prepack:
+            env["VLLM_FPQUANT_SHARED_PREPACK"] = "1"
         if args.nada_fast_model is not None:
             env["VLLM_FPQUANT_NADA_FAST"] = (
                 "1" if method in args.nada_fast_model else "0"
@@ -423,6 +431,8 @@ def summarize(values: list[float], prefix: str) -> dict[str, float]:
 def child_main(args: argparse.Namespace) -> int:
     if not args._method or not args._model_path or not args._result_path:
         raise ValueError("internal child arguments are incomplete")
+    if args.shared_nvfp4_prepack:
+        os.environ["VLLM_FPQUANT_SHARED_PREPACK"] = "1"
 
     from importlib.metadata import PackageNotFoundError, version
 
@@ -618,6 +628,7 @@ def child_main(args: argparse.Namespace) -> int:
             "gpu": torch.cuda.get_device_name(0),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "nada_fast": os.environ.get("VLLM_FPQUANT_NADA_FAST", "0"),
+            "shared_nvfp4_prepack": os.environ.get("VLLM_FPQUANT_SHARED_PREPACK", "0"),
         },
         "settings": {
             "dtype": args.dtype,
