@@ -7,6 +7,10 @@ if len(sys.argv) > 1 and sys.argv[1] == "quant-compare":
     from bench_quant_ops import main
     main(sys.argv[2:])
     raise SystemExit(0)
+if len(sys.argv) > 1 and sys.argv[1] == "nada-breakdown":
+    from bench_nada_breakdown import main
+    main(sys.argv[2:])
+    raise SystemExit(0)
 
 import torch
 from safetensors import safe_open
