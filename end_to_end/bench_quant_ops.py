@@ -120,14 +120,16 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
     gamma = torch.tensor([64.], device="cuda", dtype=torch.float32)
-    names = ["ABSO_CUDA_identity", "4o6_MSE_Triton_adapted", "ScaleSearch_Triton_adapted",
+    names = ["ABSO_Triton_fused", "ABSO_CUDA_identity", "4o6_MSE_Triton_adapted", "ScaleSearch_Triton_adapted",
              "ScaleSweep_MSE_Triton", "ScaleSweep_WMSE_Triton"]
-    kinds = dict(zip(names, ["abso", "4o6", "search", "sweep_mse", "sweep_wmse"]))
+    kinds = dict(zip(names, ["abso_fused", "abso", "4o6", "search", "sweep_mse", "sweep_wmse"]))
 
     def make(kind, x, importance):
         def call():
             if kind == "abso":
                 q, s = nvfp4_lss_quant_identity(x, gamma)
+            elif kind == "abso_fused":
+                q, s = impl.abso_fused_quantize(x, gamma)
             else:
                 q, s = impl.scalesweep_quantize(x, gamma, importance if kind == "sweep_wmse" else None,
                                                kind == "sweep_wmse", mode={"search": 1, "4o6": 2}.get(kind, 0))
@@ -146,7 +148,7 @@ def main(argv=None):
         for name in names:
             kind = kinds[name]
             actual = make(kind, x, importance)()
-            expected_q, expected_s = abso_reference(x, gamma) if kind == "abso" else reference(x, gamma, importance, kind)
+            expected_q, expected_s = abso_reference(x, gamma) if kind in ("abso", "abso_fused") else reference(x, gamma, importance, kind)
             if not torch.equal(actual[0], expected_q):
                 mismatch = actual[0] != expected_q
                 def canonical_zero_bytes(value):
@@ -160,9 +162,33 @@ def main(argv=None):
             assert torch.equal(actual[0], expected_q), (name, m, "packed FP4")
             assert torch.equal(actual[1].view(torch.uint8), to_blocked(expected_s).view(torch.uint8)), (name, m, "FP8 scales/layout")
         print(f"QUANT_OP_CHECK_OK M={m} K=256", flush=True)
+    # Also compare the fused and unfused implementations at every requested
+    # benchmark shape, including saturation, underflow and zero groups.
+    for m in args.rows:
+        for k in args.widths:
+            x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+            x[:, :16] = 0
+            x[:, 16:32] *= 10000
+            x[:, 32:48] *= .0001
+            old = nvfp4_lss_quant_identity(x, gamma)
+            new = impl.abso_fused_quantize(x, gamma)
+            assert torch.equal(old[0], new[0]), (m, k, "fused/native FP4 bytes")
+            assert torch.equal(old[1].view(torch.uint8), new[1].view(torch.uint8)), (m, k, "fused/native FP8 bytes")
+            torch.cuda.synchronize()
+            check_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(check_graph):
+                captured = impl.abso_fused_quantize(x, gamma)
+            check_graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(old[0], captured[0]), (m, k, "fused graph FP4 bytes")
+            assert torch.equal(old[1].view(torch.uint8), captured[1].view(torch.uint8)), (m, k, "fused graph FP8 bytes")
+            print(f"ABSO_FUSION_BITEXACT_OK M={m} K={k} eager/graph", flush=True)
+            del x, old, new, captured, check_graph
     print("ALL QUANT OP CHECKS PASSED", flush=True)
     if args.check_only:
         return
+    # Keep timed inputs independent of how many preflight cases were run.
+    torch.manual_seed(args.seed)
     output = args.output_dir or Path("benchmark_results") / datetime.now().strftime("quant_ops_%Y%m%d_%H%M%S")
     output.mkdir(parents=True, exist_ok=False)
     (output / "manifest.json").write_text(json.dumps(dict(
@@ -172,6 +198,7 @@ def main(argv=None):
         global_scale=64, scope="frozen-global packed quantization + CUTLASS scale layout; no GEMM",
         four_over_six="project-adapted Triton; frozen-global interface; not official backend benchmark",
         scalesearch="project-adapted Triton; frozen-global interface; not official backend benchmark",
+        abso="fused Triton and unfused native CUDA, checked byte-identical; no DACC/BITR",
         input="Gaussian + 1% amplified outliers; hot repeated buffer",
         memory="separate per-mode allocator measurement: eager one call; graph capture + initial replay; peaks include output, exclude input/importance; reserved delta reported separately; not register/shared-memory usage"), indent=2, default=str))
     rows = []
