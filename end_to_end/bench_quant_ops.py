@@ -93,7 +93,11 @@ def abso_reference(x, gamma):
     q = torch.where(a > 5, 6, torch.where(a >= 3.5, 4,
                     torch.where(a >= 1.75, a.round(), (a * 2).round() * .5))) * normalized.sign()
     grid = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.], device=x.device)
-    codes = torch.bucketize(q.abs().contiguous(), grid).byte() | (q < 0).byte() * 8
+    # Native encode_fp4 uses the pre-rounding input sign, including negative
+    # nonzero inputs that round to zero (valid E2M1 negative-zero nibble 0x8).
+    # Testing q < 0 loses that sign because rounded negative zero compares equal
+    # to zero. Match this native byte convention without changing the kernel.
+    codes = torch.bucketize(q.abs().contiguous(), grid).byte() | (normalized < 0).byte() * 8
     codes = codes.reshape_as(x)
     packed = codes[:, ::2] | (codes[:, 1::2] << 4)
     padded = torch.zeros(((x.shape[0] + 127) // 128 * 128, (x.shape[1] // 16 + 3) // 4 * 4), device=x.device, dtype=torch.float8_e4m3fn)
@@ -143,6 +147,16 @@ def main(argv=None):
             kind = kinds[name]
             actual = make(kind, x, importance)()
             expected_q, expected_s = abso_reference(x, gamma) if kind == "abso" else reference(x, gamma, importance, kind)
+            if not torch.equal(actual[0], expected_q):
+                mismatch = actual[0] != expected_q
+                def canonical_zero_bytes(value):
+                    low, high = value & 15, value >> 4
+                    return torch.where(low == 8, 0, low) | (torch.where(high == 8, 0, high) << 4)
+                print(f"PACK_MISMATCH method={name} M={m} bytes={mismatch.sum().item()} "
+                      f"equal_after_zero_canonicalization={torch.equal(canonical_zero_bytes(actual[0]), canonical_zero_bytes(expected_q))}", flush=True)
+                for row, column in mismatch.nonzero()[:4].tolist():
+                    print(f"  row={row} byte={column} actual={actual[0][row,column].item()} "
+                          f"expected={expected_q[row,column].item()}", flush=True)
             assert torch.equal(actual[0], expected_q), (name, m, "packed FP4")
             assert torch.equal(actual[1].view(torch.uint8), to_blocked(expected_s).view(torch.uint8)), (name, m, "FP8 scales/layout")
         print(f"QUANT_OP_CHECK_OK M={m} K=256", flush=True)
