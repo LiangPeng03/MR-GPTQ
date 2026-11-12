@@ -1,8 +1,8 @@
 """Packed NVFP4 operator benchmark. No models/checkpoints or environment edits.
 
 Scope: frozen inverse global scale, BF16 input -> packed E2M1 and CUTLASS-layout
-E4M3 scales. 4/6 is a controlled Triton reimplementation, NOT official CUDA.
-ScaleSearch is also the project's adapted Triton implementation. ABSO uses
+E4M3 scales. 4/6 and ScaleSearch are project-adapted Triton implementations
+under this frozen-global interface, NOT their official backend benchmarks. ABSO uses
 the existing native CUDA identity quantizer; no permutation/rescaling/GEMM.
 """
 import argparse
@@ -120,7 +120,7 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
     gamma = torch.tensor([64.], device="cuda", dtype=torch.float32)
-    names = ["ABSO_CUDA_identity", "4o6_MSE_Triton_controlled", "ScaleSearch_Triton_adapted",
+    names = ["ABSO_CUDA_identity", "4o6_MSE_Triton_adapted", "ScaleSearch_Triton_adapted",
              "ScaleSweep_MSE_Triton", "ScaleSweep_WMSE_Triton"]
     kinds = dict(zip(names, ["abso", "4o6", "search", "sweep_mse", "sweep_wmse"]))
 
@@ -170,8 +170,10 @@ def main(argv=None):
         cuda=torch.version.cuda, host=platform.node(), implementation=impl.__file__,
         implementation_sha256=hashlib.sha256(Path(impl.__file__).read_bytes()).hexdigest(),
         global_scale=64, scope="frozen-global packed quantization + CUTLASS scale layout; no GEMM",
-        four_over_six="controlled reimplementation, not official CUDA", input="Gaussian + 1% amplified outliers; hot repeated buffer",
-        memory="allocator peak delta incl output; workspace estimate subtracts live output; not register/shared-memory usage"), indent=2, default=str))
+        four_over_six="project-adapted Triton; frozen-global interface; not official backend benchmark",
+        scalesearch="project-adapted Triton; frozen-global interface; not official backend benchmark",
+        input="Gaussian + 1% amplified outliers; hot repeated buffer",
+        memory="separate per-mode allocator measurement: eager one call; graph capture + initial replay; peaks include output, exclude input/importance; reserved delta reported separately; not register/shared-memory usage"), indent=2, default=str))
     rows = []
     modes = ["eager", "graph"] if args.mode == "both" else [args.mode]
     rng = random.Random(args.seed)
@@ -188,22 +190,31 @@ def main(argv=None):
                     result = call()
                     del result
                 torch.cuda.synchronize()
-                gc.collect()
-                torch.cuda.reset_peak_memory_stats()
-                baseline = torch.cuda.memory_allocated()
-                result = call()
-                torch.cuda.synchronize()
-                live_output = sum(t.numel() * t.element_size() for t in result)
-                peak = torch.cuda.max_memory_allocated() - baseline
-                del result
                 for mode in modes:
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    baseline = torch.cuda.memory_allocated()
+                    reserved_baseline = torch.cuda.memory_reserved()
+                    torch.cuda.reset_peak_memory_stats()
                     graph = None
                     if mode == "graph":
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph):
                             graph_output = call()
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        live_output = sum(t.numel() * t.element_size() for t in graph_output)
                         timed = graph.replay
                     else:
+                        result = call()
+                        torch.cuda.synchronize()
+                        live_output = sum(t.numel() * t.element_size() for t in result)
+                    peak = torch.cuda.max_memory_allocated() - baseline
+                    reserved_extra = torch.cuda.max_memory_reserved() - reserved_baseline
+                    retained = torch.cuda.memory_allocated() - baseline
+                    if mode == "eager":
+                        del result
                         timed = call
                     samples = []
                     for _ in range(args.repeats):
@@ -221,6 +232,9 @@ def main(argv=None):
                                   max_us=max(samples), stdev_us=statistics.stdev(samples),
                                   input_bytes=x.numel() * x.element_size(), output_bytes=live_output,
                                   peak_extra_bytes=peak, workspace_estimate_bytes=max(0, peak-live_output),
+                                  reserved_extra_bytes=reserved_extra,
+                                  retained_after_setup_bytes=retained,
+                                  memory_scope="capture_and_initial_replay" if mode=="graph" else "single_eager_call",
                                   persistent_importance_bytes=importance.numel()*4 if kinds[name]=="sweep_wmse" else 0)
                     rows.append(record)
                     print(json.dumps(record), flush=True)
