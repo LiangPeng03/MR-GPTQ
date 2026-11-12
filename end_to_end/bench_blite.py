@@ -3,6 +3,11 @@ import os
 import sys
 import time
 
+if len(sys.argv) > 1 and sys.argv[1] == "quant-compare":
+    from bench_quant_ops import main
+    main(sys.argv[2:])
+    raise SystemExit(0)
+
 import torch
 from safetensors import safe_open
 from vllm._custom_ops import (
