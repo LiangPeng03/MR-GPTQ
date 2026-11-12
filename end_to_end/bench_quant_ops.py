@@ -28,6 +28,8 @@ def parser():
     p.add_argument("--output-dir", type=Path)
     p.add_argument("--check-only", action="store_true")
     p.add_argument("--mode", choices=["eager", "graph", "both"], default="both")
+    p.add_argument("--methods", nargs="+", default=None,
+                   help="Optional subset of method names; e.g. ABSO_Triton_fused_3round")
     return p
 
 
@@ -71,20 +73,24 @@ def reference(x, gamma, importance, kind):
     return packed, scales
 
 
-def abso_reference(x, gamma):
+def abso_reference(x, gamma, rounds=1):
     import torch
     # BF16 boundaries match the existing ABSO CUDA operator.
     grouped = x.reshape(x.shape[0], -1, 16)
     a = grouped.abs()
     initial = (a.amax(-1, keepdim=True) / 6).to(x.dtype)
-    safe = torch.where(initial == 0, torch.ones_like(initial), initial)
-    normalized = (a / safe).to(x.dtype)
-    z = normalized.float()
-    g = torch.where(z > 5, 6, torch.where(z >= 3.5, 4,
-                    torch.where(z >= 1.75, z.round(), (z * 2).round() * .5))).to(x.dtype)
-    numerator = (a * g).sum(-1, keepdim=True)
-    denominator = (g * g).sum(-1, keepdim=True)
-    raw = torch.where(denominator > 0, numerator / torch.where(denominator == 0, 1, denominator), initial)
+    raw = initial
+    for _ in range(rounds):
+        safe = torch.where(raw == 0, torch.ones_like(raw), raw)
+        normalized = (a / safe).to(x.dtype)
+        z = normalized.float()
+        g = torch.where(z > 5, 6, torch.where(z >= 3.5, 4,
+                        torch.where(z >= 1.75, z.round(), (z * 2).round() * .5))).to(x.dtype)
+        numerator = (a * g).sum(-1, keepdim=True)
+        denominator = (g * g).sum(-1, keepdim=True)
+        raw = torch.where(denominator > 0,
+                          numerator / torch.where(denominator == 0, 1, denominator),
+                          initial if rounds == 1 else torch.ones_like(initial))
     fp8 = (raw.float() * gamma).clamp(0, 448).to(torch.float8_e4m3fn)
     physical = (fp8.float() / gamma).to(x.dtype)
     physical = torch.where(physical == 0, torch.ones_like(physical), physical)
@@ -120,9 +126,13 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
     gamma = torch.tensor([64.], device="cuda", dtype=torch.float32)
-    names = ["ABSO_Triton_fused", "ABSO_CUDA_identity", "4o6_MSE_Triton_adapted", "ScaleSearch_Triton_adapted",
+    names = ["ABSO_Triton_fused", "ABSO_Triton_fused_3round", "ABSO_CUDA_identity", "4o6_MSE_Triton_adapted", "ScaleSearch_Triton_adapted",
              "ScaleSweep_MSE_Triton", "ScaleSweep_WMSE_Triton"]
-    kinds = dict(zip(names, ["abso_fused", "abso", "4o6", "search", "sweep_mse", "sweep_wmse"]))
+    kinds = dict(zip(names, ["abso_fused", "abso_3round", "abso", "4o6", "search", "sweep_mse", "sweep_wmse"]))
+    if args.methods is not None:
+        if len(set(args.methods)) != len(args.methods) or any(n not in kinds for n in args.methods):
+            raise ValueError("Unknown or duplicate method name")
+        names = args.methods
 
     def make(kind, x, importance):
         def call():
@@ -130,6 +140,8 @@ def main(argv=None):
                 q, s = nvfp4_lss_quant_identity(x, gamma)
             elif kind == "abso_fused":
                 q, s = impl.abso_fused_quantize(x, gamma)
+            elif kind == "abso_3round":
+                q, s = impl.abso_fused_quantize(x, gamma, rounds=3)
             else:
                 q, s = impl.scalesweep_quantize(x, gamma, importance if kind == "sweep_wmse" else None,
                                                kind == "sweep_wmse", mode={"search": 1, "4o6": 2}.get(kind, 0))
@@ -148,7 +160,7 @@ def main(argv=None):
         for name in names:
             kind = kinds[name]
             actual = make(kind, x, importance)()
-            expected_q, expected_s = abso_reference(x, gamma) if kind in ("abso", "abso_fused") else reference(x, gamma, importance, kind)
+            expected_q, expected_s = abso_reference(x, gamma, 3 if kind == "abso_3round" else 1) if kind in ("abso", "abso_fused", "abso_3round") else reference(x, gamma, importance, kind)
             if not torch.equal(actual[0], expected_q):
                 mismatch = actual[0] != expected_q
                 def canonical_zero_bytes(value):
@@ -184,6 +196,25 @@ def main(argv=None):
             assert torch.equal(old[1].view(torch.uint8), captured[1].view(torch.uint8)), (m, k, "fused graph FP8 bytes")
             print(f"ABSO_FUSION_BITEXACT_OK M={m} K={k} eager/graph", flush=True)
             del x, old, new, captured, check_graph
+            if "abso_3round" in [kinds[name] for name in names]:
+                x3 = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                x3[:, :16] = 0
+                x3[:, 16:32] *= 10000
+                x3[:, 32:48] *= .0001
+                expected_q3, expected_s3 = abso_reference(x3, gamma, rounds=3)
+                actual3 = impl.abso_fused_quantize(x3, gamma, rounds=3)
+                assert torch.equal(actual3[0], expected_q3), (m, k, "3-round FP4 bytes")
+                assert torch.equal(actual3[1].view(torch.uint8), expected_s3.view(torch.uint8)), (m, k, "3-round FP8 bytes")
+                torch.cuda.synchronize()
+                graph3 = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph3):
+                    captured3 = impl.abso_fused_quantize(x3, gamma, rounds=3)
+                graph3.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(captured3[0], expected_q3), (m, k, "3-round graph FP4 bytes")
+                assert torch.equal(captured3[1].view(torch.uint8), expected_s3.view(torch.uint8)), (m, k, "3-round graph FP8 bytes")
+                print(f"ABSO_3ROUND_BITEXACT_OK M={m} K={k} eager/graph", flush=True)
+                del x3, expected_q3, expected_s3, actual3, captured3, graph3
     print("ALL QUANT OP CHECKS PASSED", flush=True)
     if args.check_only:
         return
@@ -199,6 +230,7 @@ def main(argv=None):
         four_over_six="project-adapted Triton; frozen-global interface; not official backend benchmark",
         scalesearch="project-adapted Triton; frozen-global interface; not official backend benchmark",
         abso="fused Triton and unfused native CUDA, checked byte-identical; no DACC/BITR",
+        abso_iterations="1 or 3 LS updates, code reassignment between updates; one E4M3 projection after final update; matches LSS_3ROUND calibration semantics",
         input="Gaussian + 1% amplified outliers; hot repeated buffer",
         memory="separate per-mode allocator measurement: eager one call; graph capture + initial replay; peaks include output, exclude input/importance; reserved delta reported separately; not register/shared-memory usage"), indent=2, default=str))
     rows = []
